@@ -4,7 +4,7 @@ import sys
 
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.checkpoint.mongodb.aio import AsyncMongoDBSaver
+from langgraph.checkpoint.mongodb import MongoDBSaver
 from deepagents import create_deep_agent
 
 SYSTEM_PROMPT = """You are an expert reverse engineer working with Ghidra. Your goal is to fully \
@@ -176,7 +176,8 @@ async def main() -> None:
     print()
 
     mongodb_uri = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
-    async with AsyncMongoDBSaver.from_conn_string(mongodb_uri) as checkpointer:
+    mongodb_db = os.environ.get("MONGODB_DB", "checkpointing_db")
+    with MongoDBSaver.from_conn_string(mongodb_uri, db_name=mongodb_db) as checkpointer:
         agent_kwargs: dict = dict(
             model=model,
             tools=tools,
@@ -190,7 +191,8 @@ async def main() -> None:
 
         # All turns within one interactive session share a single thread so the
         # agent accumulates context across messages.
-        config = {"configurable": {"thread_id": "re-session"}}
+        recursion_limit = int(os.environ.get("RECURSION_LIMIT", "100"))
+        config = {"configurable": {"thread_id": "re-session"}, "recursion_limit": recursion_limit}
 
         print(f"Ghidra Reverse Engineering Agent ready  {ANSI_DIM}[model: {model}]{ANSI_RESET}")
         print("Enter your analysis task. Type 'quit' or press Ctrl+C to exit.")

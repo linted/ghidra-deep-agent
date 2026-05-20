@@ -41,14 +41,32 @@ All configuration is done via environment variables (`.env` file or shell export
 
 | Variable | Default | Description |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | — | API key for Anthropic (or swap for another provider) |
+| `ANTHROPIC_API_KEY` | — | API key for Anthropic *(not needed for Ollama)* |
 | `MODEL` | `anthropic:claude-sonnet-4-6` | Any `provider:model` string supported by LangChain |
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL *(only needed if non-default)* |
 | `MONGODB_URI` | `mongodb://localhost:27017` | MongoDB connection string for checkpoint persistence |
 | `GHIDRA_MCP_TRANSPORT` | `stdio` | Transport type: `stdio`, `http`, or `sse` |
 | `GHIDRA_MCP_COMMAND` | `ghidra-mcp` | *(stdio only)* Command to launch the MCP bridge |
 | `GHIDRA_MCP_ARGS` | *(empty)* | *(stdio only)* Extra CLI flags, space-separated |
 | `GHIDRA_MCP_URL` | `http://localhost:8080/mcp` | *(http/sse only)* URL of the MCP server |
 | `AGENTS_MD` | *(unset)* | Optional path to an `AGENTS.md` memory file |
+
+### Using Ollama
+
+Set `MODEL` to `ollama:<model-name>` — no API key needed. The model **must support tool calling**; good options for code/RE work:
+
+| Model | Pull command |
+|---|---|
+| `qwen2.5-coder:32b` | `ollama pull qwen2.5-coder:32b` |
+| `devstral` | `ollama pull devstral` |
+| `llama3.3` | `ollama pull llama3.3` |
+
+```env
+MODEL=ollama:qwen2.5-coder:32b
+# OLLAMA_HOST=http://localhost:11434  # only if non-default
+```
+
+Ollama must be running (`ollama serve`) and the model must already be pulled before starting the agent.
 
 ### Transport options
 
