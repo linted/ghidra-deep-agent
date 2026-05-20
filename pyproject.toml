@@ -1,7 +1,15 @@
 [project]
 name = "ghidra-deep-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "A reverse engineering deep agent with Ghidra integration via MCP"
 readme = "README.md"
-requires-python = ">=3.14"
-dependencies = []
+requires-python = ">=3.12"
+dependencies = [
+    "deepagents",
+    "langchain-mcp-adapters",
+    "langchain[anthropic]",
+    "langgraph",
+    "langgraph-checkpoint-mongodb",
+    "pymongo",
+    "python-dotenv",
+]
