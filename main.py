@@ -7,138 +7,14 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.checkpoint.mongodb import MongoDBSaver
 from deepagents import create_deep_agent
 
-SYSTEM_PROMPT = """You are an expert reverse engineer working with Ghidra. Your goal is to fully \
-understand a binary's behavior by analyzing its assembly and systematically enriching the Ghidra \
-project with what you learn.
-
-## Core rule: trust the assembly
-
-The disassembly and decompilation that Ghidra provides is the ground truth. When assembly \
-contradicts your assumptions or prior knowledge, update your mental model—never dismiss or \
-second-guess what the assembly shows. Every register, stack slot, and memory access you \
-observe is real.
-
-## Workflow
-
-**Reconnaissance first**: Before diving into any specific function, orient yourself:
-- List all functions and their addresses
-- Check imports, exports, and strings for hints about purpose
-- Note the binary format, architecture, and calling convention
-
-**Analyze systematically**: For each function you investigate:
-1. Get the disassembly and/or decompiler output
-2. Identify the calling convention and argument count from the prologue
-3. Trace data flow: follow values through registers and stack across the function body
-4. Identify patterns—loops, conditionals, comparisons, error checks, syscalls, API calls
-5. Note cross-references: what calls this function and what does it call
-
-**Apply learnings immediately**: As soon as you understand something, commit it back to Ghidra:
-- Rename variables and parameters to reflect their purpose (e.g., `local_10` → `file_size`)
-- Set correct types for variables and parameters (e.g., change `int` to `FILE *`)
-- Rename functions based on their behavior (e.g., `FUN_00401000` → `parse_config_file`)
-- Update function prototypes to match the real signature
-- Add inline comments at key instructions to explain non-obvious behavior
-
-**Track your progress**: Use the built-in to-do list and filesystem to record:
-- Which functions you've analyzed
-- Key data structures you've identified
-- Your current working hypothesis about the binary's purpose
-- Areas that still need investigation
-
-## Naming conventions
-
-Use lowercase snake_case for all names unless the binary itself uses another convention. \
-Prefer descriptive names over abbreviated ones. If you are uncertain about a name, prefix \
-it with `maybe_` and refine it as you learn more.
-
-## Never guess without evidence
-
-Do not rename or retype anything based on speculation alone. Every change you make to Ghidra \
-must be grounded in specific evidence from the assembly—cite the instruction address or \
-pattern that led you to that conclusion.
-"""
-
-ANSI_RESET = "\033[0m"
-ANSI_CYAN = "\033[36m"
-ANSI_YELLOW = "\033[33m"
-ANSI_GREEN = "\033[32m"
-ANSI_RED = "\033[31m"
-ANSI_DIM = "\033[2m"
-
-
-def get_mcp_config() -> dict:
-    transport = os.environ.get("GHIDRA_MCP_TRANSPORT", "stdio").lower()
-
-    if transport in ("http", "streamable-http", "streamable_http"):
-        url = os.environ.get("GHIDRA_MCP_URL", "http://localhost:8080/mcp")
-        return {"ghidra": {"transport": "http", "url": url}}
-
-    if transport == "sse":
-        url = os.environ.get("GHIDRA_MCP_URL", "http://localhost:8080/mcp")
-        return {"ghidra": {"transport": "sse", "url": url}}
-
-    # stdio (default): launch ghidra MCP bridge as a subprocess
-    command = os.environ.get("GHIDRA_MCP_COMMAND", "ghidra-mcp")
-    args_raw = os.environ.get("GHIDRA_MCP_ARGS", "")
-    args = args_raw.split() if args_raw.strip() else []
-    return {"ghidra": {"transport": "stdio", "command": command, "args": args}}
-
-
-async def stream_response(agent, user_input: str, config: dict) -> None:
-    """Stream the agent's response, showing tool calls and text tokens in real time."""
-    print()
-
-    in_text = False
-    active_tool: str | None = None
-
-    async for event in agent.astream_events(
-        {"messages": [{"role": "user", "content": user_input}]},
-        config=config,
-        version="v2",
-    ):
-        kind = event["event"]
-
-        if kind == "on_tool_start":
-            name = event.get("name", "")
-            # Skip deep-agent internal harness tools from the display
-            internal = {"write_todos", "read_file", "write_file", "edit_file",
-                        "ls", "glob", "grep", "task"}
-            if name and name not in internal:
-                if in_text:
-                    print()
-                    in_text = False
-                active_tool = name
-                print(f"{ANSI_YELLOW}⚙ {name}{ANSI_RESET}", end="  ", flush=True)
-
-        elif kind == "on_tool_end":
-            if active_tool:
-                print(f"{ANSI_GREEN}✓{ANSI_RESET}", flush=True)
-                active_tool = None
-
-        elif kind == "on_chat_model_stream":
-            chunk = event["data"].get("chunk")
-            if chunk is None:
-                continue
-
-            content = chunk.content
-            if isinstance(content, str) and content:
-                if not in_text:
-                    print()
-                    in_text = True
-                print(content, end="", flush=True)
-            elif isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text = block.get("text", "")
-                        if text:
-                            if not in_text:
-                                print()
-                                in_text = True
-                            print(text, end="", flush=True)
-
-    if in_text:
-        print()
-    print()
+from knowledge import build_knowledge_tools
+from mcp import get_mcp_config
+from prompt import SYSTEM_PROMPT
+from streaming import (
+    ANSI_CYAN, ANSI_DIM, ANSI_RED, ANSI_RESET, ANSI_YELLOW,
+    recover_from_tool_error,
+    stream_response,
+)
 
 
 async def main() -> None:
@@ -177,10 +53,20 @@ async def main() -> None:
 
     mongodb_uri = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
     mongodb_db = os.environ.get("MONGODB_DB", "checkpointing_db")
+    embed_model = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+
+    try:
+        knowledge_tools = build_knowledge_tools(mongodb_uri, mongodb_db, embed_model)
+        print(f"Knowledge base ready  {ANSI_DIM}[embed: {embed_model}]{ANSI_RESET}")
+    except Exception as exc:
+        print(f"{ANSI_YELLOW}Warning: knowledge base unavailable ({exc}){ANSI_RESET}",
+              file=sys.stderr)
+        knowledge_tools = []
+
     with MongoDBSaver.from_conn_string(mongodb_uri, db_name=mongodb_db) as checkpointer:
         agent_kwargs: dict = dict(
             model=model,
-            tools=tools,
+            tools=knowledge_tools + tools,
             system_prompt=SYSTEM_PROMPT,
             checkpointer=checkpointer,
         )
@@ -189,8 +75,6 @@ async def main() -> None:
 
         agent = create_deep_agent(**agent_kwargs)
 
-        # All turns within one interactive session share a single thread so the
-        # agent accumulates context across messages.
         recursion_limit = int(os.environ.get("RECURSION_LIMIT", "100"))
         config = {"configurable": {"thread_id": "re-session"}, "recursion_limit": recursion_limit}
 
@@ -215,7 +99,8 @@ async def main() -> None:
             except KeyboardInterrupt:
                 print(f"\n{ANSI_DIM}[interrupted]{ANSI_RESET}")
             except Exception as exc:
-                print(f"\n{ANSI_RED}[Error: {exc}]{ANSI_RESET}", file=sys.stderr)
+                print(f"\n{ANSI_RED}[Tool error: {exc}]{ANSI_RESET}", file=sys.stderr)
+                await recover_from_tool_error(agent, config, exc)
 
 
 if __name__ == "__main__":
