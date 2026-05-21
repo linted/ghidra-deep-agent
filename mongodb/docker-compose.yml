@@ -1,0 +1,48 @@
+services:
+   mongod:
+      image: mongodb/mongodb-community-server:latest
+      container_name: mongod-community
+      command: >-
+         mongod
+         --config /etc/mongod.conf
+         --replSetMember=mongod.search-community:27017
+      ports:
+         - 27017:27017
+      extra_hosts:
+         - "host.docker.internal:host-gateway"
+      volumes:
+         - mongod_data:/data/db
+         - ./mongod.conf:/etc/mongod.conf:ro
+         - ./sampledata.archive:/sampledata.archive
+         - ./init-mongo.sh:/docker-entrypoint-initdb.d/init-mongo.sh:ro
+         - ./keyfile:/etc/mongodb-keyfile:ro
+      environment:
+         MONGO_INITDB_ROOT_USERNAME: admin
+         MONGO_INITDB_ROOT_PASSWORD: 1b3ad960-d798-43d4-bfd3-4973aa14dfa5
+      networks:
+         - search-community
+
+
+   mongot:
+      image: mongodb/mongodb-community-search:latest
+      container_name: mongot-community-pupr
+      networks:
+         - search-community
+      volumes:
+         - mongot_data:/data/mongot
+         - ./mongot.conf:/mongot-community/config.default.yml
+         - ./pwfile:/mongot-community/pwfile:ro
+      depends_on:
+         - mongod
+      ports:
+         - 27028:27028  # Query server port from config
+         - 9946:9946    # Metrics port from config
+
+volumes:
+   mongod_data:
+   mongot_data:
+
+networks:
+   search-community:
+      name: search-community
+      external: true  # Use an external network if it exists. Comment this line if you want to create a new network.
