@@ -9,6 +9,7 @@ dependencies = [
     "langchain-mcp-adapters",
     "langchain-mongodb",
     "langchain[anthropic]",
+    "langchain-deepseek",
     "langchain-ollama",
     "langgraph",
     "langgraph-checkpoint-mongodb",
