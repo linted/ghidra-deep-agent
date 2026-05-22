@@ -8,7 +8,8 @@ from langgraph.checkpoint.mongodb import MongoDBSaver
 from deepagents import create_deep_agent
 
 from knowledge import build_knowledge_tools
-from mcp import get_mcp_config
+from ghidra_transport import get_mcp_config
+from models import build_model
 from prompt import SYSTEM_PROMPT
 from streaming import (
     ANSI_CYAN, ANSI_DIM, ANSI_RED, ANSI_RESET, ANSI_YELLOW,
@@ -65,7 +66,7 @@ async def main() -> None:
 
     with MongoDBSaver.from_conn_string(mongodb_uri, db_name=mongodb_db) as checkpointer:
         agent_kwargs: dict = dict(
-            model=model,
+            model=build_model(model),
             tools=knowledge_tools + tools,
             system_prompt=SYSTEM_PROMPT,
             checkpointer=checkpointer,
