@@ -1,12 +1,16 @@
 """Extract /knowledge.md from the agent's LangGraph state and write it to disk."""
 
+import os
 import sys
+from dotenv import load_dotenv
 from pymongo import MongoClient
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
-MONGODB_URI = "mongodb://firmware_user:f2970a49-95bc-412c-8983-8c69d0a01e01@mongodb.noreal.solutions:27017/?directConnection=true&serverSelectionTimeoutMS=2000&authSource=admin"
-MONGODB_DB = "firmware_analysis"
-THREAD_ID = "re-session"
+load_dotenv()
+
+MONGODB_URI = os.environ["MONGODB_URI"]
+MONGODB_DB = os.environ.get("MONGODB_DB", "checkpointing_db")
+THREAD_ID = os.environ.get("THREAD_ID", "re-session")
 FILE_PATH = "/knowledge.md"
 OUTPUT = "knowledge.md"
 
