@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import os
+
 from rich.markdown import Markdown
 from rich.rule import Rule
 from textual.app import App, ComposeResult
@@ -9,6 +12,10 @@ from textual.widgets import Footer, Header, Input, RichLog, Static, Tree
 from textual.widgets.tree import TreeNode
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual import work
+
+# Set DEBUG_EVENTS=1 to dump every astream_events event to /tmp/tui_events.jsonl
+_DEBUG_EVENTS = os.environ.get("DEBUG_EVENTS") == "1"
+_debug_log = open("/tmp/tui_events.jsonl", "w") if _DEBUG_EVENTS else None
 
 
 _PLACEHOLDER_IDLE = "Enter analysis task (Ctrl+C to quit)…"
@@ -20,14 +27,14 @@ _PLACEHOLDER_BUSY = "Agent is running… type ahead, Enter to queue"
 # ---------------------------------------------------------------------------
 
 class ToolStarted(Message):
-    def __init__(self, run_id: str, parent_run_id: str | None, name: str,
-                 input_preview: str, is_subagent: bool) -> None:
+    def __init__(self, run_id: str, name: str, input_preview: str,
+                 is_subagent: bool, checkpoint_ns: str) -> None:
         super().__init__()
         self.run_id = run_id
-        self.parent_run_id = parent_run_id
         self.name = name
         self.input_preview = input_preview
         self.is_subagent = is_subagent
+        self.checkpoint_ns = checkpoint_ns
 
 
 class ToolEnded(Message):
@@ -38,10 +45,10 @@ class ToolEnded(Message):
 
 
 class LLMThinking(Message):
-    def __init__(self, run_id: str, parent_run_id: str | None) -> None:
+    def __init__(self, run_id: str, checkpoint_ns: str) -> None:
         super().__init__()
         self.run_id = run_id
-        self.parent_run_id = parent_run_id
+        self.checkpoint_ns = checkpoint_ns
 
 
 class LLMDone(Message):
@@ -58,14 +65,6 @@ class TextToken(Message):
 
 class AgentDone(Message):
     pass
-
-
-class ChainLinked(Message):
-    """Invisible intermediary: records a chain run_id → parent_run_id link."""
-    def __init__(self, run_id: str, parent_run_id: str | None) -> None:
-        super().__init__()
-        self.run_id = run_id
-        self.parent_run_id = parent_run_id
 
 
 class StatusUpdate(Message):
@@ -96,7 +95,9 @@ class ActivityTree(Tree):
         self.clear()
         self.root.expand()
         self._run_map: dict[str, TreeNode] = {}
-        self._parent_map: dict[str, str | None] = {}
+        # Maps a task tool's langgraph_checkpoint_ns to its sub-agent tree node.
+        # Events whose checkpoint_ns starts with "<task_ns>|" belong to that sub-agent.
+        self._ns_to_node: dict[str, TreeNode] = {}
         self._thinking_node: TreeNode | None = None
         self._thinking_run_id: str | None = None
 
@@ -107,14 +108,14 @@ class ActivityTree(Tree):
 
     def on_tool_started(self, msg: ToolStarted) -> None:
         self._clear_thinking()
-        parent_node = self._resolve_parent(msg.parent_run_id)
+        parent_node = self._find_parent(msg.checkpoint_ns)
         if msg.is_subagent:
             label = f"▶ sub-agent: {msg.input_preview}" if msg.input_preview else "▶ sub-agent"
             node = parent_node.add(label, expand=True)
+            self._ns_to_node[msg.checkpoint_ns] = node
         else:
             node = parent_node.add_leaf(f"⚙ {msg.name}  ●")
         self._run_map[msg.run_id] = node
-        self._parent_map[msg.run_id] = msg.parent_run_id
 
     def on_tool_ended(self, msg: ToolEnded) -> None:
         node = self._run_map.get(msg.run_id)
@@ -128,7 +129,7 @@ class ActivityTree(Tree):
 
     def on_llm_thinking(self, msg: LLMThinking) -> None:
         self._clear_thinking()
-        parent_node = self._resolve_parent(msg.parent_run_id)
+        parent_node = self._find_parent(msg.checkpoint_ns)
         self._thinking_node = parent_node.add_leaf("⋯ thinking…")
         self._thinking_run_id = msg.run_id
 
@@ -142,19 +143,22 @@ class ActivityTree(Tree):
             self._thinking_node = None
             self._thinking_run_id = None
 
-    def on_chain_linked(self, msg: ChainLinked) -> None:
-        self._parent_map[msg.run_id] = msg.parent_run_id
-
     # -- helpers -------------------------------------------------------------
 
-    def _resolve_parent(self, parent_run_id: str | None) -> TreeNode:
-        """Walk the parent chain to find the nearest tracked node."""
-        rid = parent_run_id
-        while rid is not None:
-            if rid in self._run_map:
-                return self._run_map[rid]
-            rid = self._parent_map.get(rid)
-        return self.root
+    def _find_parent(self, checkpoint_ns: str) -> TreeNode:
+        """Return the sub-agent node whose checkpoint_ns is the longest prefix of checkpoint_ns.
+
+        A task tool's ns looks like "tools:<uuid>".  Events belonging to the
+        sub-agent it spawned have ns "tools:<uuid>|tools:<inner_uuid>…".
+        The longest matching prefix wins, which handles nested sub-agents correctly.
+        """
+        best_ns = ""
+        best_node = self.root
+        for ns, node in self._ns_to_node.items():
+            if checkpoint_ns.startswith(ns + "|") and len(ns) > len(best_ns):
+                best_ns = ns
+                best_node = node
+        return best_node
 
 
 class ThinkingPanel(VerticalScroll):
@@ -335,23 +339,33 @@ class GhidraAgentApp(App):
         kind = event.get("event", "")
         run_id: str = event.get("run_id", "")
         parent_run_id: str | None = event.get("parent_run_id")
+        metadata: dict = event.get("metadata", {})
+        checkpoint_ns: str = metadata.get("langgraph_checkpoint_ns", "")
 
-        if kind == "on_chain_start":
-            activity.post_message(ChainLinked(run_id, parent_run_id))
+        if _DEBUG_EVENTS and _debug_log:
+            _debug_log.write(json.dumps({
+                "event": kind,
+                "run_id": run_id,
+                "parent_run_id": parent_run_id,
+                "name": event.get("name", ""),
+                "tags": event.get("tags", []),
+                "metadata": metadata,
+            }) + "\n")
+            _debug_log.flush()
 
-        elif kind == "on_tool_start":
+        if kind == "on_tool_start":
             name = event.get("name", "")
             raw_input = event.get("data", {}).get("input", {})
             preview = _extract_preview(raw_input)
             is_subagent = name == "task"
-            activity.post_message(ToolStarted(run_id, parent_run_id, name, preview, is_subagent))
+            activity.post_message(ToolStarted(run_id, name, preview, is_subagent, checkpoint_ns))
 
         elif kind == "on_tool_end":
             error = bool(event.get("data", {}).get("error"))
             activity.post_message(ToolEnded(run_id, error))
 
         elif kind == "on_chat_model_start":
-            activity.post_message(LLMThinking(run_id, parent_run_id))
+            activity.post_message(LLMThinking(run_id, checkpoint_ns))
 
         elif kind == "on_chat_model_end":
             activity.post_message(LLMDone(run_id))
