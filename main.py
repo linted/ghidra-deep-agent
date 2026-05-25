@@ -1,6 +1,8 @@
+import argparse
 import asyncio
 import os
 import sys
+import uuid
 
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -11,15 +13,16 @@ from knowledge import build_knowledge_tools
 from ghidra_transport import get_mcp_config
 from models import build_model
 from prompt import SYSTEM_PROMPT
-from streaming import (
-    ANSI_CYAN, ANSI_DIM, ANSI_RED, ANSI_RESET, ANSI_YELLOW,
-    recover_from_tool_error,
-    stream_response,
-)
+from tui import GhidraAgentApp
 
 
 async def main() -> None:
     load_dotenv()
+
+    parser = argparse.ArgumentParser(description="Ghidra deep agent")
+    parser.add_argument("--session-id", default=None, help="Resume a previous session by ID")
+    args = parser.parse_args()
+    session_id = args.session_id or str(uuid.uuid4())
 
     mcp_config = get_mcp_config()
     model = os.environ.get("MODEL", "anthropic:claude-sonnet-4-6")
@@ -37,20 +40,16 @@ async def main() -> None:
         client = MultiServerMCPClient(mcp_config)
         tools = await client.get_tools()
     except Exception as exc:
-        print(f"{ANSI_RED}Failed to connect to Ghidra MCP server: {exc}{ANSI_RESET}",
-              file=sys.stderr)
+        print(f"Failed to connect to Ghidra MCP server: {exc}", file=sys.stderr)
         print("Set GHIDRA_MCP_TRANSPORT, GHIDRA_MCP_URL, or GHIDRA_MCP_COMMAND as needed.",
               file=sys.stderr)
         sys.exit(1)
 
     if not tools:
-        print(f"{ANSI_YELLOW}Warning: no tools loaded from Ghidra MCP server.{ANSI_RESET}",
-              file=sys.stderr)
+        print("Warning: no tools loaded from Ghidra MCP server.", file=sys.stderr)
     else:
         names = ", ".join(t.name for t in tools)
-        print(f"Loaded {len(tools)} Ghidra tool(s): {ANSI_DIM}{names}{ANSI_RESET}")
-
-    print()
+        print(f"Loaded {len(tools)} Ghidra tool(s): {names}")
 
     mongodb_uri = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
     mongodb_db = os.environ.get("MONGODB_DB", "checkpointing_db")
@@ -58,15 +57,19 @@ async def main() -> None:
 
     try:
         knowledge_tools = build_knowledge_tools(mongodb_uri, mongodb_db, embed_model)
-        print(f"Knowledge base ready  {ANSI_DIM}[embed: {embed_model}]{ANSI_RESET}")
+        print(f"Knowledge base ready  [embed: {embed_model}]")
     except Exception as exc:
-        print(f"{ANSI_YELLOW}Warning: knowledge base unavailable ({exc}){ANSI_RESET}",
-              file=sys.stderr)
+        print(f"Warning: knowledge base unavailable ({exc})", file=sys.stderr)
         knowledge_tools = []
 
+    built_model = build_model(model)
+    recursion_limit = int(os.environ.get("RECURSION_LIMIT", "100"))
+    config = {"configurable": {"thread_id": session_id}, "recursion_limit": recursion_limit}
+
     with MongoDBSaver.from_conn_string(mongodb_uri, db_name=mongodb_db) as checkpointer:
+
         agent_kwargs: dict = dict(
-            model=build_model(model),
+            model=built_model,
             tools=knowledge_tools + tools,
             system_prompt=SYSTEM_PROMPT,
             checkpointer=checkpointer,
@@ -76,32 +79,10 @@ async def main() -> None:
 
         agent = create_deep_agent(**agent_kwargs)
 
-        recursion_limit = int(os.environ.get("RECURSION_LIMIT", "100"))
-        config = {"configurable": {"thread_id": "re-session"}, "recursion_limit": recursion_limit}
+        app = GhidraAgentApp(agent=agent, config=config, model=model, session_id=session_id)
+        await app.run_async()
 
-        print(f"Ghidra Reverse Engineering Agent ready  {ANSI_DIM}[model: {model}]{ANSI_RESET}")
-        print("Enter your analysis task. Type 'quit' or press Ctrl+C to exit.")
-        print()
-
-        while True:
-            try:
-                user_input = input(f"{ANSI_CYAN}> {ANSI_RESET}").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\nExiting.")
-                break
-
-            if not user_input:
-                continue
-            if user_input.lower() in ("quit", "exit", "q"):
-                break
-
-            try:
-                await stream_response(agent, user_input, config)
-            except KeyboardInterrupt:
-                print(f"\n{ANSI_DIM}[interrupted]{ANSI_RESET}")
-            except Exception as exc:
-                print(f"\n{ANSI_RED}[Tool error: {exc}]{ANSI_RESET}", file=sys.stderr)
-                await recover_from_tool_error(agent, config, exc)
+    print(f"Session ID: {session_id}")
 
 
 if __name__ == "__main__":
