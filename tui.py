@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import json
-import os
-
 from rich.markdown import Markdown
 from rich.rule import Rule
 from textual.app import App, ComposeResult
@@ -12,10 +9,6 @@ from textual.widgets import Footer, Header, Input, RichLog, Static, Tree
 from textual.widgets.tree import TreeNode
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual import work
-
-# Set DEBUG_EVENTS=1 to dump every astream_events event to /tmp/tui_events.jsonl
-_DEBUG_EVENTS = os.environ.get("DEBUG_EVENTS") == "1"
-_debug_log = open("/tmp/tui_events.jsonl", "w") if _DEBUG_EVENTS else None
 
 
 _PLACEHOLDER_IDLE = "Enter analysis task (Ctrl+C to quit)…"
@@ -338,20 +331,8 @@ class GhidraAgentApp(App):
     def _handle_event(self, event: dict, activity: ActivityTree, response: ResponseLog, thinking: ThinkingPanel) -> None:
         kind = event.get("event", "")
         run_id: str = event.get("run_id", "")
-        parent_run_id: str | None = event.get("parent_run_id")
         metadata: dict = event.get("metadata", {})
         checkpoint_ns: str = metadata.get("langgraph_checkpoint_ns", "")
-
-        if _DEBUG_EVENTS and _debug_log:
-            _debug_log.write(json.dumps({
-                "event": kind,
-                "run_id": run_id,
-                "parent_run_id": parent_run_id,
-                "name": event.get("name", ""),
-                "tags": event.get("tags", []),
-                "metadata": metadata,
-            }) + "\n")
-            _debug_log.flush()
 
         if kind == "on_tool_start":
             name = event.get("name", "")

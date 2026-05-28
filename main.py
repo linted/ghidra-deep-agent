@@ -6,8 +6,10 @@ import uuid
 
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.interceptors import MCPToolCallRequest
 from langgraph.checkpoint.mongodb import MongoDBSaver
 from deepagents import create_deep_agent
+from deepagents.backends.filesystem import FilesystemBackend
 
 from knowledge import build_knowledge_tools
 from ghidra_transport import get_mcp_config
@@ -36,8 +38,14 @@ async def main() -> None:
         url = mcp_config["ghidra"].get("url", "")
         print(f"Connecting to Ghidra MCP server [{transport_desc}: {url}]...")
 
+    async def handle_mcp_errors(request: MCPToolCallRequest, handler):
+        try:
+            return await handler(request)
+        except Exception as exc:
+            return f"Tool '{request.name}' failed: {exc}"
+
     try:
-        client = MultiServerMCPClient(mcp_config)
+        client = MultiServerMCPClient(mcp_config, tool_interceptors=[handle_mcp_errors])
         tools = await client.get_tools()
     except Exception as exc:
         print(f"Failed to connect to Ghidra MCP server: {exc}", file=sys.stderr)
@@ -76,6 +84,10 @@ async def main() -> None:
         )
         if agents_md:
             agent_kwargs["memory"] = [agents_md]
+
+        output_dir = os.environ.get("AGENT_OUTPUT_DIR", "")
+        if output_dir:
+            agent_kwargs["backend"] = FilesystemBackend(root_dir=output_dir, virtual_mode=True)
 
         agent = create_deep_agent(**agent_kwargs)
 
