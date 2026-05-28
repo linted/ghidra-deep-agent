@@ -1,4 +1,9 @@
-"""Extract /knowledge.md from the agent's LangGraph state and write it to disk."""
+#!/usr/bin/env python3
+"""
+Extract /knowledge.md from the agent's LangGraph state and write it to disk.
+Use this if the agent is configured to write its knowledge base to MongoDB (e.g. AGENT_OUTPUT_DIR is unset) and you want to get that knowledge base out as a standalone Markdown file. 
+The agent writes the knowledge base to MongoDB on every update, so this script can be run at any time during or after the agent's execution to get the latest knowledge.
+"""
 
 import os
 import sys
