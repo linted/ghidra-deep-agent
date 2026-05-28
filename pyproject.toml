@@ -15,4 +15,5 @@ dependencies = [
     "langgraph-checkpoint-mongodb",
     "pymongo",
     "python-dotenv",
+    "textual",
 ]
