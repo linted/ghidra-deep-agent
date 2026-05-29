@@ -4,23 +4,21 @@ import os
 import sys
 import uuid
 
-from dotenv import load_dotenv
-from langchain.agents.middleware import SummarizationMiddleware
-from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_mcp_adapters.interceptors import MCPToolCallRequest
-from langgraph.checkpoint.mongodb import MongoDBSaver
-from deepagents import create_deep_agent, HarnessProfile, register_harness_profile
+from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
 from deepagents.backends.filesystem import FilesystemBackend
 from deepagents.middleware.summarization import (
-    SummarizationMiddleware as DeepAgentsSummarizationMiddleware,
     create_summarization_tool_middleware,
 )
+from dotenv import load_dotenv
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.interceptors import MCPToolCallRequest
+from langgraph.checkpoint.mongodb import MongoDBSaver
 
-from knowledge import build_knowledge_tools
 from ghidra_transport import get_mcp_config
+from knowledge import build_knowledge_tools
 from models import build_model
-from prompt import SYSTEM_PROMPT, SUMMARIZATION_TOOL_PROMPT
+from prompt import SYSTEM_PROMPT
 from tui import GhidraAgentApp
 
 
@@ -37,7 +35,9 @@ async def main() -> None:
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="Ghidra deep agent")
-    parser.add_argument("--session-id", default=None, help="Resume a previous session by ID")
+    parser.add_argument(
+        "--session-id", default=None, help="Resume a previous session by ID"
+    )
     args = parser.parse_args()
     session_id = args.session_id or str(uuid.uuid4())
 
@@ -64,8 +64,11 @@ async def main() -> None:
         tools = await client.get_tools()
     except Exception as exc:
         print(f"Failed to connect to Ghidra MCP server: {exc}", file=sys.stderr)
-        print("Set GHIDRA_MCP_TRANSPORT, GHIDRA_MCP_URL, or GHIDRA_MCP_COMMAND as needed.",
-              file=sys.stderr)
+        print(
+            "Set GHIDRA_MCP_TRANSPORT, GHIDRA_MCP_URL, or "
+            "GHIDRA_MCP_COMMAND as needed.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     if not tools:
@@ -87,7 +90,10 @@ async def main() -> None:
 
     built_model = build_model(model)
     recursion_limit = int(os.environ.get("RECURSION_LIMIT", "100"))
-    config = {"configurable": {"thread_id": session_id}, "recursion_limit": recursion_limit}
+    config = {
+        "configurable": {"thread_id": session_id},
+        "recursion_limit": recursion_limit,
+    }
 
     output_dir = os.environ.get("AGENT_OUTPUT_DIR", "")
     if output_dir:
@@ -96,7 +102,6 @@ async def main() -> None:
         backend = StateBackend()
 
     with MongoDBSaver.from_conn_string(mongodb_uri, db_name=mongodb_db) as checkpointer:
-
         agent_kwargs: dict = dict(
             model=built_model,
             tools=knowledge_tools + tools,
@@ -104,12 +109,14 @@ async def main() -> None:
             checkpointer=checkpointer,
             middleware=[create_summarization_tool_middleware(built_model, backend)],
             backend=backend,
-            memory= [agents_md] if agents_md else None,
+            memory=[agents_md] if agents_md else None,
         )
 
         agent = create_deep_agent(**agent_kwargs)
 
-        app = GhidraAgentApp(agent=agent, config=config, model=model, session_id=session_id)
+        app = GhidraAgentApp(
+            agent=agent, config=config, model=model, session_id=session_id
+        )
         await app.run_async()
 
     print(f"Session ID: {session_id}")

@@ -11,6 +11,7 @@ Checks each layer independently so it's clear exactly where things break:
 
 Run:  uv run python test_knowledge.py
 """
+
 import os
 import sys
 import time
@@ -88,14 +89,16 @@ step("2. Direct write + read (no search required)")
 try:
     collection = client[MONGODB_DB][COLLECTION]
 
-    result = collection.insert_one({
-        "text": "Test document inserted by test_knowledge.py",
-        "category": "test",
-        "address": "0x00000000",
-        "function_name": TEST_MARKER,
-        "confidence": "high",
-        "tags": "test",
-    })
+    result = collection.insert_one(
+        {
+            "text": "Test document inserted by test_knowledge.py",
+            "category": "test",
+            "address": "0x00000000",
+            "function_name": TEST_MARKER,
+            "confidence": "high",
+            "tags": "test",
+        }
+    )
     _test_doc_id = result.inserted_id
     ok(f"Inserted document  _id={_test_doc_id}")
 
@@ -119,10 +122,16 @@ try:
         ok(f"Found {len(indexes)} search index(es): {names}")
         index_ok = True
     else:
-        info("No search indexes found yet — auto_create_index=True will attempt creation on first use")
+        info(
+            "No search indexes found yet — auto_create_index=True will "
+            "attempt creation on first use"
+        )
 except Exception as exc:
     fail(f"list_search_indexes() failed: {exc}")
-    info("This usually means the Atlas Search (mongot) service is not running on this deployment.")
+    info(
+        "This usually means the Atlas Search (mongot) service is not "
+        "running on this deployment."
+    )
     info("Vector similarity queries will not work until mongot is available.")
 
 
@@ -132,6 +141,7 @@ step("4. Ollama embedding model")
 embeddings = None
 try:
     import httpx
+
     r = httpx.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
     models = [m["name"] for m in r.json().get("models", [])]
     if any(EMBED_MODEL in m for m in models):
@@ -145,6 +155,7 @@ except Exception as exc:
 
 try:
     from langchain_ollama import OllamaEmbeddings
+
     embeddings = OllamaEmbeddings(model=EMBED_MODEL)
     vec = embeddings.embed_query("test embedding")
     ok(f"embed_query returned vector of length {len(vec)}")
@@ -162,18 +173,23 @@ else:
     try:
         from knowledge import build_knowledge_tools
 
-        tools_map = {t.name: t for t in build_knowledge_tools(MONGODB_URI, MONGODB_DB, EMBED_MODEL)}
+        tools_map = {
+            t.name: t
+            for t in build_knowledge_tools(MONGODB_URI, MONGODB_DB, EMBED_MODEL)
+        }
 
         # save
         save = tools_map["save_knowledge"]
-        result = save.invoke({
-            "content": f"Test function at 0xDEADBEEF: marker={TEST_MARKER}",
-            "category": "function",
-            "address": "0xDEADBEEF",
-            "function_name": TEST_MARKER,
-            "confidence": "high",
-            "tags": "test",
-        })
+        result = save.invoke(
+            {
+                "content": f"Test function at 0xDEADBEEF: marker={TEST_MARKER}",
+                "category": "function",
+                "address": "0xDEADBEEF",
+                "function_name": TEST_MARKER,
+                "confidence": "high",
+                "tags": "test",
+            }
+        )
         ok(f"save_knowledge: {result}")
 
         time.sleep(1)  # give the index a moment to catch up
@@ -197,23 +213,25 @@ step("6. Direct query tools")
 try:
     from knowledge import build_knowledge_tools
 
-    tools_map = {t.name: t for t in build_knowledge_tools(MONGODB_URI, MONGODB_DB, EMBED_MODEL)}
+    tools_map = {
+        t.name: t for t in build_knowledge_tools(MONGODB_URI, MONGODB_DB, EMBED_MODEL)
+    }
 
     r1 = tools_map["query_by_address"].invoke({"address": "0xDEADBEEF"})
     if TEST_MARKER in r1:
-        ok(f"query_by_address: found test document")
+        ok("query_by_address: found test document")
     else:
         fail(f"query_by_address: test document not found\n    {r1[:200]}")
 
     r2 = tools_map["query_by_category"].invoke({"category": "function"})
     if TEST_MARKER in r2:
-        ok(f"query_by_category: found test document")
+        ok("query_by_category: found test document")
     else:
         fail(f"query_by_category: test document not found\n    {r2[:200]}")
 
     r3 = tools_map["list_all_knowledge"].invoke({})
     if TEST_MARKER in r3:
-        ok(f"list_all_knowledge: found test document")
+        ok("list_all_knowledge: found test document")
     else:
         fail(f"list_all_knowledge: test document not found\n    {r3[:200]}")
 

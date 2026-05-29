@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from rich.markdown import Markdown
 from rich.rule import Rule
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Footer, Header, Input, RichLog, Static, Tree
 from textual.widgets.tree import TreeNode
-from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual import work
-
 
 _PLACEHOLDER_IDLE = "Enter analysis task (Ctrl+C to quit)…"
 _PLACEHOLDER_BUSY = "Agent is running… type ahead, Enter to queue"
@@ -19,9 +18,16 @@ _PLACEHOLDER_BUSY = "Agent is running… type ahead, Enter to queue"
 # Messages
 # ---------------------------------------------------------------------------
 
+
 class ToolStarted(Message):
-    def __init__(self, run_id: str, name: str, input_preview: str,
-                 is_subagent: bool, checkpoint_ns: str) -> None:
+    def __init__(
+        self,
+        run_id: str,
+        name: str,
+        input_preview: str,
+        is_subagent: bool,
+        checkpoint_ns: str,
+    ) -> None:
         super().__init__()
         self.run_id = run_id
         self.name = name
@@ -70,6 +76,7 @@ class StatusUpdate(Message):
 # Widgets
 # ---------------------------------------------------------------------------
 
+
 class ActivityTree(Tree):
     """Left pane: live agent/tool call hierarchy."""
 
@@ -103,7 +110,11 @@ class ActivityTree(Tree):
         self._clear_thinking()
         parent_node = self._find_parent(msg.checkpoint_ns)
         if msg.is_subagent:
-            label = f"▶ sub-agent: {msg.input_preview}" if msg.input_preview else "▶ sub-agent"
+            label = (
+                f"▶ sub-agent: {msg.input_preview}"
+                if msg.input_preview
+                else "▶ sub-agent"
+            )
             node = parent_node.add(label, expand=True)
             self._ns_to_node[msg.checkpoint_ns] = node
         else:
@@ -139,7 +150,8 @@ class ActivityTree(Tree):
     # -- helpers -------------------------------------------------------------
 
     def _find_parent(self, checkpoint_ns: str) -> TreeNode:
-        """Return the sub-agent node whose checkpoint_ns is the longest prefix of checkpoint_ns.
+        """Return the sub-agent node whose checkpoint_ns is the longest prefix of
+        checkpoint_ns.
 
         A task tool's ns looks like "tools:<uuid>".  Events belonging to the
         sub-agent it spawned have ns "tools:<uuid>|tools:<inner_uuid>…".
@@ -203,7 +215,7 @@ class ResponseLog(RichLog):
         self._response_buf = ""
         self.last_response = ""
 
-    def clear(self) -> "ResponseLog":
+    def clear(self) -> ResponseLog:
         self._response_buf = ""
         return super().clear()
 
@@ -223,6 +235,7 @@ class ResponseLog(RichLog):
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
+
 
 class GhidraAgentApp(App):
     TITLE = "Ghidra Agent"
@@ -250,7 +263,9 @@ class GhidraAgentApp(App):
     }
     """
 
-    def __init__(self, agent, config: dict, model: str = "", session_id: str = "") -> None:
+    def __init__(
+        self, agent, config: dict, model: str = "", session_id: str = ""
+    ) -> None:
         super().__init__()
         self._agent = agent
         self._config = config
@@ -328,7 +343,13 @@ class GhidraAgentApp(App):
             self._set_busy(False)
             self.query_one("#query", Input).focus()
 
-    def _handle_event(self, event: dict, activity: ActivityTree, response: ResponseLog, thinking: ThinkingPanel) -> None:
+    def _handle_event(
+        self,
+        event: dict,
+        activity: ActivityTree,
+        response: ResponseLog,
+        thinking: ThinkingPanel,
+    ) -> None:
         kind = event.get("event", "")
         run_id: str = event.get("run_id", "")
         metadata: dict = event.get("metadata", {})
@@ -340,7 +361,9 @@ class GhidraAgentApp(App):
             raw_input = event.get("data", {}).get("input", {})
             preview = _extract_preview(raw_input)
             is_subagent = name == "task"
-            activity.post_message(ToolStarted(run_id, name, preview, is_subagent, checkpoint_ns))
+            activity.post_message(
+                ToolStarted(run_id, name, preview, is_subagent, checkpoint_ns)
+            )
 
         elif kind == "on_tool_end":
             error = bool(event.get("data", {}).get("error"))
@@ -348,13 +371,17 @@ class GhidraAgentApp(App):
 
         elif kind == "on_chat_model_start":
             if is_compaction:
-                response.post_message(StatusUpdate("[yellow]⟳ Compacting context…[/yellow]"))
+                response.post_message(
+                    StatusUpdate("[yellow]⟳ Compacting context…[/yellow]")
+                )
             else:
                 activity.post_message(LLMThinking(run_id, checkpoint_ns))
 
         elif kind == "on_chat_model_end":
             if is_compaction:
-                response.post_message(StatusUpdate("[green]✓ Context compacted[/green]"))
+                response.post_message(
+                    StatusUpdate("[green]✓ Context compacted[/green]")
+                )
             else:
                 activity.post_message(LLMDone(run_id))
 
@@ -374,9 +401,12 @@ class GhidraAgentApp(App):
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _extract_preview(raw: object) -> str:
     if isinstance(raw, dict):
-        text = raw.get("description") or raw.get("task") or raw.get("prompt") or str(raw)
+        text = (
+            raw.get("description") or raw.get("task") or raw.get("prompt") or str(raw)
+        )
     else:
         text = str(raw)
     return text[:60]

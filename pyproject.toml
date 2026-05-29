@@ -17,3 +17,21 @@ dependencies = [
     "python-dotenv",
     "textual",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "mypy",
+]
+
+[tool.ruff]
+target-version = "py312"
+exclude = ["agent_output*"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true

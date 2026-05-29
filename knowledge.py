@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from langchain_core.documents import Document
 from langchain_core.tools import tool
@@ -11,7 +11,9 @@ from pymongo import MongoClient
 
 def build_knowledge_tools(mongodb_uri: str, mongodb_db: str, embed_model: str) -> list:
     client = MongoClient(mongodb_uri)
-    collection = client[mongodb_db][os.environ.get("MONGODB_VECTOR_COLLECTION", "re_knowledge")]
+    collection = client[mongodb_db][
+        os.environ.get("MONGODB_VECTOR_COLLECTION", "re_knowledge")
+    ]
     embeddings = OllamaEmbeddings(model=embed_model)
 
     vector_store = MongoDBAtlasVectorSearch(
@@ -34,16 +36,20 @@ def build_knowledge_tools(mongodb_uri: str, mongodb_db: str, embed_model: str) -
         """Save a reverse engineering finding to the long-term knowledge base.
 
         Call this after EVERY function analyzed, every rename or retype decision, every
-        identified data structure, and every hypothesis — even uncertain ones. Write content
-        as a clear, self-contained statement so it makes sense without context later.
+        identified data structure, and every hypothesis — even uncertain ones. Write
+        content as a clear, self-contained statement so it makes sense without context
+        later.
 
         Args:
             content: The finding as a self-contained statement.
-            category: One of 'function', 'structure', 'string', 'hypothesis', 'rename', or 'finding'.
+            category: One of 'function', 'structure', 'string', 'hypothesis',
+                'rename', or 'finding'.
             address: Ghidra address this relates to, e.g. '0x08000100'.
-            function_name: The function name (original or renamed), e.g. 'parse_config_file'.
+            function_name: The function name (original or renamed),
+                e.g. 'parse_config_file'.
             confidence: 'high', 'medium', or 'low'.
-            tags: Comma-separated keywords for later filtering, e.g. 'crypto,loop,syscall'.
+            tags: Comma-separated keywords for later filtering,
+                e.g. 'crypto,loop,syscall'.
         """
         doc = Document(
             page_content=content,
@@ -53,7 +59,7 @@ def build_knowledge_tools(mongodb_uri: str, mongodb_db: str, embed_model: str) -
                 "function_name": function_name,
                 "confidence": confidence,
                 "tags": tags,
-                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "saved_at": datetime.now(UTC).isoformat(),
             },
         )
         vector_store.add_documents([doc])
@@ -70,11 +76,20 @@ def build_knowledge_tools(mongodb_uri: str, mongodb_db: str, embed_model: str) -
         Args:
             address: Full or partial address string, e.g. '0x08000100' or '0x0800'.
         """
-        docs = list(collection.find(
-            {"address": {"$regex": f"^{address}", "$options": "i"}},
-            {"text": 1, "category": 1, "address": 1, "function_name": 1,
-             "confidence": 1, "tags": 1, "_id": 0},
-        ))
+        docs = list(
+            collection.find(
+                {"address": {"$regex": f"^{address}", "$options": "i"}},
+                {
+                    "text": 1,
+                    "category": 1,
+                    "address": 1,
+                    "function_name": 1,
+                    "confidence": 1,
+                    "tags": 1,
+                    "_id": 0,
+                },
+            )
+        )
         if not docs:
             return f"No findings for address '{address}'."
         lines = [
@@ -92,12 +107,21 @@ def build_knowledge_tools(mongodb_uri: str, mongodb_db: str, embed_model: str) -
         decision made so far.
 
         Args:
-            category: One of 'function', 'structure', 'string', 'hypothesis', 'rename', 'finding'.
+            category: One of 'function', 'structure', 'string', 'hypothesis',
+                'rename', 'finding'.
         """
-        docs = list(collection.find(
-            {"category": category},
-            {"text": 1, "address": 1, "function_name": 1, "confidence": 1, "_id": 0},
-        ))
+        docs = list(
+            collection.find(
+                {"category": category},
+                {
+                    "text": 1,
+                    "address": 1,
+                    "function_name": 1,
+                    "confidence": 1,
+                    "_id": 0,
+                },
+            )
+        )
         if not docs:
             return f"No findings for category '{category}'."
         lines = [
@@ -111,24 +135,37 @@ def build_knowledge_tools(mongodb_uri: str, mongodb_db: str, embed_model: str) -
     def list_all_knowledge() -> str:
         """List a summary of every entry in the knowledge base.
 
-        Call this at the start of a session to orient yourself — see which functions have
-        been analyzed, what hypotheses exist, and where gaps remain.
+        Call this at the start of a session to orient yourself — see which
+        functions have been analyzed, what hypotheses exist, and where gaps remain.
         """
-        docs = list(collection.find(
-            {},
-            {"text": 1, "category": 1, "address": 1, "function_name": 1,
-             "confidence": 1, "tags": 1, "saved_at": 1, "_id": 0},
-        ).sort("category", 1))
+        docs = list(
+            collection.find(
+                {},
+                {
+                    "text": 1,
+                    "category": 1,
+                    "address": 1,
+                    "function_name": 1,
+                    "confidence": 1,
+                    "tags": 1,
+                    "saved_at": 1,
+                    "_id": 0,
+                },
+            ).sort("category", 1)
+        )
         if not docs:
             return "Knowledge base is empty."
         lines = []
         for d in docs:
-            parts = filter(None, [
-                d.get("category", ""),
-                d.get("address", ""),
-                d.get("function_name", ""),
-                d.get("confidence", ""),
-            ])
+            parts = filter(
+                None,
+                [
+                    d.get("category", ""),
+                    d.get("address", ""),
+                    d.get("function_name", ""),
+                    d.get("confidence", ""),
+                ],
+            )
             label = " | ".join(parts)
             snippet = d.get("text", "")[:100]
             lines.append(f"[{label}]  {snippet}")
@@ -140,9 +177,16 @@ def build_knowledge_tools(mongodb_uri: str, mongodb_db: str, embed_model: str) -
         name="query_knowledge",
         description=(
             "Semantic search across the long-term knowledge base. "
-            "Call this before analyzing any function or structure to recall prior conclusions. "
-            "Query with natural language, function names, addresses, or behavioral descriptions."
+            "Call this before analyzing any function or structure to "
+            "recall prior conclusions. Query with natural language, "
+            "function names, addresses, or behavioral descriptions."
         ),
     )
 
-    return [save_knowledge, query_knowledge, query_by_address, query_by_category, list_all_knowledge]
+    return [
+        save_knowledge,
+        query_knowledge,
+        query_by_address,
+        query_by_category,
+        list_all_knowledge,
+    ]
