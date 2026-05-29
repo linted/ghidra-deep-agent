@@ -5,17 +5,32 @@ import sys
 import uuid
 
 from dotenv import load_dotenv
+from langchain.agents.middleware import SummarizationMiddleware
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.interceptors import MCPToolCallRequest
 from langgraph.checkpoint.mongodb import MongoDBSaver
-from deepagents import create_deep_agent
+from deepagents import create_deep_agent, HarnessProfile, register_harness_profile
+from deepagents.backends import StateBackend
 from deepagents.backends.filesystem import FilesystemBackend
+from deepagents.middleware.summarization import (
+    SummarizationMiddleware as DeepAgentsSummarizationMiddleware,
+    create_summarization_tool_middleware,
+)
 
 from knowledge import build_knowledge_tools
 from ghidra_transport import get_mcp_config
 from models import build_model
-from prompt import SYSTEM_PROMPT
+from prompt import SYSTEM_PROMPT, SUMMARIZATION_TOOL_PROMPT
 from tui import GhidraAgentApp
+
+
+def _parse_token_count(value: str) -> int:
+    value = value.strip().lower()
+    if value.endswith("m"):
+        return int(float(value[:-1]) * 1_000_000)
+    if value.endswith("k"):
+        return int(float(value[:-1]) * 1_000)
+    return int(value)
 
 
 async def main() -> None:
@@ -74,6 +89,12 @@ async def main() -> None:
     recursion_limit = int(os.environ.get("RECURSION_LIMIT", "100"))
     config = {"configurable": {"thread_id": session_id}, "recursion_limit": recursion_limit}
 
+    output_dir = os.environ.get("AGENT_OUTPUT_DIR", "")
+    if output_dir:
+        backend = FilesystemBackend(root_dir=output_dir, virtual_mode=True)
+    else:
+        backend = StateBackend()
+
     with MongoDBSaver.from_conn_string(mongodb_uri, db_name=mongodb_db) as checkpointer:
 
         agent_kwargs: dict = dict(
@@ -81,13 +102,10 @@ async def main() -> None:
             tools=knowledge_tools + tools,
             system_prompt=SYSTEM_PROMPT,
             checkpointer=checkpointer,
+            middleware=[create_summarization_tool_middleware(built_model, backend)],
+            backend=backend,
+            memory= [agents_md] if agents_md else None,
         )
-        if agents_md:
-            agent_kwargs["memory"] = [agents_md]
-
-        output_dir = os.environ.get("AGENT_OUTPUT_DIR", "")
-        if output_dir:
-            agent_kwargs["backend"] = FilesystemBackend(root_dir=output_dir, virtual_mode=True)
 
         agent = create_deep_agent(**agent_kwargs)
 

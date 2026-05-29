@@ -333,6 +333,7 @@ class GhidraAgentApp(App):
         run_id: str = event.get("run_id", "")
         metadata: dict = event.get("metadata", {})
         checkpoint_ns: str = metadata.get("langgraph_checkpoint_ns", "")
+        is_compaction = metadata.get("lc_source") == "summarization"
 
         if kind == "on_tool_start":
             name = event.get("name", "")
@@ -346,12 +347,20 @@ class GhidraAgentApp(App):
             activity.post_message(ToolEnded(run_id, error))
 
         elif kind == "on_chat_model_start":
-            activity.post_message(LLMThinking(run_id, checkpoint_ns))
+            if is_compaction:
+                response.post_message(StatusUpdate("[yellow]⟳ Compacting context…[/yellow]"))
+            else:
+                activity.post_message(LLMThinking(run_id, checkpoint_ns))
 
         elif kind == "on_chat_model_end":
-            activity.post_message(LLMDone(run_id))
+            if is_compaction:
+                response.post_message(StatusUpdate("[green]✓ Context compacted[/green]"))
+            else:
+                activity.post_message(LLMDone(run_id))
 
         elif kind == "on_chat_model_stream":
+            if is_compaction:
+                return  # suppress summary tokens from the normal output panels
             chunk = event.get("data", {}).get("chunk")
             if chunk is None:
                 return
