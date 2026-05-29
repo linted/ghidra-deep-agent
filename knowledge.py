@@ -9,7 +9,9 @@ from langchain_mongodb import MongoDBAtlasVectorSearch
 from pymongo import MongoClient
 
 
-def build_knowledge_tools(mongodb_uri: str, mongodb_db: str, embeddings: Embeddings) -> list:
+def build_knowledge_tools(
+    mongodb_uri: str, mongodb_db: str, embeddings: Embeddings
+) -> list:
     client = MongoClient(mongodb_uri)
     collection = client[mongodb_db][
         os.environ.get("MONGODB_VECTOR_COLLECTION", "re_knowledge")

@@ -49,7 +49,8 @@ def info(msg: str) -> None:
 MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
 MONGODB_DB = os.environ.get("MONGODB_DB", "checkpointing_db")
 COLLECTION = os.environ.get("MONGODB_VECTOR_COLLECTION", "re_knowledge")
-EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+_ollama_fallback = f"ollama:{os.environ.get('OLLAMA_EMBED_MODEL', 'nomic-embed-text')}"
+EMBED_MODEL = os.environ.get("EMBED_MODEL", _ollama_fallback)
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 TEST_MARKER = "__test_knowledge_script__"
@@ -59,7 +60,7 @@ print("=" * 40)
 info(f"URI:        {MONGODB_URI[:40]}...")
 info(f"DB:         {MONGODB_DB}")
 info(f"Collection: {COLLECTION}")
-info(f"Embed:      {EMBED_MODEL}  (via {OLLAMA_HOST})")
+info(f"Embed:      {EMBED_MODEL}")
 
 
 # ── 1. connectivity ───────────────────────────────────────────────────────────
@@ -137,28 +138,15 @@ except Exception as exc:
 
 # ── 4. embedding model ────────────────────────────────────────────────────────
 
-step("4. Ollama embedding model")
+step("4. Embedding model")
 embeddings = None
 try:
-    import httpx
+    from models import build_embeddings
 
-    r = httpx.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
-    models = [m["name"] for m in r.json().get("models", [])]
-    if any(EMBED_MODEL in m for m in models):
-        ok(f"'{EMBED_MODEL}' is available in Ollama")
-    else:
-        fail(f"'{EMBED_MODEL}' not found in Ollama. Available: {models or '(none)'}")
-        info(f"Run:  ollama pull {EMBED_MODEL}")
-except Exception as exc:
-    fail(f"Cannot reach Ollama at {OLLAMA_HOST}: {exc}")
-    info("Vector search requires Ollama to embed queries. Other features still work.")
-
-try:
-    from langchain_ollama import OllamaEmbeddings
-
-    embeddings = OllamaEmbeddings(model=EMBED_MODEL)
-    vec = embeddings.embed_query("test embedding")
-    ok(f"embed_query returned vector of length {len(vec)}")
+    _emb = build_embeddings(EMBED_MODEL)
+    vec = _emb.embed_query("test embedding")
+    ok(f"embed_query returned vector of length {len(vec)}  [{EMBED_MODEL}]")
+    embeddings = _emb
 except Exception as exc:
     fail(f"embed_query failed: {exc}")
     embeddings = None
@@ -175,7 +163,7 @@ else:
 
         tools_map = {
             t.name: t
-            for t in build_knowledge_tools(MONGODB_URI, MONGODB_DB, EMBED_MODEL)
+            for t in build_knowledge_tools(MONGODB_URI, MONGODB_DB, embeddings)
         }
 
         # save
@@ -210,33 +198,37 @@ else:
 # ── 6. direct query tools ─────────────────────────────────────────────────────
 
 step("6. Direct query tools")
-try:
-    from knowledge import build_knowledge_tools
+if embeddings is None:
+    info("Skipping — embedding model unavailable")
+else:
+    try:
+        from knowledge import build_knowledge_tools
 
-    tools_map = {
-        t.name: t for t in build_knowledge_tools(MONGODB_URI, MONGODB_DB, EMBED_MODEL)
-    }
+        tools_map = {
+            t.name: t
+            for t in build_knowledge_tools(MONGODB_URI, MONGODB_DB, embeddings)
+        }
 
-    r1 = tools_map["query_by_address"].invoke({"address": "0xDEADBEEF"})
-    if TEST_MARKER in r1:
-        ok("query_by_address: found test document")
-    else:
-        fail(f"query_by_address: test document not found\n    {r1[:200]}")
+        r1 = tools_map["query_by_address"].invoke({"address": "0xDEADBEEF"})
+        if TEST_MARKER in r1:
+            ok("query_by_address: found test document")
+        else:
+            fail(f"query_by_address: test document not found\n    {r1[:200]}")
 
-    r2 = tools_map["query_by_category"].invoke({"category": "function"})
-    if TEST_MARKER in r2:
-        ok("query_by_category: found test document")
-    else:
-        fail(f"query_by_category: test document not found\n    {r2[:200]}")
+        r2 = tools_map["query_by_category"].invoke({"category": "function"})
+        if TEST_MARKER in r2:
+            ok("query_by_category: found test document")
+        else:
+            fail(f"query_by_category: test document not found\n    {r2[:200]}")
 
-    r3 = tools_map["list_all_knowledge"].invoke({})
-    if TEST_MARKER in r3:
-        ok("list_all_knowledge: found test document")
-    else:
-        fail(f"list_all_knowledge: test document not found\n    {r3[:200]}")
+        r3 = tools_map["list_all_knowledge"].invoke({})
+        if TEST_MARKER in r3:
+            ok("list_all_knowledge: found test document")
+        else:
+            fail(f"list_all_knowledge: test document not found\n    {r3[:200]}")
 
-except Exception as exc:
-    fail(f"Direct query tools failed: {exc}")
+    except Exception as exc:
+        fail(f"Direct query tools failed: {exc}")
 
 
 # ── cleanup ───────────────────────────────────────────────────────────────────

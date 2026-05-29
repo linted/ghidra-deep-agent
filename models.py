@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, cast
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.messages import AIMessage
@@ -38,7 +38,7 @@ def build_embeddings(embed_string: str) -> Embeddings:
     Supported providers:
       ollama:<model>       — OllamaEmbeddings (langchain-ollama, always installed)
       openai:<model>       — OpenAIEmbeddings (requires: uv add langchain-openai)
-      huggingface:<model>  — HuggingFaceEmbeddings (requires: uv add langchain-huggingface)
+      huggingface:<model>  — HuggingFaceEmbeddings (uv add langchain-huggingface)
       cohere:<model>       — CohereEmbeddings (requires: uv add langchain-cohere)
     """
     provider, _, model = embed_string.partition(":")
@@ -51,17 +51,17 @@ def build_embeddings(embed_string: str) -> Embeddings:
 
         return OllamaEmbeddings(model=model)
     if provider == "openai":
-        from langchain_openai import OpenAIEmbeddings  # type: ignore[import]
+        from langchain_openai import OpenAIEmbeddings
 
         return OpenAIEmbeddings(model=model)
     if provider == "huggingface":
-        from langchain_huggingface import HuggingFaceEmbeddings  # type: ignore[import]
+        from langchain_huggingface import HuggingFaceEmbeddings
 
-        return HuggingFaceEmbeddings(model_name=model)
+        return cast(Embeddings, HuggingFaceEmbeddings(model_name=model))
     if provider == "cohere":
-        from langchain_cohere import CohereEmbeddings  # type: ignore[import]
+        from langchain_cohere import CohereEmbeddings
 
-        return CohereEmbeddings(model=model)
+        return cast(Embeddings, CohereEmbeddings(model=model))
     raise ValueError(
         f"Unknown embeddings provider {provider!r}. "
         "Supported: ollama, openai, huggingface, cohere"

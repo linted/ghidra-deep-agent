@@ -81,7 +81,9 @@ async def main() -> None:
     mongodb_db = os.environ.get("MONGODB_DB", "checkpointing_db")
 
     # EMBED_MODEL takes precedence; fall back to legacy OLLAMA_EMBED_MODEL.
-    _ollama_fallback = f"ollama:{os.environ.get('OLLAMA_EMBED_MODEL', 'nomic-embed-text')}"
+    _ollama_fallback = (
+        f"ollama:{os.environ.get('OLLAMA_EMBED_MODEL', 'nomic-embed-text')}"
+    )
     embed_string = os.environ.get("EMBED_MODEL", _ollama_fallback)
 
     try:
