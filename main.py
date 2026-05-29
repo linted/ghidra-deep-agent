@@ -17,7 +17,7 @@ from langgraph.checkpoint.mongodb import MongoDBSaver
 
 from ghidra_transport import get_mcp_config
 from knowledge import build_knowledge_tools
-from models import build_model
+from models import build_embeddings, build_model
 from prompt import SYSTEM_PROMPT
 from tui import GhidraAgentApp
 
@@ -79,11 +79,15 @@ async def main() -> None:
 
     mongodb_uri = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
     mongodb_db = os.environ.get("MONGODB_DB", "checkpointing_db")
-    embed_model = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+
+    # EMBED_MODEL takes precedence; fall back to legacy OLLAMA_EMBED_MODEL.
+    _ollama_fallback = f"ollama:{os.environ.get('OLLAMA_EMBED_MODEL', 'nomic-embed-text')}"
+    embed_string = os.environ.get("EMBED_MODEL", _ollama_fallback)
 
     try:
-        knowledge_tools = build_knowledge_tools(mongodb_uri, mongodb_db, embed_model)
-        print(f"Knowledge base ready  [embed: {embed_model}]")
+        embeddings = build_embeddings(embed_string)
+        knowledge_tools = build_knowledge_tools(mongodb_uri, mongodb_db, embeddings)
+        print(f"Knowledge base ready  [embed: {embed_string}]")
     except Exception as exc:
         print(f"Warning: knowledge base unavailable ({exc})", file=sys.stderr)
         knowledge_tools = []

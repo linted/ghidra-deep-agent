@@ -1,5 +1,6 @@
 from typing import Any
 
+from langchain_core.embeddings import Embeddings
 from langchain_core.messages import AIMessage
 from langchain_deepseek import ChatDeepSeek
 
@@ -29,6 +30,42 @@ class _ChatDeepSeekFixed(ChatDeepSeek):
                     message["reasoning_content"] = rc
 
         return payload
+
+
+def build_embeddings(embed_string: str) -> Embeddings:
+    """Return an embeddings instance for the given provider:model string.
+
+    Supported providers:
+      ollama:<model>       — OllamaEmbeddings (langchain-ollama, always installed)
+      openai:<model>       — OpenAIEmbeddings (requires: uv add langchain-openai)
+      huggingface:<model>  — HuggingFaceEmbeddings (requires: uv add langchain-huggingface)
+      cohere:<model>       — CohereEmbeddings (requires: uv add langchain-cohere)
+    """
+    provider, _, model = embed_string.partition(":")
+    if not model:
+        raise ValueError(
+            f"EMBED_MODEL must be in provider:model format, got {embed_string!r}"
+        )
+    if provider == "ollama":
+        from langchain_ollama import OllamaEmbeddings
+
+        return OllamaEmbeddings(model=model)
+    if provider == "openai":
+        from langchain_openai import OpenAIEmbeddings  # type: ignore[import]
+
+        return OpenAIEmbeddings(model=model)
+    if provider == "huggingface":
+        from langchain_huggingface import HuggingFaceEmbeddings  # type: ignore[import]
+
+        return HuggingFaceEmbeddings(model_name=model)
+    if provider == "cohere":
+        from langchain_cohere import CohereEmbeddings  # type: ignore[import]
+
+        return CohereEmbeddings(model=model)
+    raise ValueError(
+        f"Unknown embeddings provider {provider!r}. "
+        "Supported: ollama, openai, huggingface, cohere"
+    )
 
 
 def build_model(model_string: str):

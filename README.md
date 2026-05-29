@@ -1,6 +1,6 @@
 # ghidra-deep-agent
 
-A reverse engineering agent built on the [LangChain Deep Agents SDK](https://docs.langchain.com/oss/python/deepagents/overview). It connects to a running Ghidra instance through an MCP server and iteratively analyzes binaries — reading assembly, understanding behavior, and writing its findings back into the Ghidra project as renamed functions, typed variables, and updated prototypes.
+A reverse engineering agent built on the [LangChain Deep Agents SDK](https://docs.langchain.com/oss/python/deepagents/overview). It connects to a running Ghidra instance through the [ghidra-mcp](https://github.com/bethington/ghidra-mcp) MCP server and iteratively analyzes binaries — reading assembly, understanding behavior, and writing its findings back into the Ghidra project as renamed functions, typed variables, and updated prototypes.
 
 ## How it works
 
@@ -14,15 +14,16 @@ The agent uses Ghidra's MCP server as its primary toolset. On each turn it can:
 
 It treats the assembly as ground truth. Every rename or retype it applies is grounded in specific evidence from the disassembly — it won't guess. As it learns more about the binary it refines its earlier work, building up a progressively more readable Ghidra project.
 
-Conversation history is persisted to MongoDB via `langgraph-checkpoint-mongodb`, so sessions survive restarts and the agent can continue where it left off.
+Conversation history is persisted to MongoDB via `langgraph-checkpoint-mongodb`, so sessions survive restarts and the agent can continue where it left off. Findings are also stored in a MongoDB vector collection so the agent can retrieve prior knowledge across sessions.
 
 ## Requirements
 
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
-- A running Ghidra MCP server (stdio, HTTP, or SSE)
+- A running [ghidra-mcp](https://github.com/bethington/ghidra-mcp) server (stdio, HTTP, or SSE)
 - MongoDB instance (local or remote)
 - An Anthropic API key (or any other supported LangChain model provider)
+- [Ollama](https://ollama.com/) (for the vector knowledge base embeddings)
 
 ## Setup
 
@@ -44,12 +45,20 @@ All configuration is done via environment variables (`.env` file or shell export
 | `ANTHROPIC_API_KEY` | — | API key for Anthropic *(not needed for Ollama)* |
 | `MODEL` | `anthropic:claude-sonnet-4-6` | Any `provider:model` string supported by LangChain |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL *(only needed if non-default)* |
+| `EMBED_MODEL` | `ollama:nomic-embed-text` | `provider:model` for embeddings — supports `ollama`, `openai`, `huggingface`, `cohere` |
 | `MONGODB_URI` | `mongodb://localhost:27017` | MongoDB connection string for checkpoint persistence |
+| `MONGODB_DB` | `checkpointing_db` | Database used by the checkpointer and knowledge base |
+| `MONGODB_VECTOR_COLLECTION` | `re_knowledge` | Collection for the vector knowledge base |
 | `GHIDRA_MCP_TRANSPORT` | `stdio` | Transport type: `stdio`, `http`, or `sse` |
 | `GHIDRA_MCP_COMMAND` | `ghidra-mcp` | *(stdio only)* Command to launch the MCP bridge |
 | `GHIDRA_MCP_ARGS` | *(empty)* | *(stdio only)* Extra CLI flags, space-separated |
 | `GHIDRA_MCP_URL` | `http://localhost:8080/mcp` | *(http/sse only)* URL of the MCP server |
+| `AGENT_OUTPUT_DIR` | *(unset)* | Optional directory the agent can read/write files in |
+| `RECURSION_LIMIT` | `100` | LangGraph recursion limit for deep analysis sessions |
 | `AGENTS_MD` | *(unset)* | Optional path to an `AGENTS.md` memory file |
+| `LANGSMITH_API_KEY` | *(unset)* | *(optional)* LangSmith API key to enable run tracing |
+| `LANGSMITH_TRACING` | *(unset)* | Set to `true` to enable LangSmith tracing |
+| `LANGSMITH_PROJECT` | *(unset)* | LangSmith project name for traces |
 
 ### Using Ollama
 
@@ -110,6 +119,12 @@ AGENTS_MD=./AGENTS.md
 uv run python main.py
 ```
 
+Pass `--session-id` to resume a previous session:
+
+```bash
+uv run python main.py --session-id <your-session-id>
+```
+
 The agent connects to the Ghidra MCP server, loads its tools, and opens an interactive prompt. Enter your analysis task in plain English:
 
 ```
@@ -119,6 +134,4 @@ The agent connects to the Ghidra MCP server, loads its tools, and opens an inter
 > what arguments does sub_403200 take? update the prototype
 ```
 
-Each session uses the thread ID `re-session`. To start a fresh session (e.g. for a new binary), change the `thread_id` in `main.py` or clear the relevant MongoDB collection.
-
-Press `Ctrl+C` or type `quit` to exit.
+Each run starts a new session with a random UUID unless `--session-id` is supplied. The session ID is printed when you exit — use it to resume later. Press `Ctrl+C` or type `quit` to exit.

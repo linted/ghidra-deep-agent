@@ -2,19 +2,18 @@ import os
 from datetime import UTC, datetime
 
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from langchain_core.tools import tool
 from langchain_core.tools.retriever import create_retriever_tool
 from langchain_mongodb import MongoDBAtlasVectorSearch
-from langchain_ollama import OllamaEmbeddings
 from pymongo import MongoClient
 
 
-def build_knowledge_tools(mongodb_uri: str, mongodb_db: str, embed_model: str) -> list:
+def build_knowledge_tools(mongodb_uri: str, mongodb_db: str, embeddings: Embeddings) -> list:
     client = MongoClient(mongodb_uri)
     collection = client[mongodb_db][
         os.environ.get("MONGODB_VECTOR_COLLECTION", "re_knowledge")
     ]
-    embeddings = OllamaEmbeddings(model=embed_model)
 
     vector_store = MongoDBAtlasVectorSearch(
         collection=collection,
