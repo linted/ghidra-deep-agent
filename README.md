@@ -16,6 +16,8 @@ It treats the assembly as ground truth. Every rename or retype it applies is gro
 
 Conversation history is persisted to MongoDB via `langgraph-checkpoint-mongodb`, so sessions survive restarts and the agent can continue where it left off. Findings are also stored in a MongoDB vector collection so the agent can retrieve prior knowledge across sessions.
 
+The knowledge base is scoped per binary — each program analyzed gets its own isolated namespace so findings never bleed between targets. When multiple binaries are open in Ghidra at startup, the agent presents a selection screen. A global semantic search tool is also available when cross-binary comparison is useful.
+
 ## Requirements
 
 - Python 3.12+
@@ -49,6 +51,7 @@ All configuration is done via environment variables (`.env` file or shell export
 | `MONGODB_URI` | `mongodb://localhost:27017` | MongoDB connection string for checkpoint persistence |
 | `MONGODB_DB` | `checkpointing_db` | Database used by the checkpointer and knowledge base |
 | `MONGODB_VECTOR_COLLECTION` | `re_knowledge` | Collection for the vector knowledge base |
+| `BINARY_NAME` | *(auto-detected)* | Override the binary name used to scope the knowledge base — see [Binary selection](#binary-selection) |
 | `GHIDRA_MCP_TRANSPORT` | `stdio` | Transport type: `stdio`, `http`, or `sse` |
 | `GHIDRA_MCP_COMMAND` | `ghidra-mcp` | *(stdio only)* Command to launch the MCP bridge |
 | `GHIDRA_MCP_ARGS` | *(empty)* | *(stdio only)* Extra CLI flags, space-separated |
@@ -91,6 +94,22 @@ GHIDRA_MCP_TRANSPORT=http
 GHIDRA_MCP_URL=http://localhost:8080/mcp
 ```
 
+### Binary selection
+
+At startup the agent calls `list_open_programs` on the Ghidra MCP server to determine which binary you are working on. This name is used to scope all knowledge base reads and writes so findings from different binaries never mix.
+
+- **One program open** — selected automatically, printed to console.
+- **Multiple programs open** — a selection screen appears before the main TUI; use arrow keys and Enter to choose.
+- **Override** — set `BINARY_NAME` in `.env` or pass `--binary-name` on the command line to skip detection entirely (useful for scripting or when the MCP server doesn't expose `list_open_programs`).
+
+```env
+BINARY_NAME=firmware_v2.bin
+```
+
+```bash
+uv run python main.py --binary-name firmware_v2.bin
+```
+
 ### Optional: AGENTS.md memory file
 
 Create an `AGENTS.md` file and point `AGENTS_MD` at it. The agent loads it into its context at the start of every session — useful for recording the binary's architecture, known data structures, and naming conventions:
@@ -123,6 +142,12 @@ Pass `--session-id` to resume a previous session:
 
 ```bash
 uv run python main.py --session-id <your-session-id>
+```
+
+Pass `--binary-name` to skip Ghidra's program detection:
+
+```bash
+uv run python main.py --binary-name firmware_v2.bin
 ```
 
 The agent connects to the Ghidra MCP server, loads its tools, and opens an interactive prompt. Enter your analysis task in plain English:

@@ -10,12 +10,11 @@ from pymongo import MongoClient
 
 
 def build_knowledge_tools(
-    mongodb_uri: str, mongodb_db: str, embeddings: Embeddings
+    mongodb_uri: str, mongodb_db: str, embeddings: Embeddings, binary_name: str
 ) -> list:
     client = MongoClient(mongodb_uri)
-    collection = client[mongodb_db][
-        os.environ.get("MONGODB_VECTOR_COLLECTION", "re_knowledge")
-    ]
+    collection_name = os.environ.get("MONGODB_VECTOR_COLLECTION", "re_knowledge")
+    collection = client[mongodb_db][collection_name]
 
     vector_store = MongoDBAtlasVectorSearch(
         collection=collection,
@@ -55,6 +54,7 @@ def build_knowledge_tools(
         doc = Document(
             page_content=content,
             metadata={
+                "binary_name": binary_name,
                 "category": category,
                 "address": address,
                 "function_name": function_name,
@@ -65,7 +65,7 @@ def build_knowledge_tools(
         )
         vector_store.add_documents([doc])
         label = function_name or address or category
-        return f"Saved: [{label}]"
+        return f"Saved: [{binary_name} | {label}]"
 
     @tool
     def query_by_address(address: str) -> str:
@@ -79,7 +79,10 @@ def build_knowledge_tools(
         """
         docs = list(
             collection.find(
-                {"address": {"$regex": f"^{address}", "$options": "i"}},
+                {
+                    "binary_name": binary_name,
+                    "address": {"$regex": f"^{address}", "$options": "i"},
+                },
                 {
                     "text": 1,
                     "category": 1,
@@ -113,7 +116,7 @@ def build_knowledge_tools(
         """
         docs = list(
             collection.find(
-                {"category": category},
+                {"binary_name": binary_name, "category": category},
                 {
                     "text": 1,
                     "address": 1,
@@ -134,14 +137,14 @@ def build_knowledge_tools(
 
     @tool
     def list_all_knowledge() -> str:
-        """List a summary of every entry in the knowledge base.
+        """List a summary of every entry in the knowledge base for the current binary.
 
         Call this at the start of a session to orient yourself — see which
         functions have been analyzed, what hypotheses exist, and where gaps remain.
         """
         docs = list(
             collection.find(
-                {},
+                {"binary_name": binary_name},
                 {
                     "text": 1,
                     "category": 1,
@@ -155,7 +158,7 @@ def build_knowledge_tools(
             ).sort("category", 1)
         )
         if not docs:
-            return "Knowledge base is empty."
+            return f"Knowledge base is empty for '{binary_name}'."
         lines = []
         for d in docs:
             parts = filter(
@@ -170,24 +173,60 @@ def build_knowledge_tools(
             label = " | ".join(parts)
             snippet = d.get("text", "")[:100]
             lines.append(f"[{label}]  {snippet}")
-        return f"{len(docs)} total findings:\n" + "\n".join(lines)
+        return f"{len(docs)} total findings for '{binary_name}':\n" + "\n".join(lines)
 
-    retriever = vector_store.as_retriever(search_kwargs={"k": 10})
+    @tool
+    def list_analyzed_binaries() -> str:
+        """List all binaries that have findings stored in the knowledge base.
+
+        Use this to see what other binaries have been analyzed and whether
+        cross-binary queries might surface relevant findings.
+        """
+        names = collection.distinct("binary_name")
+        if not names:
+            return "Knowledge base is empty."
+        lines = []
+        for name in sorted(names):
+            count = collection.count_documents({"binary_name": name})
+            marker = " ← current" if name == binary_name else ""
+            lines.append(f"  {name}: {count} finding(s){marker}")
+        return "Analyzed binaries:\n" + "\n".join(lines)
+
+    retriever = vector_store.as_retriever(
+        search_kwargs={
+            "k": 10,
+            "pre_filter": {"binary_name": {"$eq": binary_name}},
+        }
+    )
     query_knowledge = create_retriever_tool(
         retriever,
         name="query_knowledge",
         description=(
-            "Semantic search across the long-term knowledge base. "
+            f"Semantic search across the knowledge base for '{binary_name}'. "
             "Call this before analyzing any function or structure to "
             "recall prior conclusions. Query with natural language, "
             "function names, addresses, or behavioral descriptions."
         ),
     )
 
+    global_retriever = vector_store.as_retriever(search_kwargs={"k": 10})
+    query_knowledge_global = create_retriever_tool(
+        global_retriever,
+        name="query_knowledge_global",
+        description=(
+            "Semantic search across the knowledge base for ALL analyzed binaries. "
+            "Use this to find patterns, shared code, or related findings from other "
+            "binaries when cross-binary comparison may be relevant. "
+            "Results are labeled with their source binary."
+        ),
+    )
+
     return [
         save_knowledge,
         query_knowledge,
+        query_knowledge_global,
         query_by_address,
         query_by_category,
         list_all_knowledge,
+        list_analyzed_binaries,
     ]
