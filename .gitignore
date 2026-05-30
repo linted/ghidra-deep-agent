@@ -6,3 +6,4 @@ agent_output/
 mongodb/pwfile
 mongodb/keyfile
 mongodb/firmware_pwfile
+mongodb/tls/
