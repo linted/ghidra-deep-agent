@@ -14,17 +14,17 @@ chmod 400 "$SCRIPT_DIR/keyfile"
 echo "Generated keyfile"
 
 # pwfile: UUID used as the mongotUser password
-uuidgen | tr '[:upper:]' '[:lower:]' > "$SCRIPT_DIR/pwfile"
+uuidgen | tr '[:upper:]' '[:lower:]' | tr -d '\n' > "$SCRIPT_DIR/pwfile"
 chmod 400 "$SCRIPT_DIR/pwfile"
 echo "Generated pwfile (mongotUser password)"
 
 # firmware_pwfile: UUID used as the firmware_user password
-uuidgen | tr '[:upper:]' '[:lower:]' > "$SCRIPT_DIR/firmware_pwfile"
+uuidgen | tr '[:upper:]' '[:lower:]' | tr -d '\n' > "$SCRIPT_DIR/firmware_pwfile"
 chmod 400 "$SCRIPT_DIR/firmware_pwfile"
 echo "Generated firmware_pwfile (firmware_user password): $(cat "$SCRIPT_DIR/firmware_pwfile")"
 
 # admin_pwfile: UUID used as the MongoDB admin password
-uuidgen | tr '[:upper:]' '[:lower:]' > "$SCRIPT_DIR/admin_pwfile"
+uuidgen | tr '[:upper:]' '[:lower:]' | tr -d '\n' > "$SCRIPT_DIR/admin_pwfile"
 chmod 400 "$SCRIPT_DIR/admin_pwfile"
 echo "Generated admin_pwfile (admin password): $(cat "$SCRIPT_DIR/admin_pwfile")"
 
