@@ -5,3 +5,4 @@ agent_output/
 *AGENTS.md
 mongodb/pwfile
 mongodb/keyfile
+mongodb/firmware_pwfile

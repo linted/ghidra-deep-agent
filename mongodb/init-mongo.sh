@@ -9,6 +9,9 @@ echo "Starting MongoDB initialization..."
 # docker-compose so the image creates it and uses those credentials for rs.initiate()
 # after the full restart.
 
+MONGOT_PWD=$(cat /etc/mongodb-passwords/mongot_pwfile)
+FIRMWARE_PWD=$(cat /etc/mongodb-passwords/firmware_pwfile)
+
 echo "Creating application users..."
 mongosh --eval "
   const adminDb = db.getSiblingDB('admin');
@@ -28,7 +31,7 @@ mongosh --eval "
 
   createUserSafe(adminDb, {
     user: 'firmware_user',
-    pwd: 'f2970a49-95bc-412c-8983-8c69d0a01e01',
+    pwd: '$FIRMWARE_PWD',
     roles: [
       { role: 'readWrite', db: 'firmware_analysis' }
     ]
@@ -36,7 +39,7 @@ mongosh --eval "
 
   createUserSafe(adminDb, {
     user: 'mongotUser',
-    pwd: 'b0533610-6d55-4a78-bbbe-afaace6c1fb3',
+    pwd: '$MONGOT_PWD',
     roles: [{ role: 'searchCoordinator', db: 'admin' }]
   });
 "

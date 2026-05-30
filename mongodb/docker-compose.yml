@@ -16,6 +16,10 @@ services:
          - ./sampledata.archive:/sampledata.archive
          - ./init-mongo.sh:/docker-entrypoint-initdb.d/init-mongo.sh:ro
          - ./keyfile:/etc/mongodb-keyfile:ro
+         - ./pwfile:/etc/mongodb-passwords/mongot_pwfile:ro
+         - ./firmware_pwfile:/etc/mongodb-passwords/firmware_pwfile:ro
+         - ./tls/mongod.pem:/etc/ssl/mongod.pem:ro
+         - ./tls/ca.pem:/etc/ssl/ca.pem:ro
       environment:
          MONGO_INITDB_ROOT_USERNAME: admin
          MONGO_INITDB_ROOT_PASSWORD: 1b3ad960-d798-43d4-bfd3-4973aa14dfa5
@@ -32,6 +36,7 @@ services:
          - mongot_data:/data/mongot
          - ./mongot.conf:/mongot-community/config.default.yml
          - ./pwfile:/mongot-community/pwfile:ro
+         - ./tls/ca.pem:/etc/ssl/ca.pem:ro
       depends_on:
          - mongod
       ports:
