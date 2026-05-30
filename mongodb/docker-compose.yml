@@ -15,9 +15,6 @@ services:
          - ./mongod.conf:/etc/mongod.conf:ro
          - ./sampledata.archive:/sampledata.archive
          - ./init-mongo.sh:/docker-entrypoint-initdb.d/init-mongo.sh:ro
-         - ./keyfile:/etc/mongodb-keyfile:ro
-         - ./tls/mongod.pem:/etc/ssl/mongod.pem:ro
-         - ./tls/ca.pem:/etc/ssl/ca.pem:ro
       environment:
          MONGO_INITDB_ROOT_USERNAME: admin
          MONGO_INITDB_ROOT_PASSWORD_FILE: /run/secrets/admin_pwfile
@@ -25,8 +22,13 @@ services:
          - admin_pwfile
          - mongot_pwfile
          - firmware_pwfile
+         - mongod_pem
+         - ca_pem
+         - keyfile
       networks:
-         - search-community
+         search-community:
+            aliases:
+               - mongod.search-community
 
 
    mongot:
@@ -37,7 +39,6 @@ services:
       volumes:
          - mongot_data:/data/mongot
          - ./mongot.conf:/mongot-community/config.default.yml
-         - ./tls/ca.pem:/etc/ssl/ca.pem:ro
       secrets:
          - mongot_pwfile
       depends_on:
@@ -62,3 +63,9 @@ secrets:
       file: ./pwfile
    firmware_pwfile:
       file: ./firmware_pwfile
+   mongod_pem:
+      file: ./tls/mongod.pem
+   ca_pem:
+      file: ./tls/ca.pem
+   keyfile:
+      file: ./keyfile

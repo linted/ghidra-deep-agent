@@ -14,30 +14,37 @@ Run `generate-secrets.sh` to create a `pwfile` and `keyfile`. This also generate
 
 1. Obtain a certificate for your domain (e.g. via certbot).
 
-2. Combine the private key and full chain into a single PEM file that MongoDB requires:
+2. Combine the private key and full chain into a single PEM file and write it directly into the letsencrypt live directory:
 
    ```bash
    cat /etc/letsencrypt/live/<your-domain>/privkey.pem \
        /etc/letsencrypt/live/<your-domain>/fullchain.pem \
-       > ./tls/mongod.pem
+       > /etc/letsencrypt/live/<your-domain>/mongod.pem
    ```
 
-3. Mount the entire letsencrypt directory in `docker-compose.yml` (already configured) so Docker correctly follows symlinks:
+3. Replace `mongod.search-community` with your domain in `docker-compose.yml` and `mongot.conf`. This must match the cert's CN/SAN so mongot can verify the TLS connection to mongod:
+
+   ```bash
+   sed -i 's/mongod.search-community/<your-domain>/g' docker-compose.yml mongot.conf
+   ```
+
+4. Update the `mongod_pem` and `ca_pem` file paths in the `secrets:` section of `docker-compose.yml`:
 
    ```yaml
-   - /etc/letsencrypt:/etc/letsencrypt:ro
+   mongod_pem:
+     file: /etc/letsencrypt/live/<your-domain>/mongod.pem
+   ca_pem:
+     file: /etc/letsencrypt/live/<your-domain>/fullchain.pem
    ```
 
-4. Update the cert paths in `mongod.conf` to match your domain.
-
-**Cert renewal:** Let's Encrypt certs expire every 90 days. After each renewal, regenerate `mongod.pem` and restart the container. Add a certbot deploy hook to automate this:
+**Cert renewal:** Let's Encrypt certs expire every 90 days. Add a certbot deploy hook to regenerate `mongod.pem` and restart the containers:
 
 ```bash
 # /etc/letsencrypt/renewal-hooks/deploy/restart-mongodb.sh
 cat /etc/letsencrypt/live/<your-domain>/privkey.pem \
     /etc/letsencrypt/live/<your-domain>/fullchain.pem \
-    > /path/to/mongodb/tls/mongod.pem
-docker restart mongod-community
+    > /etc/letsencrypt/live/<your-domain>/mongod.pem
+docker restart mongod-community mongot-community-pupr
 ```
 
 ### With self-signed certificates
@@ -56,7 +63,7 @@ docker restart mongod-community
 
 ### Without TLS
 
-Comment out the `tls:` block in `mongod.conf` and the TLS volume mounts in `docker-compose.yml`.
+Comment out the `tls:` block in `mongod.conf`, set `tls: false` in `mongot.conf`, and remove the TLS volume mounts from `docker-compose.yml`.
 
 ## Starting the stack
 
