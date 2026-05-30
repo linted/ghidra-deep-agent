@@ -16,13 +16,15 @@ services:
          - ./sampledata.archive:/sampledata.archive
          - ./init-mongo.sh:/docker-entrypoint-initdb.d/init-mongo.sh:ro
          - ./keyfile:/etc/mongodb-keyfile:ro
-         - ./pwfile:/etc/mongodb-passwords/mongot_pwfile:ro
-         - ./firmware_pwfile:/etc/mongodb-passwords/firmware_pwfile:ro
          - ./tls/mongod.pem:/etc/ssl/mongod.pem:ro
          - ./tls/ca.pem:/etc/ssl/ca.pem:ro
       environment:
          MONGO_INITDB_ROOT_USERNAME: admin
-         MONGO_INITDB_ROOT_PASSWORD: 1b3ad960-d798-43d4-bfd3-4973aa14dfa5
+         MONGO_INITDB_ROOT_PASSWORD_FILE: /run/secrets/admin_pwfile
+      secrets:
+         - admin_pwfile
+         - mongot_pwfile
+         - firmware_pwfile
       networks:
          - search-community
 
@@ -35,8 +37,9 @@ services:
       volumes:
          - mongot_data:/data/mongot
          - ./mongot.conf:/mongot-community/config.default.yml
-         - ./pwfile:/mongot-community/pwfile:ro
          - ./tls/ca.pem:/etc/ssl/ca.pem:ro
+      secrets:
+         - mongot_pwfile
       depends_on:
          - mongod
       ports:
@@ -51,3 +54,11 @@ networks:
    search-community:
       name: search-community
       external: true  # Use an external network if it exists. Comment this line if you want to create a new network.
+
+secrets:
+   admin_pwfile:
+      file: ./admin_pwfile
+   mongot_pwfile:
+      file: ./pwfile
+   firmware_pwfile:
+      file: ./firmware_pwfile

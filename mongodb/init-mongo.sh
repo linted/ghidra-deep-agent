@@ -9,8 +9,8 @@ echo "Starting MongoDB initialization..."
 # docker-compose so the image creates it and uses those credentials for rs.initiate()
 # after the full restart.
 
-MONGOT_PWD=$(cat /etc/mongodb-passwords/mongot_pwfile)
-FIRMWARE_PWD=$(cat /etc/mongodb-passwords/firmware_pwfile)
+MONGOT_PWD=$(cat /run/secrets/mongot_pwfile)
+FIRMWARE_PWD=$(cat /run/secrets/firmware_pwfile)
 
 echo "Creating application users..."
 mongosh --eval "
