@@ -31,7 +31,7 @@ def build_knowledge_tools(
         address: str = "",
         function_name: str = "",
         confidence: str = "medium",
-        tags: str = "",
+        tags: list[str] | None = None,
     ) -> str:
         """Save a reverse engineering finding to the long-term knowledge base.
 
@@ -48,8 +48,7 @@ def build_knowledge_tools(
             function_name: The function name (original or renamed),
                 e.g. 'parse_config_file'.
             confidence: 'high', 'medium', or 'low'.
-            tags: Comma-separated keywords for later filtering,
-                e.g. 'crypto,loop,syscall'.
+            tags: Keywords for later filtering, e.g. ['crypto', 'loop', 'syscall'].
         """
         doc = Document(
             page_content=content,
@@ -59,7 +58,7 @@ def build_knowledge_tools(
                 "address": address,
                 "function_name": function_name,
                 "confidence": confidence,
-                "tags": tags,
+                "tags": tags or [],
                 "saved_at": datetime.now(UTC).isoformat(),
             },
         )
@@ -68,7 +67,49 @@ def build_knowledge_tools(
         return f"Saved: [{binary_name} | {label}]"
 
     @tool
-    def query_by_address(address: str) -> str:
+    def update_knowledge(
+        address: str,
+        function_name: str | None = None,
+        confidence: str | None = None,
+        tags: list[str] | None = None,
+    ) -> str:
+        """Update metadata on all knowledge entries for a given address.
+
+        Use this when a function is renamed, confidence changes, or tags need
+        updating. Only the fields you provide are changed; omit a field to leave
+        it unchanged. To replace the content of a finding entirely, save a new
+        entry instead.
+
+        Args:
+            address: Exact address of the entries to update, e.g. '0x08000100'.
+            function_name: New function name, e.g. 'does_a_thing'.
+            confidence: New confidence level: 'high', 'medium', or 'low'.
+            tags: Replacement tags list, e.g. ['crypto', 'hash'].
+        """
+        updates: dict = {}
+        if function_name is not None:
+            updates["function_name"] = function_name
+        if confidence is not None:
+            updates["confidence"] = confidence
+        if tags is not None:
+            updates["tags"] = tags
+
+        if not updates:
+            return "Nothing to update — no fields provided."
+
+        result = collection.update_many(
+            {"binary_name": binary_name, "address": address},
+            {"$set": updates},
+        )
+        if result.matched_count == 0:
+            return f"No entries found for address '{address}'."
+        return (
+            f"Updated {result.modified_count} of {result.matched_count} "
+            f"entry/entries for '{address}'."
+        )
+
+    @tool
+    def query_by_address(address: str, tags: list[str] | None = None) -> str:
         """Retrieve all stored findings for a given address or address prefix.
 
         Use this before working on a specific function or data location to surface
@@ -76,13 +117,18 @@ def build_knowledge_tools(
 
         Args:
             address: Full or partial address string, e.g. '0x08000100' or '0x0800'.
+            tags: Optional list of tags to filter by; returns findings that have
+                at least one matching tag, e.g. ['crypto', 'loop'].
         """
+        query: dict = {
+            "binary_name": binary_name,
+            "address": {"$regex": f"^{address}", "$options": "i"},
+        }
+        if tags:
+            query["tags"] = {"$in": tags}
         docs = list(
             collection.find(
-                {
-                    "binary_name": binary_name,
-                    "address": {"$regex": f"^{address}", "$options": "i"},
-                },
+                query,
                 {
                     "text": 1,
                     "category": 1,
@@ -104,7 +150,7 @@ def build_knowledge_tools(
         return f"{len(docs)} finding(s):\n" + "\n".join(lines)
 
     @tool
-    def query_by_category(category: str) -> str:
+    def query_by_category(category: str, tags: list[str] | None = None) -> str:
         """Retrieve all stored findings of a given category.
 
         Useful for reviewing every known function, every hypothesis, or every rename
@@ -113,10 +159,15 @@ def build_knowledge_tools(
         Args:
             category: One of 'function', 'structure', 'string', 'hypothesis',
                 'rename', 'finding'.
+            tags: Optional list of tags to filter by; returns findings that have
+                at least one matching tag, e.g. ['crypto', 'loop'].
         """
+        query: dict = {"binary_name": binary_name, "category": category}
+        if tags:
+            query["tags"] = {"$in": tags}
         docs = list(
             collection.find(
-                {"binary_name": binary_name, "category": category},
+                query,
                 {
                     "text": 1,
                     "address": 1,
@@ -136,15 +187,22 @@ def build_knowledge_tools(
         return f"{len(docs)} finding(s):\n" + "\n".join(lines)
 
     @tool
-    def list_all_knowledge() -> str:
+    def list_all_knowledge(tags: list[str] | None = None) -> str:
         """List a summary of every entry in the knowledge base for the current binary.
 
         Call this at the start of a session to orient yourself — see which
         functions have been analyzed, what hypotheses exist, and where gaps remain.
+
+        Args:
+            tags: Optional list of tags to filter by; returns findings that have
+                at least one matching tag, e.g. ['crypto', 'loop'].
         """
+        query: dict = {"binary_name": binary_name}
+        if tags:
+            query["tags"] = {"$in": tags}
         docs = list(
             collection.find(
-                {"binary_name": binary_name},
+                query,
                 {
                     "text": 1,
                     "category": 1,
@@ -174,6 +232,41 @@ def build_knowledge_tools(
             snippet = d.get("text", "")[:100]
             lines.append(f"[{label}]  {snippet}")
         return f"{len(docs)} total findings for '{binary_name}':\n" + "\n".join(lines)
+
+    @tool
+    def query_by_tags(tags: list[str]) -> str:
+        """Retrieve all stored findings that match any of the given tags.
+
+        Use this to surface everything related to a theme across the whole binary,
+        e.g. all crypto-related findings or all syscall sites.
+
+        Args:
+            tags: One or more tags to search for, e.g. ['crypto', 'hash'].
+                Returns findings that match at least one tag.
+        """
+        docs = list(
+            collection.find(
+                {"binary_name": binary_name, "tags": {"$in": tags}},
+                {
+                    "text": 1,
+                    "category": 1,
+                    "address": 1,
+                    "function_name": 1,
+                    "confidence": 1,
+                    "tags": 1,
+                    "_id": 0,
+                },
+            ).sort("category", 1)
+        )
+        if not docs:
+            return f"No findings tagged with {tags}."
+        lines = [
+            f"[{d.get('category', '')} | {d.get('confidence', '')}] "
+            f"{d.get('address', '')} {d.get('function_name', '')} "
+            f"[{', '.join(d.get('tags', []))}] — {d.get('text', '')}"
+            for d in docs
+        ]
+        return f"{len(docs)} finding(s) for tags {tags}:\n" + "\n".join(lines)
 
     @tool
     def list_analyzed_binaries() -> str:
@@ -223,10 +316,12 @@ def build_knowledge_tools(
 
     return [
         save_knowledge,
+        update_knowledge,
         query_knowledge,
         query_knowledge_global,
         query_by_address,
         query_by_category,
+        query_by_tags,
         list_all_knowledge,
         list_analyzed_binaries,
     ]
