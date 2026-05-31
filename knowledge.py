@@ -20,9 +20,29 @@ def build_knowledge_tools(
         collection=collection,
         embedding=embeddings,
         index_name="re_knowledge_index",
-        auto_create_index=True,
-        auto_index_timeout=60,
+        auto_create_index=False,
     )
+
+    # Ensure the index exists and has binary_name as a filterable field.
+    # auto_create_index=True only creates a bare vector index; pre_filter on
+    # binary_name requires it to be explicitly declared as a filter field.
+    try:
+        existing = list(collection.list_search_indexes("re_knowledge_index"))
+        fields = existing[0].get("latestDefinition", {}).get("fields", []) if existing else []
+        has_filter = any(
+            f.get("type") == "filter" and f.get("path") == "binary_name"
+            for f in fields
+        )
+        if not has_filter:
+            dims = len(embeddings.embed_query(""))
+            vector_store.create_vector_search_index(
+                dimensions=dims,
+                filters=["binary_name"],
+                update=bool(existing),
+                wait_until_complete=60,
+            )
+    except Exception:
+        pass  # mongot unavailable; direct query tools still work
 
     @tool
     def save_knowledge(

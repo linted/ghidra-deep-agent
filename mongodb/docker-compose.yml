@@ -35,12 +35,15 @@ services:
       image: mongodb/mongodb-community-search:latest
       container_name: mongot-community-pupr
       networks:
-         - search-community
+         search-community:
+            aliases:
+               - mongot.search-community
       volumes:
          - mongot_data:/data/mongot
          - ./mongot.conf:/mongot-community/config.default.yml
       secrets:
          - mongot_pwfile
+         - mongot_pem
       depends_on:
          - mongod
       ports:
@@ -65,6 +68,8 @@ secrets:
       file: ./firmware_pwfile
    mongod_pem:
       file: ./tls/mongod.pem
+   mongot_pem:
+      file: ./tls/mongot.pem
    ca_pem:
       file: ./tls/ca.pem
    keyfile:
