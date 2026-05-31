@@ -41,8 +41,9 @@ def build_knowledge_tools(
                 update=bool(existing),
                 wait_until_complete=60,
             )
-    except Exception:
-        pass  # mongot unavailable; direct query tools still work
+    except Exception as exc:
+        import sys
+        print(f"Warning: vector search index setup failed ({exc}); direct query tools still work", file=sys.stderr)
 
     @tool
     def save_knowledge(
@@ -53,12 +54,13 @@ def build_knowledge_tools(
         confidence: str = "medium",
         tags: list[str] | None = None,
     ) -> str:
-        """Save a reverse engineering finding to the long-term knowledge base.
+        """Save a NEW reverse engineering finding to the long-term knowledge base.
 
-        Call this after EVERY function analyzed, every rename or retype decision, every
-        identified data structure, and every hypothesis — even uncertain ones. Write
-        content as a clear, self-contained statement so it makes sense without context
-        later.
+        Call this the first time you record a function, data structure, string, or
+        hypothesis — when no entry for it exists yet. Write content as a clear,
+        self-contained statement so it makes sense without context later. To update
+        an entry that was already saved (rename, confidence change, tag update),
+        use update_knowledge instead.
 
         Args:
             content: The finding as a self-contained statement.
@@ -93,12 +95,12 @@ def build_knowledge_tools(
         confidence: str | None = None,
         tags: list[str] | None = None,
     ) -> str:
-        """Update metadata on all knowledge entries for a given address.
+        """Update metadata on EXISTING knowledge entries for a given address.
 
-        Use this when a function is renamed, confidence changes, or tags need
-        updating. Only the fields you provide are changed; omit a field to leave
-        it unchanged. To replace the content of a finding entirely, save a new
-        entry instead.
+        Use this when knowledge already saved for an address needs to change —
+        a function is renamed, confidence level shifts, or tags need updating.
+        Only the fields you provide are changed; omit a field to leave it unchanged.
+        To record a brand-new finding with no prior entry, use save_knowledge instead.
 
         Args:
             address: Exact address of the entries to update, e.g. '0x08000100'.

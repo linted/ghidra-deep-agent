@@ -33,6 +33,13 @@ def _parse_program_list(result: str) -> list[str]:
                 item.get("name", str(item)) if isinstance(item, dict) else str(item)
                 for item in data
             ]
+        if isinstance(data, dict):
+            programs = data.get("programs", [])
+            if isinstance(programs, list):
+                return [
+                    item.get("name", str(item)) if isinstance(item, dict) else str(item)
+                    for item in programs
+                ]
     except (json.JSONDecodeError, AttributeError):
         pass
 
@@ -61,7 +68,21 @@ async def _resolve_binary_name(tools: list, override: str | None) -> str:
 
     try:
         result = await list_tool.ainvoke({})
-        programs = _parse_program_list(str(result))
+        # langchain_mcp_adapters may return a content-block list instead of a
+        # plain string; dig out the first text block if so.
+        if isinstance(result, list):
+            text = next(
+                (
+                    (item.get("text") if isinstance(item, dict) else getattr(item, "text", None))
+                    for item in result
+                    if (isinstance(item, dict) and item.get("type") == "text")
+                    or (hasattr(item, "type") and item.type == "text")
+                ),
+                str(result),
+            )
+        else:
+            text = str(result)
+        programs = _parse_program_list(text)
     except Exception as exc:
         raise RuntimeError(f"Failed to list open programs: {exc}") from exc
 
