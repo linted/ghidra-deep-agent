@@ -14,7 +14,9 @@ class _ChatDeepSeekFixed(ChatDeepSeek):
     it back into the request payload, causing a 400 on multi-turn sessions.
     """
 
-    def _get_request_payload(self, input_: Any, *, stop=None, **kwargs) -> dict:
+    def _get_request_payload(
+        self, input_: Any, *, stop: list[str] | None = None, **kwargs: Any
+    ) -> dict[str, Any]:
         original_messages = self._convert_input(input_).to_messages()
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
 
@@ -68,7 +70,7 @@ def build_embeddings(embed_string: str) -> Embeddings:
     )
 
 
-def build_model(model_string: str):
+def build_model(model_string: str) -> _ChatDeepSeekFixed | str:
     """Return a configured chat model for the given provider:model string.
 
     For DeepSeek models we return _ChatDeepSeekFixed so reasoning_content is

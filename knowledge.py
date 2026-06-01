@@ -1,5 +1,6 @@
 import os
 from datetime import UTC, datetime
+from typing import Any
 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
@@ -11,8 +12,8 @@ from pymongo import MongoClient
 
 def build_knowledge_tools(
     mongodb_uri: str, mongodb_db: str, embeddings: Embeddings, binary_name: str
-) -> list:
-    client = MongoClient(mongodb_uri)
+) -> list[Any]:
+    client: MongoClient[Any] = MongoClient(mongodb_uri)
     collection_name = os.environ.get("MONGODB_VECTOR_COLLECTION", "re_knowledge")
     collection = client[mongodb_db][collection_name]
 
@@ -28,10 +29,13 @@ def build_knowledge_tools(
     # binary_name requires it to be explicitly declared as a filter field.
     try:
         existing = list(collection.list_search_indexes("re_knowledge_index"))
-        fields = existing[0].get("latestDefinition", {}).get("fields", []) if existing else []
+        fields = (
+            existing[0].get("latestDefinition", {}).get("fields", [])
+            if existing
+            else []
+        )
         has_filter = any(
-            f.get("type") == "filter" and f.get("path") == "binary_name"
-            for f in fields
+            f.get("type") == "filter" and f.get("path") == "binary_name" for f in fields
         )
         if not has_filter:
             dims = len(embeddings.embed_query(""))
@@ -43,7 +47,12 @@ def build_knowledge_tools(
             )
     except Exception as exc:
         import sys
-        print(f"Warning: vector search index setup failed ({exc}); direct query tools still work", file=sys.stderr)
+
+        print(
+            f"Warning: vector search index setup failed ({exc});"
+            " direct query tools still work",
+            file=sys.stderr,
+        )
 
     @tool
     def save_knowledge(
@@ -108,7 +117,7 @@ def build_knowledge_tools(
             confidence: New confidence level: 'high', 'medium', or 'low'.
             tags: Replacement tags list, e.g. ['crypto', 'hash'].
         """
-        updates: dict = {}
+        updates: dict[str, Any] = {}
         if function_name is not None:
             updates["function_name"] = function_name
         if confidence is not None:
@@ -142,7 +151,7 @@ def build_knowledge_tools(
             tags: Optional list of tags to filter by; returns findings that have
                 at least one matching tag, e.g. ['crypto', 'loop'].
         """
-        query: dict = {
+        query: dict[str, Any] = {
             "binary_name": binary_name,
             "address": {"$regex": f"^{address}", "$options": "i"},
         }
@@ -184,7 +193,7 @@ def build_knowledge_tools(
             tags: Optional list of tags to filter by; returns findings that have
                 at least one matching tag, e.g. ['crypto', 'loop'].
         """
-        query: dict = {"binary_name": binary_name, "category": category}
+        query: dict[str, Any] = {"binary_name": binary_name, "category": category}
         if tags:
             query["tags"] = {"$in": tags}
         docs = list(
@@ -219,7 +228,7 @@ def build_knowledge_tools(
             tags: Optional list of tags to filter by; returns findings that have
                 at least one matching tag, e.g. ['crypto', 'loop'].
         """
-        query: dict = {"binary_name": binary_name}
+        query: dict[str, Any] = {"binary_name": binary_name}
         if tags:
             query["tags"] = {"$in": tags}
         docs = list(

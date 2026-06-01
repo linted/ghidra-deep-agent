@@ -35,6 +35,7 @@ select = ["E", "F", "I", "UP"]
 python_version = "3.12"
 strict = true
 ignore_missing_imports = true
+exclude = ["agent_output"]
 
 [dependency-groups]
 dev = [

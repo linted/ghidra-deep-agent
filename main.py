@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import uuid
+from typing import Any
 
 from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
@@ -55,7 +56,7 @@ def _parse_program_list(result: str) -> list[str]:
     return names
 
 
-async def _resolve_binary_name(tools: list, override: str | None) -> str:
+async def _resolve_binary_name(tools: list[Any], override: str | None) -> str:
     if override:
         return override
 
@@ -71,15 +72,20 @@ async def _resolve_binary_name(tools: list, override: str | None) -> str:
         # langchain_mcp_adapters may return a content-block list instead of a
         # plain string; dig out the first text block if so.
         if isinstance(result, list):
-            text = next(
+            raw = next(
                 (
-                    (item.get("text") if isinstance(item, dict) else getattr(item, "text", None))
+                    (
+                        item.get("text")
+                        if isinstance(item, dict)
+                        else getattr(item, "text", None)
+                    )
                     for item in result
                     if (isinstance(item, dict) and item.get("type") == "text")
                     or (hasattr(item, "type") and item.type == "text")
                 ),
                 str(result),
             )
+            text: str = raw if isinstance(raw, str) else str(result)
         else:
             text = str(result)
         programs = _parse_program_list(text)
@@ -99,7 +105,6 @@ async def _resolve_binary_name(tools: list, override: str | None) -> str:
     if not selected:
         raise RuntimeError("No program selected.")
     return selected
-
 
 
 async def main() -> None:
@@ -129,7 +134,7 @@ async def main() -> None:
         url = mcp_config["ghidra"].get("url", "")
         print(f"Connecting to Ghidra MCP server [{transport_desc}: {url}]...")
 
-    async def handle_mcp_errors(request: MCPToolCallRequest, handler):
+    async def handle_mcp_errors(request: MCPToolCallRequest, handler: Any) -> Any:
         try:
             return await handler(request)
         except Exception as exc:
@@ -172,7 +177,9 @@ async def main() -> None:
 
     try:
         embeddings = build_embeddings(embed_string)
-        knowledge_tools = build_knowledge_tools(mongodb_uri, mongodb_db, embeddings, binary_name)
+        knowledge_tools = build_knowledge_tools(
+            mongodb_uri, mongodb_db, embeddings, binary_name
+        )
         print(f"Knowledge base ready  [embed: {embed_string}]")
     except Exception as exc:
         print(f"Warning: knowledge base unavailable ({exc})", file=sys.stderr)
@@ -186,13 +193,14 @@ async def main() -> None:
     }
 
     output_dir = os.environ.get("AGENT_OUTPUT_DIR", "")
+    backend: Any
     if output_dir:
         backend = FilesystemBackend(root_dir=output_dir, virtual_mode=True)
     else:
         backend = StateBackend()
 
     with MongoDBSaver.from_conn_string(mongodb_uri, db_name=mongodb_db) as checkpointer:
-        agent_kwargs: dict = dict(
+        agent_kwargs: dict[str, Any] = dict(
             model=built_model,
             tools=knowledge_tools + tools,
             system_prompt=SYSTEM_PROMPT,

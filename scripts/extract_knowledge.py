@@ -11,6 +11,7 @@ agent's execution to get the latest knowledge.
 
 import os
 import sys
+from typing import Any
 
 from dotenv import load_dotenv
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
@@ -24,7 +25,7 @@ THREAD_ID = os.environ.get("THREAD_ID", "re-session")
 FILE_PATH = "/knowledge.md"
 OUTPUT = "knowledge.md"
 
-client = MongoClient(MONGODB_URI)
+client: MongoClient[Any] = MongoClient(MONGODB_URI)
 db = client[MONGODB_DB]
 serde = JsonPlusSerializer()
 
