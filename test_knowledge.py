@@ -1,243 +1,288 @@
 """
-End-to-end test for the MongoDB knowledge base.
+End-to-end pytest tests for the MongoDB knowledge base.
 
 Checks each layer independently so it's clear exactly where things break:
-  1. MongoDB connectivity
-  2. Direct write + read (no search required)
-  3. Vector search index existence / creation
-  4. Embedding model (Ollama)
-  5. Full round-trip: save_knowledge → query_knowledge (vector)
-  6. Direct query tools: query_by_address, query_by_category, list_all_knowledge
+  - MongoDB connectivity and direct write/read
+  - Vector search index presence
+  - Embedding model
+  - Full round-trip: save_knowledge → query_knowledge (vector)
+  - Direct query tools: query_by_address, query_by_category, list_all_knowledge
+  - Tag filtering across all query tools
+  - update_knowledge: rename, confidence/tags update, no-op, unknown address
+  - list_analyzed_binaries
 
-Run:  uv run python test_knowledge.py
+Run:  uv run pytest test_knowledge.py -v
 """
 
-import os
-import sys
-import time
+from __future__ import annotations
 
+import os
+import time
+from collections.abc import Generator
+from typing import Any
+
+import pytest
 from dotenv import load_dotenv
 
 load_dotenv()
-
-PASS = "\033[32m✓\033[0m"
-FAIL = "\033[31m✗\033[0m"
-INFO = "\033[2m·\033[0m"
-
-_test_doc_id = None
-
-
-def step(label: str) -> None:
-    print(f"\n{label}")
-    print("─" * len(label))
-
-
-def ok(msg: str) -> None:
-    print(f"  {PASS}  {msg}")
-
-
-def fail(msg: str) -> None:
-    print(f"  {FAIL}  {msg}")
-
-
-def info(msg: str) -> None:
-    print(f"  {INFO}  \033[2m{msg}\033[0m")
-
 
 # ── config ────────────────────────────────────────────────────────────────────
 
 MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
 MONGODB_DB = os.environ.get("MONGODB_DB", "checkpointing_db")
-COLLECTION = os.environ.get("MONGODB_VECTOR_COLLECTION", "re_knowledge")
+COLLECTION = "re_knowledge_test"
+os.environ["MONGODB_VECTOR_COLLECTION"] = COLLECTION
 _ollama_fallback = f"ollama:{os.environ.get('OLLAMA_EMBED_MODEL', 'nomic-embed-text')}"
 EMBED_MODEL = os.environ.get("EMBED_MODEL", _ollama_fallback)
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+BINARY_NAME = os.environ.get("BINARY_NAME", "test_binary")
 
-TEST_MARKER = "__test_knowledge_script__"
+TEST_MARKER = "__test_knowledge_pytest__"
+TEST_ADDRESS = "0xDEADBEEF"
+UPDATE_ADDRESS = "0xBEEFBEEF"
 
-print("\nKnowledge base test")
-print("=" * 40)
-info(f"URI:        {MONGODB_URI[:40]}...")
-info(f"DB:         {MONGODB_DB}")
-info(f"Collection: {COLLECTION}")
-info(f"Embed:      {EMBED_MODEL}")
+
+# ── fixtures ──────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture(scope="session")
+def mongo_client() -> Generator[Any, None, None]:
+    from pymongo import MongoClient
+
+    client: Any = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+    client.admin.command("ping")
+    yield client
+    client[MONGODB_DB][COLLECTION].drop()
+    client.close()
+
+
+@pytest.fixture(scope="session")
+def mongo_collection(mongo_client: Any) -> Any:
+    return mongo_client[MONGODB_DB][COLLECTION]
+
+
+@pytest.fixture(scope="session")
+def embeddings_model() -> Any:
+    from models import build_embeddings
+
+    try:
+        emb = build_embeddings(EMBED_MODEL)
+        emb.embed_query("test")
+        return emb
+    except Exception as exc:
+        pytest.skip(f"Embedding model unavailable: {exc}")
+
+
+@pytest.fixture(scope="session")
+def tools_map(embeddings_model: Any) -> Any:
+    from knowledge import build_knowledge_tools
+
+    tm = {
+        t.name: t
+        for t in build_knowledge_tools(
+            MONGODB_URI, MONGODB_DB, embeddings_model, BINARY_NAME
+        )
+    }
+
+    # Seed the primary read-only test document.
+    tm["save_knowledge"].invoke(
+        {
+            "content": f"Test function at {TEST_ADDRESS}: marker={TEST_MARKER}",
+            "category": "function",
+            "address": TEST_ADDRESS,
+            "function_name": TEST_MARKER,
+            "confidence": "high",
+            "tags": ["test", "crypto"],
+        }
+    )
+    # Seed a separate document owned by update_knowledge tests.
+    tm["save_knowledge"].invoke(
+        {
+            "content": (
+                f"Update test function at {UPDATE_ADDRESS}: marker={TEST_MARKER}"
+            ),
+            "category": "function",
+            "address": UPDATE_ADDRESS,
+            "function_name": TEST_MARKER,
+            "confidence": "medium",
+            "tags": ["test"],
+        }
+    )
+
+    time.sleep(1)  # let the vector index catch up
+    return tm
 
 
 # ── 1. connectivity ───────────────────────────────────────────────────────────
 
-step("1. MongoDB connectivity")
-try:
-    from pymongo import MongoClient
-    from pymongo.errors import ConnectionFailure, OperationFailure
 
-    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    client.admin.command("ping")
-    ok("Connected and ping succeeded")
-except ConnectionFailure as exc:
-    fail(f"Cannot reach MongoDB: {exc}")
-    sys.exit(1)
-except OperationFailure as exc:
-    fail(f"Auth / operation failure: {exc}")
-    sys.exit(1)
-except Exception as exc:
-    fail(f"Unexpected error: {exc}")
-    sys.exit(1)
+class TestMongoConnectivity:
+    def test_ping(self, mongo_client: Any) -> None:
+        mongo_client.admin.command("ping")
 
 
 # ── 2. direct write + read ────────────────────────────────────────────────────
 
-step("2. Direct write + read (no search required)")
-try:
-    collection = client[MONGODB_DB][COLLECTION]
 
-    result = collection.insert_one(
-        {
-            "text": "Test document inserted by test_knowledge.py",
-            "category": "test",
-            "address": "0x00000000",
-            "function_name": TEST_MARKER,
-            "confidence": "high",
-            "tags": "test",
-        }
-    )
-    _test_doc_id = result.inserted_id
-    ok(f"Inserted document  _id={_test_doc_id}")
+class TestDirectWriteRead:
+    def test_insert_and_read_back(self, mongo_collection: Any) -> None:
+        doc_id = mongo_collection.insert_one(
+            {
+                "text": "Direct insert by test_knowledge.py",
+                "binary_name": BINARY_NAME,
+                "category": "test",
+                "address": "0x00000000",
+                "function_name": TEST_MARKER,
+                "confidence": "high",
+                "tags": ["test"],
+            }
+        ).inserted_id
 
-    found = collection.find_one({"_id": _test_doc_id})
-    assert found is not None, "Document not found after insert"
-    assert found["function_name"] == TEST_MARKER
-    ok("Read back inserted document — content matches")
-except Exception as exc:
-    fail(f"Direct write/read failed: {exc}")
-    sys.exit(1)
+        found = mongo_collection.find_one({"_id": doc_id})
+        assert found is not None
+        assert found["function_name"] == TEST_MARKER
+        assert found["tags"] == ["test"]
 
 
 # ── 3. vector search index ────────────────────────────────────────────────────
 
-step("3. Vector search index")
-index_ok = False
-try:
-    indexes = list(collection.list_search_indexes())
-    if indexes:
-        names = [idx.get("name") for idx in indexes]
-        ok(f"Found {len(indexes)} search index(es): {names}")
-        index_ok = True
-    else:
-        info(
-            "No search indexes found yet — auto_create_index=True will "
-            "attempt creation on first use"
-        )
-except Exception as exc:
-    fail(f"list_search_indexes() failed: {exc}")
-    info(
-        "This usually means the Atlas Search (mongot) service is not "
-        "running on this deployment."
-    )
-    info("Vector similarity queries will not work until mongot is available.")
+
+class TestVectorSearchIndex:
+    def test_search_indexes_accessible(self, mongo_collection: Any) -> None:
+        try:
+            indexes = list(mongo_collection.list_search_indexes())
+        except Exception as exc:
+            pytest.skip(
+                f"list_search_indexes() not available on this deployment: {exc}"
+            )
+        # We just assert the call succeeded; the index may not exist yet
+        assert isinstance(indexes, list)
 
 
 # ── 4. embedding model ────────────────────────────────────────────────────────
 
-step("4. Embedding model")
-embeddings = None
-try:
-    from models import build_embeddings
 
-    _emb = build_embeddings(EMBED_MODEL)
-    vec = _emb.embed_query("test embedding")
-    ok(f"embed_query returned vector of length {len(vec)}  [{EMBED_MODEL}]")
-    embeddings = _emb
-except Exception as exc:
-    fail(f"embed_query failed: {exc}")
-    embeddings = None
+class TestEmbeddingModel:
+    def test_embed_query_returns_vector(self, embeddings_model: Any) -> None:
+        vec = embeddings_model.embed_query("test embedding")
+        assert len(vec) > 0
 
 
-# ── 5. full round-trip via knowledge tools ────────────────────────────────────
+# ── 5. full round-trip ────────────────────────────────────────────────────────
 
-step("5. Full round-trip via knowledge tools")
-if embeddings is None:
-    info("Skipping — embedding model unavailable")
-else:
-    try:
-        from knowledge import build_knowledge_tools
 
-        tools_map = {
-            t.name: t
-            for t in build_knowledge_tools(MONGODB_URI, MONGODB_DB, embeddings)
-        }
+class TestRoundTrip:
+    def test_query_knowledge_scoped(self, tools_map: Any) -> None:
+        result = tools_map["query_knowledge"].invoke({"query": TEST_MARKER})
+        assert TEST_MARKER in result
 
-        # save
-        save = tools_map["save_knowledge"]
-        result = save.invoke(
-            {
-                "content": f"Test function at 0xDEADBEEF: marker={TEST_MARKER}",
-                "category": "function",
-                "address": "0xDEADBEEF",
-                "function_name": TEST_MARKER,
-                "confidence": "high",
-                "tags": "test",
-            }
-        )
-        ok(f"save_knowledge: {result}")
-
-        time.sleep(1)  # give the index a moment to catch up
-
-        # vector query
-        query = tools_map["query_knowledge"]
-        results = query.invoke({"query": TEST_MARKER})
-        if TEST_MARKER in results:
-            ok("query_knowledge (vector): test document retrieved")
-        else:
-            fail("query_knowledge (vector): test document NOT found in results")
-            info(f"Raw result: {results[:200]}")
-
-    except Exception as exc:
-        fail(f"Round-trip failed: {exc}")
+    def test_query_knowledge_global(self, tools_map: Any) -> None:
+        result = tools_map["query_knowledge_global"].invoke({"query": TEST_MARKER})
+        assert TEST_MARKER in result
 
 
 # ── 6. direct query tools ─────────────────────────────────────────────────────
 
-step("6. Direct query tools")
-if embeddings is None:
-    info("Skipping — embedding model unavailable")
-else:
-    try:
-        from knowledge import build_knowledge_tools
 
-        tools_map = {
-            t.name: t
-            for t in build_knowledge_tools(MONGODB_URI, MONGODB_DB, embeddings)
-        }
+class TestDirectQueryTools:
+    def test_query_by_address(self, tools_map: Any) -> None:
+        r = tools_map["query_by_address"].invoke({"address": TEST_ADDRESS})
+        assert TEST_MARKER in r
 
-        r1 = tools_map["query_by_address"].invoke({"address": "0xDEADBEEF"})
-        if TEST_MARKER in r1:
-            ok("query_by_address: found test document")
-        else:
-            fail(f"query_by_address: test document not found\n    {r1[:200]}")
+    def test_query_by_category(self, tools_map: Any) -> None:
+        r = tools_map["query_by_category"].invoke({"category": "function"})
+        assert TEST_MARKER in r
 
-        r2 = tools_map["query_by_category"].invoke({"category": "function"})
-        if TEST_MARKER in r2:
-            ok("query_by_category: found test document")
-        else:
-            fail(f"query_by_category: test document not found\n    {r2[:200]}")
-
-        r3 = tools_map["list_all_knowledge"].invoke({})
-        if TEST_MARKER in r3:
-            ok("list_all_knowledge: found test document")
-        else:
-            fail(f"list_all_knowledge: test document not found\n    {r3[:200]}")
-
-    except Exception as exc:
-        fail(f"Direct query tools failed: {exc}")
+    def test_list_all_knowledge(self, tools_map: Any) -> None:
+        r = tools_map["list_all_knowledge"].invoke({})
+        assert TEST_MARKER in r
 
 
-# ── cleanup ───────────────────────────────────────────────────────────────────
+# ── 7. tag filtering ──────────────────────────────────────────────────────────
 
-step("Cleanup")
-try:
-    deleted = collection.delete_many({"function_name": TEST_MARKER})
-    ok(f"Removed {deleted.deleted_count} test document(s)")
-except Exception as exc:
-    fail(f"Cleanup failed (manual removal may be needed): {exc}")
 
-print()
+class TestTagFiltering:
+    def test_query_by_tags_match(self, tools_map: Any) -> None:
+        r = tools_map["query_by_tags"].invoke({"tags": ["crypto"]})
+        assert TEST_MARKER in r
+
+    def test_query_by_tags_no_match(self, tools_map: Any) -> None:
+        r = tools_map["query_by_tags"].invoke({"tags": ["__nonexistent__"]})
+        assert TEST_MARKER not in r
+
+    def test_query_by_address_tag_match(self, tools_map: Any) -> None:
+        r = tools_map["query_by_address"].invoke(
+            {"address": TEST_ADDRESS, "tags": ["test"]}
+        )
+        assert TEST_MARKER in r
+
+    def test_query_by_address_tag_no_match(self, tools_map: Any) -> None:
+        r = tools_map["query_by_address"].invoke(
+            {"address": TEST_ADDRESS, "tags": ["__nonexistent__"]}
+        )
+        assert TEST_MARKER not in r
+
+    def test_query_by_category_tag_match(self, tools_map: Any) -> None:
+        r = tools_map["query_by_category"].invoke(
+            {"category": "function", "tags": ["crypto"]}
+        )
+        assert TEST_MARKER in r
+
+    def test_list_all_knowledge_tag_match(self, tools_map: Any) -> None:
+        r = tools_map["list_all_knowledge"].invoke({"tags": ["test"]})
+        assert TEST_MARKER in r
+
+    def test_list_all_knowledge_tag_no_match(self, tools_map: Any) -> None:
+        r = tools_map["list_all_knowledge"].invoke({"tags": ["__nonexistent__"]})
+        assert TEST_MARKER not in r
+
+
+# ── 8. update_knowledge ───────────────────────────────────────────────────────
+
+
+class TestUpdateKnowledge:
+    def test_rename(self, tools_map: Any) -> None:
+        r = tools_map["update_knowledge"].invoke(
+            {"address": UPDATE_ADDRESS, "function_name": "does_a_thing"}
+        )
+        assert "Updated" in r
+
+    def test_rename_visible_in_query(self, tools_map: Any) -> None:
+        r = tools_map["query_by_address"].invoke({"address": UPDATE_ADDRESS})
+        assert "does_a_thing" in r
+
+    def test_update_confidence_and_tags(self, tools_map: Any) -> None:
+        r = tools_map["update_knowledge"].invoke(
+            {
+                "address": UPDATE_ADDRESS,
+                "confidence": "high",
+                "tags": ["crypto", "renamed"],
+            }
+        )
+        assert "Updated" in r
+
+    def test_updated_tags_visible(self, tools_map: Any) -> None:
+        r = tools_map["query_by_tags"].invoke({"tags": ["renamed"]})
+        assert "does_a_thing" in r
+
+    def test_noop_no_fields(self, tools_map: Any) -> None:
+        r = tools_map["update_knowledge"].invoke({"address": UPDATE_ADDRESS})
+        assert "Nothing to update" in r
+
+    def test_unknown_address(self, tools_map: Any) -> None:
+        r = tools_map["update_knowledge"].invoke(
+            {"address": "0xFFFFFFFF", "function_name": "ghost"}
+        )
+        assert "No entries found" in r
+
+
+# ── 9. list_analyzed_binaries ─────────────────────────────────────────────────
+
+
+class TestListAnalyzedBinaries:
+    def test_binary_listed(self, tools_map: Any) -> None:
+        r = tools_map["list_analyzed_binaries"].invoke({})
+        assert BINARY_NAME in r
+
+    def test_current_binary_marked(self, tools_map: Any) -> None:
+        r = tools_map["list_analyzed_binaries"].invoke({})
+        assert "← current" in r

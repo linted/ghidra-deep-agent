@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from rich.markdown import Markdown
 from rich.rule import Rule
 from textual import work
@@ -7,7 +9,17 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.widgets import Footer, Header, Input, RichLog, Static, Tree
+from textual.widgets import (
+    Footer,
+    Header,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    RichLog,
+    Static,
+    Tree,
+)
 from textual.widgets.tree import TreeNode
 
 _PLACEHOLDER_IDLE = "Enter analysis task (Ctrl+C to quit)…"
@@ -77,7 +89,7 @@ class StatusUpdate(Message):
 # ---------------------------------------------------------------------------
 
 
-class ActivityTree(Tree):
+class ActivityTree(Tree[None]):
     """Left pane: live agent/tool call hierarchy."""
 
     DEFAULT_CSS = """
@@ -94,14 +106,14 @@ class ActivityTree(Tree):
     def _reset(self) -> None:
         self.clear()
         self.root.expand()
-        self._run_map: dict[str, TreeNode] = {}
+        self._run_map: dict[str, TreeNode[None]] = {}
         # Maps a task tool's langgraph_checkpoint_ns to its sub-agent tree node.
         # Events whose checkpoint_ns starts with "<task_ns>|" belong to that sub-agent.
-        self._ns_to_node: dict[str, TreeNode] = {}
-        self._thinking_node: TreeNode | None = None
+        self._ns_to_node: dict[str, TreeNode[None]] = {}
+        self._thinking_node: TreeNode[None] | None = None
         self._thinking_run_id: str | None = None
 
-    def reset(self) -> None:
+    def reset(self) -> None:  # type: ignore[override]
         self._reset()
 
     # -- tool tracking -------------------------------------------------------
@@ -149,7 +161,7 @@ class ActivityTree(Tree):
 
     # -- helpers -------------------------------------------------------------
 
-    def _find_parent(self, checkpoint_ns: str) -> TreeNode:
+    def _find_parent(self, checkpoint_ns: str) -> TreeNode[None]:
         """Return the sub-agent node whose checkpoint_ns is the longest prefix of
         checkpoint_ns.
 
@@ -233,11 +245,58 @@ class ResponseLog(RichLog):
 
 
 # ---------------------------------------------------------------------------
+# Program selection screen (shown when multiple programs are open in Ghidra)
+# ---------------------------------------------------------------------------
+
+
+class ProgramSelectApp(App[str]):
+    TITLE = "Ghidra Agent"
+    BINDINGS = [Binding("ctrl+c", "quit", "Quit")]
+    CSS = """
+    Screen {
+        align: center middle;
+    }
+    #select-container {
+        width: 60;
+        height: auto;
+        border: solid $accent;
+        padding: 1 2;
+    }
+    #select-label {
+        margin-bottom: 1;
+        text-style: bold;
+    }
+    """
+
+    def __init__(self, programs: list[str]) -> None:
+        super().__init__()
+        self._programs = programs
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=False)
+        with Vertical(id="select-container"):
+            yield Label(
+                "Multiple programs are open. Select one to analyze:", id="select-label"
+            )
+            yield ListView(
+                *[ListItem(Label(name), name=name) for name in self._programs]
+            )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.sub_title = "Program Selection"
+        self.query_one(ListView).focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        self.exit(event.item.name or "")
+
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
 
-class GhidraAgentApp(App):
+class GhidraAgentApp(App[None]):
     TITLE = "Ghidra Agent"
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit"),
@@ -264,7 +323,7 @@ class GhidraAgentApp(App):
     """
 
     def __init__(
-        self, agent, config: dict, model: str = "", session_id: str = ""
+        self, agent: Any, config: dict[str, Any], model: str = "", session_id: str = ""
     ) -> None:
         super().__init__()
         self._agent = agent
@@ -345,14 +404,14 @@ class GhidraAgentApp(App):
 
     def _handle_event(
         self,
-        event: dict,
+        event: dict[str, Any],
         activity: ActivityTree,
         response: ResponseLog,
         thinking: ThinkingPanel,
     ) -> None:
         kind = event.get("event", "")
         run_id: str = event.get("run_id", "")
-        metadata: dict = event.get("metadata", {})
+        metadata: dict[str, Any] = event.get("metadata", {})
         checkpoint_ns: str = metadata.get("langgraph_checkpoint_ns", "")
         is_compaction = metadata.get("lc_source") == "summarization"
 

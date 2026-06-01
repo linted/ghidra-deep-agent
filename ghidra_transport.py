@@ -1,7 +1,8 @@
 import os
+from typing import Any
 
 
-def get_mcp_config() -> dict:
+def get_mcp_config() -> dict[str, Any]:
     transport = os.environ.get("GHIDRA_MCP_TRANSPORT", "stdio").lower()
 
     if transport in ("http", "streamable-http", "streamable_http"):

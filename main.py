@@ -1,8 +1,11 @@
 import argparse
 import asyncio
+import json
 import os
+import re
 import sys
 import uuid
+from typing import Any
 
 from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
@@ -19,16 +22,89 @@ from ghidra_transport import get_mcp_config
 from knowledge import build_knowledge_tools
 from models import build_embeddings, build_model
 from prompt import SYSTEM_PROMPT
-from tui import GhidraAgentApp
+from tui import GhidraAgentApp, ProgramSelectApp
 
 
-def _parse_token_count(value: str) -> int:
-    value = value.strip().lower()
-    if value.endswith("m"):
-        return int(float(value[:-1]) * 1_000_000)
-    if value.endswith("k"):
-        return int(float(value[:-1]) * 1_000)
-    return int(value)
+def _parse_program_list(result: str) -> list[str]:
+    """Parse list_open_programs output into a list of program names."""
+    try:
+        data = json.loads(result)
+        if isinstance(data, list):
+            return [
+                item.get("name", str(item)) if isinstance(item, dict) else str(item)
+                for item in data
+            ]
+        if isinstance(data, dict):
+            programs = data.get("programs", [])
+            if isinstance(programs, list):
+                return [
+                    item.get("name", str(item)) if isinstance(item, dict) else str(item)
+                    for item in programs
+                ]
+    except (json.JSONDecodeError, AttributeError):
+        pass
+
+    names = []
+    for line in result.splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith(("open", "program", "#")):
+            continue
+        line = re.sub(r"^\d+\.\s*|^[-*]\s*", "", line)
+        line = re.sub(r"\s*\(.*?\)\s*$", "", line).strip()
+        if line:
+            names.append(line)
+    return names
+
+
+async def _resolve_binary_name(tools: list[Any], override: str | None) -> str:
+    if override:
+        return override
+
+    list_tool = next((t for t in tools if t.name == "list_open_programs"), None)
+    if list_tool is None:
+        raise RuntimeError(
+            "Ghidra MCP does not expose 'list_open_programs'. "
+            "Set BINARY_NAME or pass --binary-name."
+        )
+
+    try:
+        result = await list_tool.ainvoke({})
+        # langchain_mcp_adapters may return a content-block list instead of a
+        # plain string; dig out the first text block if so.
+        if isinstance(result, list):
+            raw = next(
+                (
+                    (
+                        item.get("text")
+                        if isinstance(item, dict)
+                        else getattr(item, "text", None)
+                    )
+                    for item in result
+                    if (isinstance(item, dict) and item.get("type") == "text")
+                    or (hasattr(item, "type") and item.type == "text")
+                ),
+                str(result),
+            )
+            text: str = raw if isinstance(raw, str) else str(result)
+        else:
+            text = str(result)
+        programs = _parse_program_list(text)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to list open programs: {exc}") from exc
+
+    if not programs:
+        raise RuntimeError(
+            "No open programs found in Ghidra. Open a binary and try again, "
+            "or set BINARY_NAME / pass --binary-name."
+        )
+
+    if len(programs) == 1:
+        return programs[0]
+
+    selected = await ProgramSelectApp(programs).run_async()
+    if not selected:
+        raise RuntimeError("No program selected.")
+    return selected
 
 
 async def main() -> None:
@@ -37,6 +113,11 @@ async def main() -> None:
     parser = argparse.ArgumentParser(description="Ghidra deep agent")
     parser.add_argument(
         "--session-id", default=None, help="Resume a previous session by ID"
+    )
+    parser.add_argument(
+        "--binary-name",
+        default=None,
+        help="Binary name to use for knowledge isolation (overrides auto-detection)",
     )
     args = parser.parse_args()
     session_id = args.session_id or str(uuid.uuid4())
@@ -53,7 +134,7 @@ async def main() -> None:
         url = mcp_config["ghidra"].get("url", "")
         print(f"Connecting to Ghidra MCP server [{transport_desc}: {url}]...")
 
-    async def handle_mcp_errors(request: MCPToolCallRequest, handler):
+    async def handle_mcp_errors(request: MCPToolCallRequest, handler: Any) -> Any:
         try:
             return await handler(request)
         except Exception as exc:
@@ -86,9 +167,19 @@ async def main() -> None:
     )
     embed_string = os.environ.get("EMBED_MODEL", _ollama_fallback)
 
+    binary_name_override = args.binary_name or os.environ.get("BINARY_NAME")
+    try:
+        binary_name = await _resolve_binary_name(tools, binary_name_override)
+        print(f"Analyzing binary: {binary_name}")
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     try:
         embeddings = build_embeddings(embed_string)
-        knowledge_tools = build_knowledge_tools(mongodb_uri, mongodb_db, embeddings)
+        knowledge_tools = build_knowledge_tools(
+            mongodb_uri, mongodb_db, embeddings, binary_name
+        )
         print(f"Knowledge base ready  [embed: {embed_string}]")
     except Exception as exc:
         print(f"Warning: knowledge base unavailable ({exc})", file=sys.stderr)
@@ -102,13 +193,14 @@ async def main() -> None:
     }
 
     output_dir = os.environ.get("AGENT_OUTPUT_DIR", "")
+    backend: Any
     if output_dir:
         backend = FilesystemBackend(root_dir=output_dir, virtual_mode=True)
     else:
         backend = StateBackend()
 
     with MongoDBSaver.from_conn_string(mongodb_uri, db_name=mongodb_db) as checkpointer:
-        agent_kwargs: dict = dict(
+        agent_kwargs: dict[str, Any] = dict(
             model=built_model,
             tools=knowledge_tools + tools,
             system_prompt=SYSTEM_PROMPT,
