@@ -341,7 +341,11 @@ def build_knowledge_tools(
             "Semantic search across the knowledge base for ALL analyzed binaries. "
             "Use this to find patterns, shared code, or related findings from other "
             "binaries when cross-binary comparison may be relevant. "
-            "Results are labeled with their source binary."
+            "Results are labeled with their source binary. "
+            "IMPORTANT: This tool returns a large result set that can pollute the "
+            "context of an ongoing analysis. It MUST only be called from within a "
+            "dedicated sub-agent whose sole purpose is cross-binary comparison — "
+            "never inline during normal analysis or function review."
         ),
     )
 
