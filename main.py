@@ -152,6 +152,13 @@ async def main() -> None:
         )
         sys.exit(1)
 
+    # MCP server errors arrive as isError=True results, which langchain_mcp_adapters
+    # converts to ToolException. Without handle_tool_error=True, ToolException bypasses
+    # LangGraph's ToolNode default handler (which only catches ToolInvocationError) and
+    # propagates all the way up through sub-agents to the TUI.
+    for tool in tools:
+        tool.handle_tool_error = True
+
     if not tools:
         print("Warning: no tools loaded from Ghidra MCP server.", file=sys.stderr)
     else:
@@ -186,7 +193,7 @@ async def main() -> None:
         knowledge_tools = []
 
     built_model = build_model(model)
-    recursion_limit = int(os.environ.get("RECURSION_LIMIT", "100"))
+    recursion_limit = int(os.environ.get("RECURSION_LIMIT", "10000"))
     config = {
         "configurable": {"thread_id": session_id},
         "recursion_limit": recursion_limit,
