@@ -62,7 +62,7 @@ def mongo_collection(mongo_client: Any) -> Any:
 
 @pytest.fixture(scope="session")
 def embeddings_model() -> Any:
-    from models import build_embeddings
+    from ghidra_deep_agent.models import build_embeddings
 
     try:
         emb = build_embeddings(EMBED_MODEL)
@@ -74,7 +74,7 @@ def embeddings_model() -> Any:
 
 @pytest.fixture(scope="session")
 def tools_map(embeddings_model: Any) -> Any:
-    from knowledge import build_knowledge_tools
+    from ghidra_deep_agent.knowledge import build_knowledge_tools
 
     tm = {
         t.name: t

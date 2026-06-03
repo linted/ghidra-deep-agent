@@ -18,11 +18,11 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.interceptors import MCPToolCallRequest
 from langgraph.checkpoint.mongodb import MongoDBSaver
 
-from ghidra_transport import get_mcp_config
-from knowledge import build_knowledge_tools
-from models import build_embeddings, build_model
-from prompt import SYSTEM_PROMPT
-from tui import GhidraAgentApp, ProgramSelectApp
+from ghidra_deep_agent.ghidra_transport import get_mcp_config
+from ghidra_deep_agent.knowledge import build_knowledge_tools
+from ghidra_deep_agent.models import build_embeddings, build_model
+from ghidra_deep_agent.prompt import SYSTEM_PROMPT
+from ghidra_deep_agent.tui import GhidraAgentApp, ProgramSelectApp
 
 
 def _parse_program_list(result: str) -> list[str]:
@@ -227,5 +227,9 @@ async def main() -> None:
     print(f"Session ID: {session_id}")
 
 
-if __name__ == "__main__":
+def run() -> None:
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    run()
