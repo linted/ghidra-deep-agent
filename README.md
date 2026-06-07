@@ -47,7 +47,7 @@ All configuration is done via environment variables (`.env` file or shell export
 | `ANTHROPIC_API_KEY` | — | API key for Anthropic *(not needed for Ollama)* |
 | `MODEL` | `anthropic:claude-sonnet-4-6` | Any `provider:model` string supported by LangChain |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL *(only needed if non-default)* |
-| `EMBED_MODEL` | `ollama:nomic-embed-text` | `provider:model` for embeddings — supports `ollama`, `openai`, `huggingface`, `cohere` |
+| `EMBED_MODEL` | `ollama:nomic-embed-text` | `provider:model` for embeddings — supports `ollama`, `openai`, `huggingface`, `cohere`, `automated` (MongoDB Atlas Automated Embeddings via Voyage AI; requires an Atlas cluster with Voyage AI configured at the project level, e.g. `automated:voyage-4`) |
 | `MONGODB_URI` | `mongodb://localhost:27017` | MongoDB connection string for checkpoint persistence |
 | `MONGODB_DB` | `checkpointing_db` | Database used by the checkpointer and knowledge base |
 | `MONGODB_VECTOR_COLLECTION` | `re_knowledge` | Collection for the vector knowledge base |

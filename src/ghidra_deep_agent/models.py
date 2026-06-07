@@ -42,6 +42,10 @@ def build_embeddings(embed_string: str) -> Embeddings:
       openai:<model>       — OpenAIEmbeddings (requires: uv add langchain-openai)
       huggingface:<model>  — HuggingFaceEmbeddings (uv add langchain-huggingface)
       cohere:<model>       — CohereEmbeddings (requires: uv add langchain-cohere)
+      automated:<model>    — AutoEmbeddings; MongoDB Atlas generates embeddings
+                             server-side via Voyage AI (requires an Atlas
+                             cluster with Voyage AI configured at the project
+                             level — see langchain_mongodb.embeddings)
     """
     provider, _, model = embed_string.partition(":")
     if not model:
@@ -64,9 +68,13 @@ def build_embeddings(embed_string: str) -> Embeddings:
         from langchain_cohere import CohereEmbeddings
 
         return cast(Embeddings, CohereEmbeddings(model=model))
+    if provider == "automated":
+        from langchain_mongodb.embeddings import AutoEmbeddings
+
+        return AutoEmbeddings(model=model)
     raise ValueError(
         f"Unknown embeddings provider {provider!r}. "
-        "Supported: ollama, openai, huggingface, cohere"
+        "Supported: ollama, openai, huggingface, cohere, automated"
     )
 
 
