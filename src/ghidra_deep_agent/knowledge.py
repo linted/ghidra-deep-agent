@@ -7,6 +7,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.tools import tool
 from langchain_core.tools.retriever import create_retriever_tool
 from langchain_mongodb import MongoDBAtlasVectorSearch
+from langchain_mongodb.embeddings import AutoEmbeddings
 from pymongo import MongoClient
 
 
@@ -17,12 +18,24 @@ def build_knowledge_tools(
     collection_name = os.environ.get("MONGODB_VECTOR_COLLECTION", "re_knowledge")
     collection = client[mongodb_db][collection_name]
 
-    vector_store = MongoDBAtlasVectorSearch(
-        collection=collection,
-        embedding=embeddings,
-        index_name="re_knowledge_index",
-        auto_create_index=False,
-    )
+    is_autoembedding = isinstance(embeddings, AutoEmbeddings)
+    if is_autoembedding:
+        vector_store = MongoDBAtlasVectorSearch(
+            collection=collection,
+            embedding=embeddings,
+            index_name="re_knowledge_index",
+            embedding_key=None,
+            relevance_score_fn=None,
+            dimensions=-1,
+            auto_create_index=False,
+        )
+    else:
+        vector_store = MongoDBAtlasVectorSearch(
+            collection=collection,
+            embedding=embeddings,
+            index_name="re_knowledge_index",
+            auto_create_index=False,
+        )
 
     # Ensure the index exists and has binary_name as a filterable field.
     # auto_create_index=True only creates a bare vector index; pre_filter on
@@ -38,7 +51,11 @@ def build_knowledge_tools(
             f.get("type") == "filter" and f.get("path") == "binary_name" for f in fields
         )
         if not has_filter:
-            dims = len(embeddings.embed_query(""))
+            # AutoEmbeddings can't be probed locally (embed_query raises);
+            # create_vector_search_index detects AutoEmbeddings itself and
+            # builds the automated-embedding index definition, overriding
+            # dimensions to -1 regardless of what's passed here.
+            dims = -1 if is_autoembedding else len(embeddings.embed_query(""))
             vector_store.create_vector_search_index(
                 dimensions=dims,
                 filters=["binary_name"],
