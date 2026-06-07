@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from rich.markdown import Markdown
@@ -21,6 +22,8 @@ from textual.widgets import (
     Tree,
 )
 from textual.widgets.tree import TreeNode
+
+from ghidra_deep_agent.toasts import ToastRequest, register_toast_sink
 
 _PLACEHOLDER_IDLE = "Enter analysis task (Ctrl+C to quit)…"
 _PLACEHOLDER_BUSY = "Agent is running… type ahead, Enter to queue"
@@ -331,6 +334,7 @@ class GhidraAgentApp(App[None]):
         self._model = model
         self._session_id = session_id
         self._agent_running = False
+        self._unregister_toast_sink: Callable[[], None] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -345,6 +349,20 @@ class GhidraAgentApp(App[None]):
     def on_mount(self) -> None:
         self.sub_title = f"{self._model}  ·  session: {self._session_id}"
         self.query_one("#query", Input).focus()
+        self._unregister_toast_sink = register_toast_sink(self._on_toast_request)
+
+    def on_unmount(self) -> None:
+        if self._unregister_toast_sink is not None:
+            self._unregister_toast_sink()
+            self._unregister_toast_sink = None
+
+    def _on_toast_request(self, toast: ToastRequest) -> None:
+        self.notify(
+            toast.message,
+            title=toast.title,
+            severity=toast.severity,
+            timeout=toast.timeout,
+        )
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if self._agent_running:
