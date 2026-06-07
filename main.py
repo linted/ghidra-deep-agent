@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.interceptors import MCPToolCallRequest
 from langgraph.checkpoint.mongodb import MongoDBSaver
+from pymongo.errors import ServerSelectionTimeoutError
 
 from ghidra_deep_agent.ghidra_transport import get_mcp_config
 from ghidra_deep_agent.knowledge import build_knowledge_tools
@@ -123,23 +124,32 @@ async def main() -> None:
     else:
         backend = StateBackend()
 
-    with MongoDBSaver.from_conn_string(mongodb_uri, db_name=mongodb_db) as checkpointer:
-        agent_kwargs: dict[str, Any] = dict(
-            model=built_model,
-            tools=knowledge_tools + tools,
-            system_prompt=SYSTEM_PROMPT,
-            checkpointer=checkpointer,
-            middleware=[create_summarization_tool_middleware(built_model, backend)],
-            backend=backend,
-            memory=[agents_md] if agents_md else None,
-        )
+    try:
+        with MongoDBSaver.from_conn_string(
+            mongodb_uri, db_name=mongodb_db
+        ) as checkpointer:
+            agent_kwargs: dict[str, Any] = dict(
+                model=built_model,
+                tools=knowledge_tools + tools,
+                system_prompt=SYSTEM_PROMPT,
+                checkpointer=checkpointer,
+                middleware=[create_summarization_tool_middleware(built_model, backend)],
+                backend=backend,
+                memory=[agents_md] if agents_md else None,
+            )
 
-        agent = create_deep_agent(**agent_kwargs)
+            agent = create_deep_agent(**agent_kwargs)
 
-        app = GhidraAgentApp(
-            agent=agent, config=config, model=model, session_id=session_id
+            app = GhidraAgentApp(
+                agent=agent, config=config, model=model, session_id=session_id
+            )
+            await app.run_async()
+    except ServerSelectionTimeoutError as e:
+        print(
+            f"Error: could not connect to MongoDB — {e}",
+            file=sys.stderr,
         )
-        await app.run_async()
+        sys.exit(1)
 
     print(f"Session ID: {session_id}")
 
