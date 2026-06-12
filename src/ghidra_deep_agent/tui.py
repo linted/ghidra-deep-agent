@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -10,6 +11,8 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
+from textual.reactive import reactive
+from textual.timer import Timer
 from textual.widgets import (
     Footer,
     Header,
@@ -25,7 +28,7 @@ from textual.widgets.tree import TreeNode
 
 from ghidra_deep_agent.toasts import ToastRequest, register_toast_sink
 
-_PLACEHOLDER_IDLE = "Enter analysis task (Ctrl+C to quit)…"
+_PLACEHOLDER_IDLE = "Enter task (Ctrl+C quit · /help for commands)…"
 _PLACEHOLDER_BUSY = "Agent is running… type ahead, Enter to queue"
 
 
@@ -52,10 +55,13 @@ class ToolStarted(Message):
 
 
 class ToolEnded(Message):
-    def __init__(self, run_id: str, error: bool = False) -> None:
+    def __init__(
+        self, run_id: str, error: bool = False, output_snippet: str = ""
+    ) -> None:
         super().__init__()
         self.run_id = run_id
         self.error = error
+        self.output_snippet = output_snippet
 
 
 class LLMThinking(Message):
@@ -81,10 +87,24 @@ class AgentDone(Message):
     pass
 
 
-class StatusUpdate(Message):
+class StatusFlash(Message):
+    """Transient text to surface in the status bar (auto-clears)."""
+
     def __init__(self, text: str) -> None:
         super().__init__()
         self.text = text
+
+
+class TokenUpdate(Message):
+    def __init__(self, delta_tokens: int) -> None:
+        super().__init__()
+        self.delta_tokens = delta_tokens
+
+
+class ToolCountChanged(Message):
+    def __init__(self, delta: int) -> None:
+        super().__init__()
+        self.delta = delta
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +129,9 @@ class ActivityTree(Tree[None]):
     def _reset(self) -> None:
         self.clear()
         self.root.expand()
-        self._run_map: dict[str, TreeNode[None]] = {}
-        # Maps a task tool's langgraph_checkpoint_ns to its sub-agent tree node.
-        # Events whose checkpoint_ns starts with "<task_ns>|" belong to that sub-agent.
+        # run_id -> (node, start_time, base_label, is_subagent)
+        self._run_map: dict[str, tuple[TreeNode[None], float, str, bool]] = {}
+        # checkpoint_ns -> sub-agent node, used to nest events under sub-agents.
         self._ns_to_node: dict[str, TreeNode[None]] = {}
         self._thinking_node: TreeNode[None] | None = None
         self._thinking_run_id: str | None = None
@@ -124,32 +144,48 @@ class ActivityTree(Tree[None]):
     def on_tool_started(self, msg: ToolStarted) -> None:
         self._clear_thinking()
         parent_node = self._find_parent(msg.checkpoint_ns)
+        preview = msg.input_preview[:40].replace("\n", " ")
         if msg.is_subagent:
-            label = (
-                f"▶ sub-agent: {msg.input_preview}"
-                if msg.input_preview
-                else "▶ sub-agent"
-            )
+            base = "[bold]▶ sub-agent[/bold]"
+            if preview:
+                base += f": [dim]{preview}[/dim]"
+            label = f"{base}  [yellow]●[/yellow]"
             node = parent_node.add(label, expand=True)
             self._ns_to_node[msg.checkpoint_ns] = node
         else:
-            node = parent_node.add_leaf(f"⚙ {msg.name}  ●")
-        self._run_map[msg.run_id] = node
+            base = f"⚙ {msg.name}"
+            if preview:
+                base += f": [dim]{preview}[/dim]"
+            label = f"{base}  [yellow]●[/yellow]"
+            node = parent_node.add_leaf(label)
+        self._run_map[msg.run_id] = (
+            node,
+            time.monotonic(),
+            base,
+            msg.is_subagent,
+        )
 
     def on_tool_ended(self, msg: ToolEnded) -> None:
-        node = self._run_map.get(msg.run_id)
-        if node is None:
+        entry = self._run_map.get(msg.run_id)
+        if entry is None:
             return
-        current = str(node.label)
-        marker = "  ✗" if msg.error else "  ✓"
-        node.set_label(current.replace("  ●", marker))
+        node, start_time, base, is_subagent = entry
+        elapsed = time.monotonic() - start_time
+        marker = "[red]✗[/red]" if msg.error else "[green]✓[/green]"
+        duration = f"[dim]({_fmt_duration(elapsed)})[/dim]"
+        node.set_label(f"{base}  {marker} {duration}")
+        if msg.error and msg.output_snippet:
+            snippet = msg.output_snippet[:80].replace("\n", " ")
+            node.add_leaf(f"[red]└ {snippet}[/red]")
+        if is_subagent:
+            node.collapse()
 
     # -- LLM thinking indicator ----------------------------------------------
 
     def on_llm_thinking(self, msg: LLMThinking) -> None:
         self._clear_thinking()
         parent_node = self._find_parent(msg.checkpoint_ns)
-        self._thinking_node = parent_node.add_leaf("⋯ thinking…")
+        self._thinking_node = parent_node.add_leaf("[italic]⋯ thinking…[/italic]")
         self._thinking_run_id = msg.run_id
 
     def on_llm_done(self, msg: LLMDone) -> None:
@@ -237,14 +273,127 @@ class ResponseLog(RichLog):
     def on_text_token(self, msg: TextToken) -> None:
         self._response_buf += msg.text
 
-    def on_status_update(self, msg: StatusUpdate) -> None:
-        self.write(f"[dim]{msg.text}[/dim]")
-
     def on_agent_done(self, _msg: AgentDone) -> None:
         if self._response_buf:
             self.last_response = self._response_buf
+            self.write(Rule(style="dim green"))
+            self.write("[bold green]✦ assistant[/bold green]")
+            self.write(Rule(style="dim green"))
             self.write(Markdown(self._response_buf))
             self._response_buf = ""
+
+
+class StatusBar(Static):
+    """Single-line status bar above the input: connections, timer, tokens, tools."""
+
+    DEFAULT_CSS = """
+    StatusBar {
+        height: 1;
+        background: $boost;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    """
+
+    mcp_ok: reactive[bool] = reactive(True)
+    db_ok: reactive[bool] = reactive(True)
+    elapsed_seconds: reactive[int] = reactive(0)
+    tokens: reactive[int] = reactive(0)
+    active_tools: reactive[int] = reactive(0)
+    flash_text: reactive[str] = reactive("")
+
+    def on_mount(self) -> None:
+        self._flash_timer: Timer | None = None
+        self._refresh_status()
+
+    def watch_mcp_ok(self, _old: bool, _new: bool) -> None:
+        self._refresh_status()
+
+    def watch_db_ok(self, _old: bool, _new: bool) -> None:
+        self._refresh_status()
+
+    def watch_elapsed_seconds(self, _old: int, _new: int) -> None:
+        self._refresh_status()
+
+    def watch_tokens(self, _old: int, _new: int) -> None:
+        self._refresh_status()
+
+    def watch_active_tools(self, _old: int, _new: int) -> None:
+        self._refresh_status()
+
+    def watch_flash_text(self, _old: str, _new: str) -> None:
+        self._refresh_status()
+
+    def flash(self, text: str, duration: float = 3.0) -> None:
+        if self._flash_timer is not None:
+            self._flash_timer.stop()
+        self.flash_text = text
+        self._flash_timer = self.set_timer(duration, self._clear_flash)
+
+    def _clear_flash(self) -> None:
+        self.flash_text = ""
+
+    def _refresh_status(self) -> None:
+        if self.flash_text:
+            self.update(self.flash_text)
+            return
+        mcp = "[green]✓[/green]" if self.mcp_ok else "[red]✗[/red]"
+        db = "[green]✓[/green]" if self.db_ok else "[red]✗[/red]"
+        mins, secs = divmod(int(self.elapsed_seconds), 60)
+        elapsed = f"{mins:02d}:{secs:02d}"
+        toks = _fmt_tokens(self.tokens)
+        self.update(
+            f" mcp {mcp}  db {db}   ⏱ {elapsed}   🧠 {toks} tok   "
+            f"⚙ {self.active_tools} active"
+        )
+
+
+class CommandInput(Input):
+    """Single-line input with Up/Down history walking."""
+
+    BINDINGS = [
+        Binding("up", "history_up", show=False, priority=True),
+        Binding("down", "history_down", show=False, priority=True),
+    ]
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._history: list[str] = []
+        self._history_idx: int | None = None
+        self._draft: str = ""
+
+    def add_to_history(self, query: str) -> None:
+        if not query.strip():
+            return
+        if self._history and self._history[-1] == query:
+            return
+        self._history.append(query)
+        self._history_idx = None
+        self._draft = ""
+
+    def action_history_up(self) -> None:
+        if not self._history:
+            return
+        if self._history_idx is None:
+            self._draft = self.value
+            self._history_idx = len(self._history) - 1
+        elif self._history_idx > 0:
+            self._history_idx -= 1
+        else:
+            return
+        self.value = self._history[self._history_idx]
+        self.cursor_position = len(self.value)
+
+    def action_history_down(self) -> None:
+        if self._history_idx is None:
+            return
+        if self._history_idx < len(self._history) - 1:
+            self._history_idx += 1
+            self.value = self._history[self._history_idx]
+        else:
+            self._history_idx = None
+            self.value = self._draft
+        self.cursor_position = len(self.value)
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +452,8 @@ class GhidraAgentApp(App[None]):
     TITLE = "Ghidra Agent"
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit"),
-        Binding("y", "yank", "Copy response"),
+        Binding("ctrl+y", "yank", "Copy response"),
+        Binding("ctrl+l", "clear_log", "Clear log"),
     ]
     CSS = """
     Screen {
@@ -316,7 +466,6 @@ class GhidraAgentApp(App[None]):
         width: 65%;
     }
     #query {
-        dock: bottom;
         height: 3;
         border-top: solid $accent-darken-2;
     }
@@ -326,7 +475,13 @@ class GhidraAgentApp(App[None]):
     """
 
     def __init__(
-        self, agent: Any, config: dict[str, Any], model: str = "", session_id: str = ""
+        self,
+        agent: Any,
+        config: dict[str, Any],
+        model: str = "",
+        session_id: str = "",
+        mcp_ok: bool = True,
+        db_ok: bool = True,
     ) -> None:
         super().__init__()
         self._agent = agent
@@ -335,6 +490,11 @@ class GhidraAgentApp(App[None]):
         self._session_id = session_id
         self._agent_running = False
         self._unregister_toast_sink: Callable[[], None] | None = None
+        self._mcp_ok = mcp_ok
+        self._db_ok = db_ok
+        self._elapsed_timer: Timer | None = None
+        self._run_start: float | None = None
+        self._total_tokens = 0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -343,12 +503,16 @@ class GhidraAgentApp(App[None]):
             with Vertical(id="right-pane"):
                 yield ResponseLog(highlight=True, markup=True)
                 yield ThinkingPanel()
-        yield Input(placeholder=_PLACEHOLDER_IDLE, id="query")
+        yield StatusBar()
+        yield CommandInput(placeholder=_PLACEHOLDER_IDLE, id="query")
         yield Footer()
 
     def on_mount(self) -> None:
         self.sub_title = f"{self._model}  ·  session: {self._session_id}"
         self.query_one("#query", Input).focus()
+        bar = self.query_one(StatusBar)
+        bar.mcp_ok = self._mcp_ok
+        bar.db_ok = self._db_ok
         self._unregister_toast_sink = register_toast_sink(self._on_toast_request)
 
     def on_unmount(self) -> None:
@@ -364,23 +528,80 @@ class GhidraAgentApp(App[None]):
             timeout=toast.timeout,
         )
 
+    # -- status-bar plumbing -------------------------------------------------
+
+    def on_status_flash(self, msg: StatusFlash) -> None:
+        self.query_one(StatusBar).flash(msg.text)
+
+    def on_token_update(self, msg: TokenUpdate) -> None:
+        self._total_tokens += msg.delta_tokens
+        self.query_one(StatusBar).tokens = self._total_tokens
+
+    def on_tool_count_changed(self, msg: ToolCountChanged) -> None:
+        bar = self.query_one(StatusBar)
+        bar.active_tools = max(0, bar.active_tools + msg.delta)
+
+    # -- input ---------------------------------------------------------------
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        if self._agent_running:
-            self.query_one(ResponseLog).post_message(
-                StatusUpdate("[yellow]Agent still running — please wait.[/yellow]")
-            )
-            return
         query = event.value.strip()
         if not query:
             return
+        inp = event.input
         event.input.clear()
+        if isinstance(inp, CommandInput):
+            inp.add_to_history(query)
+
+        if query.startswith("/"):
+            self._dispatch_slash(query)
+            return
+
+        if self._agent_running:
+            self.query_one(StatusBar).flash(
+                "[yellow]Agent still running — please wait.[/yellow]"
+            )
+            return
+
+        self._start_run(query, query)
+
+    def _start_run(self, display: str, agent_input: str) -> None:
         self._set_busy(True)
         response = self.query_one(ResponseLog)
         response.write(Rule(style="dim cyan"))
-        response.write(f"[bold cyan]❯ {query}[/bold cyan]")
+        shown = display.replace("\n", "\n  ")
+        response.write(f"[bold cyan]❯ {shown}[/bold cyan]")
         response.write(Rule(style="dim cyan"))
         self.query_one(ActivityTree).reset()
-        self._run_agent(query)
+        self._run_agent(agent_input)
+
+    def _dispatch_slash(self, command: str) -> None:
+        cmd = command.split()[0].lower()
+        bar = self.query_one(StatusBar)
+        if cmd == "/clear":
+            self.action_clear_log()
+            bar.flash("[green]Cleared.[/green]")
+        elif cmd == "/yank":
+            self.action_yank()
+        elif cmd == "/quit":
+            self.exit()
+        elif cmd == "/compact":
+            if self._agent_running:
+                bar.flash("[yellow]Agent still running — please wait.[/yellow]")
+                return
+            self._start_run(
+                "/compact",
+                "Call the `compact_conversation` tool now to compact the "
+                "conversation history.",
+            )
+        elif cmd == "/help":
+            bar.flash(
+                "/clear  /yank  /compact  /quit  /help  ·  "
+                "↑/↓ history · Ctrl+Y yank · Ctrl+L clear · Ctrl+C quit"
+            )
+        else:
+            bar.flash(f"[red]Unknown command: {cmd}[/red]")
+
+    # -- bindings ------------------------------------------------------------
 
     def action_yank(self) -> None:
         text = self.query_one(ResponseLog).last_response
@@ -390,15 +611,38 @@ class GhidraAgentApp(App[None]):
         self.copy_to_clipboard(text)
         self.notify("Response copied to clipboard.")
 
+    def action_clear_log(self) -> None:
+        self.query_one(ResponseLog).clear()
+        self.query_one(ActivityTree).reset()
+
+    # -- run state -----------------------------------------------------------
+
     def _set_busy(self, busy: bool) -> None:
         self._agent_running = busy
         inp = self.query_one("#query", Input)
+        bar = self.query_one(StatusBar)
         if busy:
             inp.placeholder = _PLACEHOLDER_BUSY
             inp.add_class("busy")
+            self._run_start = time.monotonic()
+            bar.elapsed_seconds = 0
+            if self._elapsed_timer is not None:
+                self._elapsed_timer.stop()
+            self._elapsed_timer = self.set_interval(1.0, self._tick_elapsed)
         else:
             inp.placeholder = _PLACEHOLDER_IDLE
             inp.remove_class("busy")
+            if self._elapsed_timer is not None:
+                self._elapsed_timer.stop()
+                self._elapsed_timer = None
+            self._run_start = None
+
+    def _tick_elapsed(self) -> None:
+        if self._run_start is None:
+            return
+        self.query_one(StatusBar).elapsed_seconds = int(
+            time.monotonic() - self._run_start
+        )
 
     @work(exclusive=True)
     async def _run_agent(self, query: str) -> None:
@@ -413,7 +657,9 @@ class GhidraAgentApp(App[None]):
             ):
                 self._handle_event(event, activity, response, thinking)
         except Exception as exc:
-            response.post_message(StatusUpdate(f"[red]Error: {exc}[/red]"))
+            response.write(Rule(style="red"))
+            response.write(f"[bold red]✗ Error: {exc}[/bold red]")
+            response.write(Rule(style="red"))
         finally:
             thinking.display = False
             response.post_message(AgentDone())
@@ -441,26 +687,30 @@ class GhidraAgentApp(App[None]):
             activity.post_message(
                 ToolStarted(run_id, name, preview, is_subagent, checkpoint_ns)
             )
+            self.post_message(ToolCountChanged(1))
 
         elif kind == "on_tool_end":
+            output = event.get("data", {}).get("output")
             error = bool(event.get("data", {}).get("error"))
-            activity.post_message(ToolEnded(run_id, error))
+            snippet = _extract_output_snippet(output) if error else ""
+            activity.post_message(ToolEnded(run_id, error, snippet))
+            self.post_message(ToolCountChanged(-1))
 
         elif kind == "on_chat_model_start":
             if is_compaction:
-                response.post_message(
-                    StatusUpdate("[yellow]⟳ Compacting context…[/yellow]")
-                )
+                self.post_message(StatusFlash("[yellow]⟳ Compacting context…[/yellow]"))
             else:
                 activity.post_message(LLMThinking(run_id, checkpoint_ns))
 
         elif kind == "on_chat_model_end":
             if is_compaction:
-                response.post_message(
-                    StatusUpdate("[green]✓ Context compacted[/green]")
-                )
+                self.post_message(StatusFlash("[green]✓ Context compacted[/green]"))
             else:
                 activity.post_message(LLMDone(run_id))
+            output = event.get("data", {}).get("output")
+            tokens = _extract_usage(output)
+            if tokens:
+                self.post_message(TokenUpdate(tokens))
 
         elif kind == "on_chat_model_stream":
             if is_compaction:
@@ -502,3 +752,49 @@ def _extract_text(chunk: object) -> str:
                 parts.append(block.get("text", ""))
         return "".join(parts)
     return ""
+
+
+def _extract_output_snippet(output: object) -> str:
+    """Pull a short text snippet from a tool's output (typically a ToolMessage)."""
+    if output is None:
+        return ""
+    content = getattr(output, "content", output)
+    if isinstance(content, str):
+        return content[:80]
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and "text" in block:
+                return str(block["text"])[:80]
+            if isinstance(block, str):
+                return block[:80]
+    return str(content)[:80]
+
+
+def _extract_usage(output: object) -> int:
+    """Pull total_tokens from a chat model's usage_metadata, if present."""
+    if output is None:
+        return 0
+    usage = getattr(output, "usage_metadata", None)
+    if isinstance(usage, dict):
+        try:
+            return int(usage.get("total_tokens", 0))
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _fmt_duration(seconds: float) -> str:
+    if seconds < 1.0:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    mins, secs = divmod(int(seconds), 60)
+    return f"{mins}m{secs:02d}s"
+
+
+def _fmt_tokens(n: int) -> str:
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1000:.1f}k"
+    return f"{n / 1_000_000:.2f}M"
