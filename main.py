@@ -141,7 +141,12 @@ async def main() -> None:
             agent = create_deep_agent(**agent_kwargs)
 
             app = GhidraAgentApp(
-                agent=agent, config=config, model=model, session_id=session_id
+                agent=agent,
+                config=config,
+                model=model,
+                session_id=session_id,
+                mcp_ok=True,
+                db_ok=True,
             )
             await app.run_async()
     except ServerSelectionTimeoutError as e:
