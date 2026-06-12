@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 from rich.markdown import Markdown
 from rich.rule import Rule
@@ -96,9 +96,18 @@ class StatusFlash(Message):
 
 
 class TokenUpdate(Message):
-    def __init__(self, delta_tokens: int) -> None:
+    def __init__(self, delta_input: int, delta_output: int) -> None:
         super().__init__()
-        self.delta_tokens = delta_tokens
+        self.delta_input = delta_input
+        self.delta_output = delta_output
+
+
+class ContextUpdate(Message):
+    """Snapshot of the main-thread prompt size from the last LLM turn."""
+
+    def __init__(self, current_input: int) -> None:
+        super().__init__()
+        self.current_input = current_input
 
 
 class ToolCountChanged(Message):
@@ -298,7 +307,10 @@ class StatusBar(Static):
     mcp_ok: reactive[bool] = reactive(True)
     db_ok: reactive[bool] = reactive(True)
     elapsed_seconds: reactive[int] = reactive(0)
-    tokens: reactive[int] = reactive(0)
+    input_tokens: reactive[int] = reactive(0)
+    output_tokens: reactive[int] = reactive(0)
+    current_context: reactive[int] = reactive(0)
+    max_context: reactive[int] = reactive(200_000)
     active_tools: reactive[int] = reactive(0)
     flash_text: reactive[str] = reactive("")
 
@@ -315,7 +327,16 @@ class StatusBar(Static):
     def watch_elapsed_seconds(self, _old: int, _new: int) -> None:
         self._refresh_status()
 
-    def watch_tokens(self, _old: int, _new: int) -> None:
+    def watch_input_tokens(self, _old: int, _new: int) -> None:
+        self._refresh_status()
+
+    def watch_output_tokens(self, _old: int, _new: int) -> None:
+        self._refresh_status()
+
+    def watch_current_context(self, _old: int, _new: int) -> None:
+        self._refresh_status()
+
+    def watch_max_context(self, _old: int, _new: int) -> None:
         self._refresh_status()
 
     def watch_active_tools(self, _old: int, _new: int) -> None:
@@ -341,11 +362,27 @@ class StatusBar(Static):
         db = "[green]✓[/green]" if self.db_ok else "[red]✗[/red]"
         mins, secs = divmod(int(self.elapsed_seconds), 60)
         elapsed = f"{mins:02d}:{secs:02d}"
-        toks = _fmt_tokens(self.tokens)
+        toks_in = _fmt_tokens(self.input_tokens)
+        toks_out = _fmt_tokens(self.output_tokens)
+        ctx = self._format_context()
         self.update(
-            f" mcp {mcp}  db {db}   ⏱ {elapsed}   🧠 {toks} tok   "
+            f" mcp {mcp}  db {db}   ⏱ {elapsed}   "
+            f"↓ {toks_in} in · ↑ {toks_out} out   {ctx}   "
             f"⚙ {self.active_tools} active"
         )
+
+    def _format_context(self) -> str:
+        max_ctx = max(self.max_context, 1)
+        cur = self.current_context
+        pct = (cur / max_ctx) * 100
+        cur_s = _fmt_tokens(cur)
+        max_s = _fmt_tokens(max_ctx)
+        body = f"ctx {cur_s}/{max_s} ({pct:.0f}%)"
+        if pct >= 85:
+            return f"[red]{body}[/red]"
+        if pct >= 75:
+            return f"[yellow]{body}[/yellow]"
+        return body
 
 
 class CommandInput(Input):
@@ -482,6 +519,7 @@ class GhidraAgentApp(App[None]):
         session_id: str = "",
         mcp_ok: bool = True,
         db_ok: bool = True,
+        max_context_tokens: int = 200_000,
     ) -> None:
         super().__init__()
         self._agent = agent
@@ -492,9 +530,11 @@ class GhidraAgentApp(App[None]):
         self._unregister_toast_sink: Callable[[], None] | None = None
         self._mcp_ok = mcp_ok
         self._db_ok = db_ok
+        self._max_context_tokens = max_context_tokens
         self._elapsed_timer: Timer | None = None
         self._run_start: float | None = None
-        self._total_tokens = 0
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -513,6 +553,7 @@ class GhidraAgentApp(App[None]):
         bar = self.query_one(StatusBar)
         bar.mcp_ok = self._mcp_ok
         bar.db_ok = self._db_ok
+        bar.max_context = self._max_context_tokens
         self._unregister_toast_sink = register_toast_sink(self._on_toast_request)
 
     def on_unmount(self) -> None:
@@ -534,8 +575,14 @@ class GhidraAgentApp(App[None]):
         self.query_one(StatusBar).flash(msg.text)
 
     def on_token_update(self, msg: TokenUpdate) -> None:
-        self._total_tokens += msg.delta_tokens
-        self.query_one(StatusBar).tokens = self._total_tokens
+        self._total_input_tokens += msg.delta_input
+        self._total_output_tokens += msg.delta_output
+        bar = self.query_one(StatusBar)
+        bar.input_tokens = self._total_input_tokens
+        bar.output_tokens = self._total_output_tokens
+
+    def on_context_update(self, msg: ContextUpdate) -> None:
+        self.query_one(StatusBar).current_context = msg.current_input
 
     def on_tool_count_changed(self, msg: ToolCountChanged) -> None:
         bar = self.query_one(StatusBar)
@@ -708,9 +755,11 @@ class GhidraAgentApp(App[None]):
             else:
                 activity.post_message(LLMDone(run_id))
             output = event.get("data", {}).get("output")
-            tokens = _extract_usage(output)
-            if tokens:
-                self.post_message(TokenUpdate(tokens))
+            usage = _extract_usage(output)
+            if usage.input_tokens or usage.output_tokens:
+                self.post_message(TokenUpdate(usage.input_tokens, usage.output_tokens))
+            if not is_compaction and "|" not in checkpoint_ns and usage.input_tokens:
+                self.post_message(ContextUpdate(usage.input_tokens))
 
         elif kind == "on_chat_model_stream":
             if is_compaction:
@@ -770,17 +819,25 @@ def _extract_output_snippet(output: object) -> str:
     return str(content)[:80]
 
 
-def _extract_usage(output: object) -> int:
-    """Pull total_tokens from a chat model's usage_metadata, if present."""
+class _Usage(NamedTuple):
+    input_tokens: int
+    output_tokens: int
+
+
+def _extract_usage(output: object) -> _Usage:
+    """Pull input/output tokens from a chat model's usage_metadata, if present."""
     if output is None:
-        return 0
+        return _Usage(0, 0)
     usage = getattr(output, "usage_metadata", None)
-    if isinstance(usage, dict):
-        try:
-            return int(usage.get("total_tokens", 0))
-        except (TypeError, ValueError):
-            return 0
-    return 0
+    if not isinstance(usage, dict):
+        return _Usage(0, 0)
+    try:
+        return _Usage(
+            int(usage.get("input_tokens", 0) or 0),
+            int(usage.get("output_tokens", 0) or 0),
+        )
+    except (TypeError, ValueError):
+        return _Usage(0, 0)
 
 
 def _fmt_duration(seconds: float) -> str:

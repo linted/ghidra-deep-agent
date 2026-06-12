@@ -140,6 +140,11 @@ async def main() -> None:
 
             agent = create_deep_agent(**agent_kwargs)
 
+            profile = getattr(built_model, "profile", None) or {}
+            ctx_max = profile.get("max_input_tokens") or int(
+                os.environ.get("MAX_CONTEXT_TOKENS", "200000")
+            )
+
             app = GhidraAgentApp(
                 agent=agent,
                 config=config,
@@ -147,6 +152,7 @@ async def main() -> None:
                 session_id=session_id,
                 mcp_ok=True,
                 db_ok=True,
+                max_context_tokens=ctx_max,
             )
             await app.run_async()
     except ServerSelectionTimeoutError as e:
