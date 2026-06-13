@@ -286,3 +286,53 @@ class TestListAnalyzedBinaries:
     def test_current_binary_marked(self, tools_map: Any) -> None:
         r = tools_map["list_analyzed_binaries"].invoke({})
         assert "← current" in r
+
+
+# ── 10. get_knowledge_summary tool ───────────────────────────────────────────
+
+
+class TestGetKnowledgeSummary:
+    def test_summary_contains_seeded_data(self, tools_map: Any) -> None:
+        # tools_map fixture has already seeded two findings via save_knowledge.
+        summary = tools_map["get_knowledge_summary"].invoke({})
+        assert BINARY_NAME in summary
+        assert "Totals:" in summary
+        assert TEST_MARKER in summary  # function name appears in analyzed list
+
+    def test_summary_respects_function_cap(
+        self, tools_map: Any, mongo_collection: Any, embeddings_model: Any
+    ) -> None:
+        from ghidra_deep_agent.knowledge import (
+            SUMMARY_FUNCTION_CAP,
+            build_knowledge_tools,
+        )
+
+        cap_binary = "__cap_test_binary__"
+        docs = [
+            {
+                "text": f"cap test fn {i}",
+                "binary_name": cap_binary,
+                "category": "function",
+                "address": f"0x{i:08x}",
+                "function_name": f"cap_fn_{i:03d}",
+                "confidence": "medium",
+                "tags": [],
+            }
+            for i in range(SUMMARY_FUNCTION_CAP + 5)
+        ]
+        try:
+            mongo_collection.insert_many(docs)
+            # Build a separate tools map scoped to the cap_binary.
+            cap_tools = {
+                t.name: t
+                for t in build_knowledge_tools(
+                    MONGODB_URI, MONGODB_DB, embeddings_model, cap_binary
+                )
+            }
+            summary = cap_tools["get_knowledge_summary"].invoke({})
+            assert f"({SUMMARY_FUNCTION_CAP} shown)" in summary
+            assert "cap_fn_000" in summary
+            # An entry beyond the cap should not appear.
+            assert f"cap_fn_{SUMMARY_FUNCTION_CAP + 3:03d}" not in summary
+        finally:
+            mongo_collection.delete_many({"binary_name": cap_binary})
