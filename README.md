@@ -160,3 +160,29 @@ The agent connects to the Ghidra MCP server, loads its tools, and opens an inter
 ```
 
 Each run starts a new session with a random UUID unless `--session-id` is supplied. The session ID is printed when you exit — use it to resume later. Press `Ctrl+C` or type `quit` to exit.
+
+## Web UI
+
+A browser front-end with the same feature set as the TUI — live activity tree, streaming responses, token/context status bar, slash commands, and toasts — plus a session sidebar for managing multiple analyses. It shares the same agent runtime, MongoDB checkpointer, and knowledge base as the TUI.
+
+Install the optional `web` extra and start the server:
+
+```bash
+uv sync --extra web
+uv run ghidra-deep-agent-web
+```
+
+Then open <http://localhost:8000>. Click **+ New**, pick an open Ghidra program, and start asking questions. Sessions persist (resume them from the sidebar), and you can run several at once.
+
+Configure the bind address with `WEB_HOST` / `WEB_PORT` (defaults `0.0.0.0:8000`). All other configuration (model, MongoDB, embeddings, Ghidra MCP transport) is read from the same environment as the TUI.
+
+### Docker
+
+The web service ships with a `Dockerfile` and a top-level `docker-compose.yml`. MongoDB runs as a separate stack (see [mongodb/](mongodb/)); start it first so the `search-community` network exists:
+
+```bash
+(cd mongodb && docker compose up -d)
+docker compose up --build
+```
+
+> **Note:** A container can't reach a Ghidra instance on your host over stdio. For Docker, run a Ghidra MCP server reachable over HTTP and set `GHIDRA_MCP_TRANSPORT=http` with `GHIDRA_MCP_URL` (the compose file defaults it to `http://host.docker.internal:8080/mcp`).

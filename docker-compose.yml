@@ -1,0 +1,36 @@
+# Web UI for the Ghidra deep agent.
+#
+# This compose file runs only the web service. MongoDB is expected to be
+# running separately via mongodb/docker-compose.yml (which also creates the
+# `search-community` network this service attaches to). Start Mongo first:
+#
+#   (cd mongodb && docker compose up -d)
+#   docker compose up --build
+#
+# Ghidra runs on the host (or elsewhere), so the web container must reach its
+# MCP server over HTTP — set GHIDRA_MCP_TRANSPORT=http and GHIDRA_MCP_URL.
+services:
+  web:
+    build: .
+    container_name: ghidra-deep-agent-web
+    ports:
+      - "8000:8000"
+    environment:
+      WEB_HOST: 0.0.0.0
+      WEB_PORT: "8000"
+      MONGODB_URI: ${MONGODB_URI:-mongodb://mongod.search-community:27017}
+      MONGODB_DB: ${MONGODB_DB:-checkpointing_db}
+      MODEL: ${MODEL:-anthropic:claude-sonnet-4-6}
+      EMBED_MODEL: ${EMBED_MODEL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GHIDRA_MCP_TRANSPORT: ${GHIDRA_MCP_TRANSPORT:-http}
+      GHIDRA_MCP_URL: ${GHIDRA_MCP_URL:-http://host.docker.internal:8080/mcp}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - search-community
+
+networks:
+  search-community:
+    name: search-community
+    external: true

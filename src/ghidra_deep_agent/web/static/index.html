@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ghidra Deep Agent</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="/static/vendor/marked.umd.min.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div id="app">
+    <!-- Sidebar: sessions -->
+    <aside id="sidebar">
+      <div class="sidebar-head">
+        <span class="brand">Ghidra Agent</span>
+        <button id="new-session" title="New session">+ New</button>
+      </div>
+      <ul id="session-list"></ul>
+    </aside>
+
+    <!-- Main column -->
+    <main id="main">
+      <header id="topbar">
+        <div class="title">
+          <span id="active-binary">No session</span>
+          <span id="active-meta" class="muted"></span>
+        </div>
+        <div class="topbar-actions">
+          <button id="toggle-tree" title="Toggle activity (Ctrl+T)">Activity</button>
+          <button id="yank" title="Copy last response (Ctrl+Y)">Copy</button>
+          <button id="clear" title="Clear log (Ctrl+L)">Clear</button>
+          <button id="help" title="Help (F1)">?</button>
+        </div>
+      </header>
+
+      <section id="panes">
+        <div id="conversation"></div>
+        <div id="activity">
+          <div class="pane-title">Activity</div>
+          <div id="activity-tree"></div>
+        </div>
+      </section>
+
+      <div id="thinking" class="hidden">
+        <div class="pane-title">Thinking
+          <button id="thinking-toggle" class="link">hide</button>
+        </div>
+        <pre id="thinking-body"></pre>
+      </div>
+
+      <footer id="statusbar">
+        <span id="st-mcp" class="dot" title="Ghidra MCP">MCP</span>
+        <span id="st-db" class="dot" title="MongoDB">DB</span>
+        <span id="st-timer" class="metric">0:00</span>
+        <span id="st-tokens" class="metric">↑0 ↓0</span>
+        <span id="st-context" class="metric">ctx 0</span>
+        <span id="st-tools" class="metric">tools 0</span>
+        <span id="st-flash" class="flash"></span>
+      </footer>
+
+      <form id="input-row" autocomplete="off">
+        <input id="query" type="text" placeholder="Ask the agent…  (start with / for commands)" disabled />
+      </form>
+    </main>
+  </div>
+
+  <!-- Binary picker modal -->
+  <div id="binary-modal" class="modal hidden">
+    <div class="modal-card">
+      <h3>Select a binary</h3>
+      <p class="muted">Open programs in Ghidra:</p>
+      <ul id="binary-list"></ul>
+      <div id="binary-error" class="error hidden"></div>
+      <div class="modal-actions">
+        <button id="binary-cancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Help modal -->
+  <div id="help-modal" class="modal hidden">
+    <div class="modal-card">
+      <h3>Help</h3>
+      <table class="help-table">
+        <tr><td>/clear</td><td>Clear the conversation log</td></tr>
+        <tr><td>/yank</td><td>Copy the last response</td></tr>
+        <tr><td>/compact</td><td>Compact the conversation history</td></tr>
+        <tr><td>/help</td><td>Show this help</td></tr>
+        <tr><td>Esc</td><td>Cancel the running agent</td></tr>
+        <tr><td>Ctrl+L</td><td>Clear log</td></tr>
+        <tr><td>Ctrl+T</td><td>Toggle activity panel</td></tr>
+        <tr><td>Ctrl+Y</td><td>Copy last response</td></tr>
+        <tr><td>↑ / ↓</td><td>Walk input history</td></tr>
+      </table>
+      <div class="modal-actions">
+        <button id="help-close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toasts"></div>
+</body>
+</html>

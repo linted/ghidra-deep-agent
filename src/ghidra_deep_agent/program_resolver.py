@@ -2,8 +2,6 @@ import json
 import re
 from typing import Any
 
-from ghidra_deep_agent.tui import ProgramSelectApp
-
 
 def parse_program_list(result: str) -> list[str]:
     """Parse list_open_programs output into a list of program names."""
@@ -36,10 +34,12 @@ def parse_program_list(result: str) -> list[str]:
     return names
 
 
-async def resolve_binary_name(tools: list[Any], override: str | None) -> str:
-    if override:
-        return override
+async def list_open_programs(tools: list[Any]) -> list[str]:
+    """Query Ghidra for the names of all currently open programs.
 
+    Framework-agnostic: callable from both the TUI and the web UI. Raises
+    RuntimeError if the MCP server cannot provide a usable program list.
+    """
     list_tool = next((t for t in tools if t.name == "list_open_programs"), None)
     if list_tool is None:
         raise RuntimeError(
@@ -68,9 +68,16 @@ async def resolve_binary_name(tools: list[Any], override: str | None) -> str:
             text: str = raw if isinstance(raw, str) else str(result)
         else:
             text = str(result)
-        programs = parse_program_list(text)
+        return parse_program_list(text)
     except Exception as exc:
         raise RuntimeError(f"Failed to list open programs: {exc}") from exc
+
+
+async def resolve_binary_name(tools: list[Any], override: str | None) -> str:
+    if override:
+        return override
+
+    programs = await list_open_programs(tools)
 
     if not programs:
         raise RuntimeError(
@@ -80,6 +87,9 @@ async def resolve_binary_name(tools: list[Any], override: str | None) -> str:
 
     if len(programs) == 1:
         return programs[0]
+
+    # Imported lazily so the TUI dependency stays out of the listing path.
+    from ghidra_deep_agent.tui import ProgramSelectApp
 
     selected = await ProgramSelectApp(programs).run_async()
     if not selected:

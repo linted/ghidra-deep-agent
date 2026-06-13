@@ -4,6 +4,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ghidra_deep_agent"]
+artifacts = ["src/ghidra_deep_agent/web/static/**"]
 
 [project]
 name = "ghidra-deep-agent"
@@ -27,11 +28,16 @@ dependencies = [
 
 [project.scripts]
 ghidra-deep-agent = "main:run"
+ghidra-deep-agent-web = "ghidra_deep_agent.web.server:run"
 
 [project.optional-dependencies]
 dev = [
     "ruff",
     "mypy",
+]
+web = [
+    "fastapi",
+    "uvicorn[standard]",
 ]
 
 [tool.ruff]
