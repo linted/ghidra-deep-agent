@@ -1,0 +1,83 @@
+Screen {
+    layout: vertical;
+}
+
+#panes {
+    height: 1fr;
+}
+
+ActivityTree {
+    width: 35%;
+    border: round $accent-darken-2;
+    border-title-color: $accent;
+    scrollbar-size: 1 1;
+}
+
+#panes.hide-tree ActivityTree {
+    display: none;
+}
+
+#right-pane {
+    width: 65%;
+}
+
+#panes.hide-tree #right-pane {
+    width: 1fr;
+}
+
+ResponseLog {
+    width: 100%;
+    height: 1fr;
+    padding: 0 1;
+    scrollbar-size: 1 1;
+}
+
+ThinkingPanel {
+    height: 10;
+    border: round $warning-darken-2;
+    border-title-color: $warning;
+    padding: 0 1;
+    scrollbar-size: 1 1;
+    display: none;
+}
+
+ThinkingPanel Static {
+    color: $text-muted;
+}
+
+StatusBar {
+    height: 1;
+    background: $boost;
+    color: $text-muted;
+    padding: 0 1;
+}
+
+StatusBar.busy {
+    background: $warning 15%;
+}
+
+#query {
+    height: 3;
+    border-top: solid $accent-darken-2;
+}
+
+#query.busy {
+    border-top: solid $warning-darken-2;
+}
+
+HelpScreen {
+    align: center middle;
+}
+
+#help-box {
+    width: 64;
+    height: auto;
+    border: round $accent;
+    padding: 1 2;
+    background: $surface;
+}
+
+#help-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
