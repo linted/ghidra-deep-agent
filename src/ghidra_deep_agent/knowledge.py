@@ -1,4 +1,5 @@
 import os
+from collections import Counter
 from datetime import UTC, datetime
 from typing import Any
 
@@ -9,6 +10,103 @@ from langchain_core.tools.retriever import create_retriever_tool
 from langchain_mongodb import MongoDBAtlasVectorSearch
 from langchain_mongodb.embeddings import AutoEmbeddings
 from pymongo import MongoClient
+
+# Caps applied when rendering the session-start summary so the result
+# stays predictable as the knowledge base grows.
+SUMMARY_HYPOTHESIS_CAP = 10
+SUMMARY_FUNCTION_CAP = 40
+SUMMARY_TAG_CAP = 15
+SUMMARY_SNIPPET_CHARS = 240
+
+
+def _render_knowledge_summary(docs: list[dict[str, Any]], binary_name: str) -> str:
+    """Render the markdown summary string from already-fetched MongoDB docs."""
+    header = f"# Knowledge summary for {binary_name}"
+    if not docs:
+        return (
+            f"{header}\n\nKnowledge base is empty — no prior findings for this binary."
+        )
+
+    category_counts: Counter[str] = Counter(d.get("category", "") for d in docs)
+    confidence_counts: Counter[str] = Counter(d.get("confidence", "") for d in docs)
+
+    conf_rank = {"high": 0, "medium": 1, "low": 2}
+    hypotheses = sorted(
+        (
+            d
+            for d in docs
+            if d.get("category") == "hypothesis"
+            and d.get("confidence") in ("high", "medium")
+        ),
+        key=lambda d: conf_rank.get(d.get("confidence", ""), 99),
+    )[:SUMMARY_HYPOTHESIS_CAP]
+
+    seen_funcs: dict[str, str] = {}
+    for d in docs:
+        name = d.get("function_name", "")
+        if name and name not in seen_funcs:
+            seen_funcs[name] = d.get("address", "")
+        if len(seen_funcs) >= SUMMARY_FUNCTION_CAP:
+            break
+
+    tag_counter: Counter[str] = Counter()
+    for d in docs:
+        for t in d.get("tags", []) or []:
+            tag_counter[t] += 1
+    top_tags = tag_counter.most_common(SUMMARY_TAG_CAP)
+
+    lines: list[str] = [header, ""]
+    lines.append(
+        f"Totals: {len(docs)} findings across {len(category_counts)} categories"
+    )
+    lines.append(
+        "  "
+        + "  ".join(f"{cat}: {n}" for cat, n in category_counts.most_common() if cat)
+    )
+    conf_parts = [
+        f"{c} {confidence_counts.get(c, 0)}"
+        for c in ("high", "medium", "low")
+        if confidence_counts.get(c, 0)
+    ]
+    if conf_parts:
+        lines.append("Confidence: " + " · ".join(conf_parts))
+
+    if hypotheses:
+        lines.append("")
+        lines.append("## Working hypotheses (high/medium confidence)")
+        for d in hypotheses:
+            label = " | ".join([d.get("address") or "-", d.get("confidence") or "-"])
+            snippet = (d.get("text") or "")[:SUMMARY_SNIPPET_CHARS]
+            lines.append(f"- [{label}] {snippet}")
+
+    if seen_funcs:
+        lines.append("")
+        lines.append(f"## Analyzed functions ({len(seen_funcs)} shown)")
+        func_strs = [
+            f"{name} ({addr})" if addr else name for name, addr in seen_funcs.items()
+        ]
+        lines.append(" · ".join(func_strs))
+
+    if top_tags:
+        lines.append("")
+        lines.append("## Top tags")
+        lines.append(" · ".join(f"{t} ({n})" for t, n in top_tags))
+
+    low_count = confidence_counts.get("low", 0)
+    if low_count:
+        lines.append("")
+        lines.append(
+            f"## Gaps\n{low_count} low-confidence finding(s) — "
+            "call `query_by_category` or `query_by_tags` to review."
+        )
+
+    lines.append("")
+    lines.append(
+        "_Use `list_all_knowledge` only if you need the full inventory; "
+        "this summary is regenerated each session._"
+    )
+
+    return "\n".join(lines)
 
 
 def build_knowledge_tools(
@@ -235,6 +333,34 @@ def build_knowledge_tools(
         return f"{len(docs)} finding(s):\n" + "\n".join(lines)
 
     @tool
+    def get_knowledge_summary() -> str:
+        """Compact session-start summary of the knowledge base for this binary.
+
+        Call this at the **start of every session** to orient yourself before
+        doing anything else. Returns totals by category and confidence, the
+        top high/medium-confidence working hypotheses, the list of analyzed
+        functions, and the most common tags — capped so the result stays
+        light regardless of how many findings have been saved.
+
+        For a complete listing of every finding (rare), use `list_all_knowledge`.
+        """
+        docs = list(
+            collection.find(
+                {"binary_name": binary_name},
+                {
+                    "text": 1,
+                    "category": 1,
+                    "address": 1,
+                    "function_name": 1,
+                    "confidence": 1,
+                    "tags": 1,
+                    "_id": 0,
+                },
+            )
+        )
+        return _render_knowledge_summary(docs, binary_name)
+
+    @tool
     def list_all_knowledge(tags: list[str] | None = None) -> str:
         """List a summary of every entry in the knowledge base for the current binary.
 
@@ -374,6 +500,7 @@ def build_knowledge_tools(
         query_by_address,
         query_by_category,
         query_by_tags,
+        get_knowledge_summary,
         list_all_knowledge,
         list_analyzed_binaries,
     ]
