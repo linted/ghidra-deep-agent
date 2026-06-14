@@ -9,20 +9,37 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from ghidra_deep_agent.importer_client import import_binary
 from ghidra_deep_agent.web.service import COMPACT_PROMPT, AgentService
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+# Program names become analyzeHeadless args and repo paths in the importer; keep
+# the web-side check identical to the importer's allowlist.
+_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "256"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+
+def _safe_program_name(filename: str | None) -> str | None:
+    """Reduce an upload filename to a safe program name, or None if unusable."""
+    if not filename:
+        return None
+    name = os.path.basename(filename).strip()
+    return name if _NAME_RE.match(name) else None
+
 
 service = AgentService()
 
@@ -65,6 +82,37 @@ async def get_programs() -> Response:
         return JSONResponse({"programs": await service.list_programs()})
     except RuntimeError as exc:
         return JSONResponse({"error": str(exc)}, status_code=502)
+
+
+@app.post("/api/upload")
+async def upload_binary(request: Request, name: str) -> Response:
+    """Accept a binary and import it into the shared Ghidra Server repo.
+
+    The file is sent as the raw request body (``application/octet-stream``) with
+    ``?name=<filename>``; the bytes are forwarded to the importer in the
+    ghidra-mcp container (the only place Ghidra is installed). Duplicate names are
+    rejected (409) and no analysis runs at upload time — both per product decision.
+    """
+    safe = _safe_program_name(name)
+    if safe is None:
+        return JSONResponse(
+            {"error": "invalid filename (allowed: letters, digits, . _ -)"},
+            status_code=400,
+        )
+
+    data = await request.body()
+    if not data:
+        return JSONResponse({"error": "empty file"}, status_code=400)
+    if len(data) > MAX_UPLOAD_BYTES:
+        return JSONResponse(
+            {"error": f"file exceeds {MAX_UPLOAD_MB} MB"}, status_code=413
+        )
+
+    try:
+        result = await import_binary(safe, data)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return JSONResponse(result.payload, status_code=result.status_code)
 
 
 @app.get("/api/sessions")

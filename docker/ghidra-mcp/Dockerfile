@@ -51,12 +51,18 @@ ENV GHIDRA_MCP_PORT=8089
 ENV MCP_BRIDGE_PORT=8081
 ENV JAVA_OPTS="-Xmx4g -XX:+UseG1GC"
 
+ENV IMPORTER_PORT=8082
+
 RUN mkdir -p /data /projects
+# Binary import service (stdlib only): runs analyzeHeadless to commit uploaded
+# binaries into the shared repo, since the web container has no Ghidra.
+COPY importer.py /app/importer.py
 COPY entrypoint.sh /app/entrypoint.sh
 RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
-# 8089 stays internal (engine REST); 8081 is the MCP endpoint the agent uses.
-EXPOSE 8089 8081
+# 8089 stays internal (engine REST); 8081 is the MCP endpoint the agent uses;
+# 8082 is the import service (internal — reached by the web service by name).
+EXPOSE 8089 8081 8082
 VOLUME ["/data", "/projects"]
 
 # Health = engine REST API up. Generous start period: Ghidra init is slow.

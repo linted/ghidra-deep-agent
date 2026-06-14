@@ -206,6 +206,10 @@ button:hover { border-color: var(--primary); color: var(--primary); }
 #binary-list li { padding: 8px 10px; border-radius: 6px; cursor: pointer; }
 #binary-list li:hover { background: var(--panel); color: var(--primary); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.modal-sep { border: none; border-top: 1px solid var(--panel); margin: 14px 0 10px; }
+.upload-row { display: flex; gap: 8px; align-items: center; }
+.upload-row input[type="file"] { flex: 1; min-width: 0; }
+#upload-status { margin-top: 8px; font-size: 0.85em; }
 .error { color: var(--error); margin: 8px 0; }
 .help-table { width: 100%; border-collapse: collapse; }
 .help-table td { padding: 4px 8px; }

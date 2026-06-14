@@ -501,6 +501,40 @@ async function openBinaryPicker() {
   }
 }
 
+// ---- Binary upload ---------------------------------------------------------
+async function uploadBinary() {
+  const input = $("#upload-file");
+  const status = $("#upload-status");
+  const file = input.files && input.files[0];
+  if (!file) {
+    status.textContent = "Choose a file first.";
+    return;
+  }
+  const btn = $("#upload-btn");
+  btn.disabled = true;
+  status.textContent = `Importing ${file.name}… (this can take a moment)`;
+  try {
+    // Send the file as the raw request body with the name in the query string
+    // (the server reads request.body() — no multipart parsing needed).
+    const res = await fetch(`/api/upload?name=${encodeURIComponent(file.name)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: file,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      status.textContent = `Imported "${data.name}" into ${data.repository}. It's in the shared repo — check it out in Ghidra to analyze.`;
+      input.value = "";
+    } else {
+      status.textContent = `Import failed (${res.status}): ${data.error || "unknown error"}`;
+    }
+  } catch (e) {
+    status.textContent = "Upload failed: " + e;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 // ---- Wiring ----------------------------------------------------------------
 function init() {
   loadConfig();
@@ -531,6 +565,7 @@ function init() {
   });
 
   $("#new-session").onclick = openBinaryPicker;
+  $("#upload-btn").onclick = uploadBinary;
   $("#binary-cancel").onclick = () => $("#binary-modal").classList.add("hidden");
   $("#toggle-tree").onclick = () => $("#panes").classList.toggle("hide-tree");
   $("#yank").onclick = doYank;
