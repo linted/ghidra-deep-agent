@@ -16,7 +16,8 @@ import pytest
 
 
 def _load_importer() -> Any:
-    path = pathlib.Path(__file__).parent / "docker" / "ghidra-mcp" / "importer.py"
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    path = repo_root / "docker" / "ghidra-mcp" / "importer.py"
     spec = importlib.util.spec_from_file_location("ghidra_importer", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
