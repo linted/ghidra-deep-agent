@@ -7,7 +7,12 @@ set -uo pipefail
 GHIDRA_HOME="${GHIDRA_HOME:-/opt/ghidra}"
 ENGINE_PORT="${GHIDRA_MCP_PORT:-8089}"
 BRIDGE_PORT="${MCP_BRIDGE_PORT:-8081}"
-BIND_ADDRESS="${GHIDRA_MCP_BIND_ADDRESS:-0.0.0.0}"
+# The engine REST API (8089) is only consumed by the bridge *inside this
+# container* via 127.0.0.1, and compose never publishes 8089 — so bind it to
+# loopback. GhidraMCP >=5.13 refuses any non-loopback bind (0.0.0.0) unless
+# GHIDRA_MCP_AUTH_TOKEN is set; loopback sidesteps that guard and is strictly
+# more secure. Only the Python bridge (8081) binds 0.0.0.0, below.
+BIND_ADDRESS="${GHIDRA_MCP_BIND_ADDRESS:-127.0.0.1}"
 JAVA_OPTS="${JAVA_OPTS:--Xmx4g -XX:+UseG1GC}"
 
 # Build the Ghidra runtime classpath (framework + features + processors) plus
@@ -19,9 +24,15 @@ for category in Framework Features Processors; do
   done
 done
 
-# Optional service-account name to bypass Ghidra project ownership checks.
+# The Ghidra Server identifies a client by its JVM user.name (it runs with
+# "Prompt for user ID: no", so a client-supplied SID is ignored). This container
+# runs as root, so without an override the engine logs in as "root" and the
+# server rejects it ("Unknown user: root") even though the service account is
+# "agent". Force user.name to the service account so RMI/SSL auth presents the
+# right SID. GHIDRA_SERVER_USER is what compose sets; GHIDRA_USER is a fallback.
+SERVICE_USER="${GHIDRA_SERVER_USER:-${GHIDRA_USER:-}}"
 USER_OPT=""
-[ -n "${GHIDRA_USER:-}" ] && USER_OPT="-Duser.name=${GHIDRA_USER}"
+[ -n "${SERVICE_USER}" ] && USER_OPT="-Duser.name=${SERVICE_USER}"
 
 engine_pid=""
 bridge_pid=""

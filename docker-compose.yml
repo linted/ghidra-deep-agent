@@ -29,6 +29,13 @@ services:
       # provisions this user (with the password below) on first boot.
       GHIDRA_SERVER_USER: ${GHIDRA_SERVER_USER:-agent}
       GHIDRA_SERVER_PASSWORD: ${GHIDRA_SERVER_PASSWORD:-}
+      # Default shared repository the entrypoint seeds on first boot via the
+      # Ghidra RMI client API (svrAdmin cannot create repositories). Leave blank
+      # to skip seeding. The helper connects back to this server by its
+      # advertised hostname (must match the cert SAN baked in at build time).
+      GHIDRA_DEFAULT_REPOSITORY: ${GHIDRA_DEFAULT_REPOSITORY:-agent-shared}
+      GHIDRA_SERVER_HOST: ghidra-server
+      GHIDRA_SERVER_PORT: "13100"
     volumes:
       - ghidra-repositories:/repositories
     networks:

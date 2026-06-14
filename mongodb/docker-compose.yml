@@ -11,7 +11,7 @@ services:
       extra_hosts:
          - "host.docker.internal:host-gateway"
       volumes:
-         - mongod_data:/data/db
+         - mongod_data_test:/data/db
          - ./mongod.conf:/etc/mongod.conf:ro
          - ./sampledata.archive:/sampledata.archive
          - ./init-mongo.sh:/docker-entrypoint-initdb.d/init-mongo.sh:ro
@@ -39,7 +39,7 @@ services:
             aliases:
                - mongot.search-community
       volumes:
-         - mongot_data:/data/mongot
+         - mongot_data_test:/data/mongot
          - ./mongot.conf:/mongot-community/config.default.yml
       secrets:
          - mongot_pwfile
@@ -51,8 +51,8 @@ services:
          - 9946:9946    # Metrics port from config
 
 volumes:
-   mongod_data:
-   mongot_data:
+   mongod_data_test:
+   mongot_data_test:
 
 networks:
    search-community:
