@@ -1,15 +1,64 @@
-# Web UI for the Ghidra deep agent.
+# Full Ghidra deep-agent stack: web UI + Ghidra Server + a combined headless
+# Ghidra engine / MCP bridge.
 #
-# This compose file runs only the web service. MongoDB is expected to be
-# running separately via mongodb/docker-compose.yml (which also creates the
-# `search-community` network this service attaches to). Start Mongo first:
+# MongoDB runs separately via mongodb/docker-compose.yml, which also creates the
+# external `search-community` network everything here attaches to. Start Mongo
+# first, then this stack:
 #
 #   (cd mongodb && docker compose up -d)
 #   docker compose up --build
 #
-# Ghidra runs on the host (or elsewhere), so the web container must reach its
-# MCP server over HTTP — set GHIDRA_MCP_TRANSPORT=http and GHIDRA_MCP_URL.
+# Data path:
+#   web (MultiServerMCPClient) --MCP--> ghidra-mcp:8081 /mcp
+#       --REST--> headless engine :8089 --RMI/SSL--> ghidra-server:13100-13102
+#
+# Scaling note (future TODO): each ghidra-mcp container holds one program at a
+# time, so concurrent agents on different binaries need one ghidra-mcp instance
+# each. This file defines a single instance; dynamic per-agent provisioning is a
+# follow-up.
 services:
+  ghidra-server:
+    build: ./docker/ghidra-server
+    container_name: ghidra-server
+    ports:
+      - "13100:13100"
+      - "13101:13101"
+      - "13102:13102"
+    environment:
+      # Service account the ghidra-mcp engine authenticates as. The entrypoint
+      # provisions this user (with the password below) on first boot.
+      GHIDRA_SERVER_USER: ${GHIDRA_SERVER_USER:-agent}
+      GHIDRA_SERVER_PASSWORD: ${GHIDRA_SERVER_PASSWORD:-}
+    volumes:
+      - ghidra-repositories:/repositories
+    networks:
+      - search-community
+    restart: unless-stopped
+
+  ghidra-mcp:
+    build: ./docker/ghidra-mcp
+    container_name: ghidra-mcp
+    ports:
+      - "8081:8081"            # MCP bridge; engine REST (8089) stays internal
+    environment:
+      MCP_BRIDGE_PORT: "8081"
+      GHIDRA_MCP_PORT: "8089"
+      JAVA_OPTS: ${GHIDRA_JAVA_OPTS:--Xmx4g -XX:+UseG1GC}
+      # Where the headless engine checks out shared programs from. Consumed by
+      # GhidraServerManager when /server/connect is invoked at runtime.
+      GHIDRA_SERVER_HOST: ghidra-server
+      GHIDRA_SERVER_PORT: "13100"
+      GHIDRA_SERVER_USER: ${GHIDRA_SERVER_USER:-agent}
+      GHIDRA_SERVER_PASSWORD: ${GHIDRA_SERVER_PASSWORD:-}
+    volumes:
+      - ghidra-data:/data
+      - ghidra-projects:/projects
+    depends_on:
+      - ghidra-server
+    networks:
+      - search-community
+    restart: unless-stopped
+
   web:
     build: .
     container_name: ghidra-deep-agent-web
@@ -24,9 +73,10 @@ services:
       EMBED_MODEL: ${EMBED_MODEL:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GHIDRA_MCP_TRANSPORT: ${GHIDRA_MCP_TRANSPORT:-http}
-      GHIDRA_MCP_URL: ${GHIDRA_MCP_URL:-http://host.docker.internal:8080/mcp}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      # Points at the in-network MCP bridge above.
+      GHIDRA_MCP_URL: ${GHIDRA_MCP_URL:-http://ghidra-mcp:8081/mcp}
+    depends_on:
+      - ghidra-mcp
     networks:
       - search-community
 
@@ -34,3 +84,8 @@ networks:
   search-community:
     name: search-community
     external: true
+
+volumes:
+  ghidra-repositories:
+  ghidra-data:
+  ghidra-projects:
