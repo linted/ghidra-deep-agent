@@ -78,6 +78,24 @@
         <input id="upload-file" type="file" />
         <button id="upload-btn" type="button">Upload &amp; import</button>
       </div>
+      <p class="muted upload-hint-label">
+        Raw/headerless binary (e.g. firmware)? Set a processor so Ghidra can load it:
+      </p>
+      <div class="upload-hints">
+        <label>Processor
+          <input id="upload-processor" list="ghidra-langs" placeholder="auto-detect" />
+          <datalist id="ghidra-langs"></datalist>
+        </label>
+        <label>Compiler spec
+          <select id="upload-cspec"><option value="">default</option></select>
+        </label>
+        <label>Image base
+          <input id="upload-base" placeholder="e.g. 0x0" />
+        </label>
+        <label>Loader
+          <input id="upload-loader" placeholder="auto (BinaryLoader)" />
+        </label>
+      </div>
       <div id="upload-status" class="muted"></div>
       <div class="modal-actions">
         <button id="binary-cancel">Cancel</button>

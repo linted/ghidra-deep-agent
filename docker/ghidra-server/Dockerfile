@@ -13,8 +13,9 @@ ARG GHIDRA_DATE=20260513
 # DNS name matching <host> found".
 ARG GHIDRA_SERVER_HOSTNAME=ghidra-server
 
+# python3 runs the stdlib-only binary import service (importer.py); no pip needed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        wget unzip ca-certificates \
+        wget unzip ca-certificates python3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt
@@ -67,6 +68,13 @@ RUN set -eu; \
     CP="${CP#:}"; \
     javac -cp "${CP}" -d /opt/repo-tools /opt/repo-tools/CreateRepository.java; \
     printf '%s' "${CP}" > /opt/repo-tools/classpath
+
+# Binary import service (upload -> analyzeHeadless -> shared repo). Co-located
+# here because importing is a global, session-agnostic operation owned by the
+# single persistent server, not a per-session ghidra-mcp engine. It listens on
+# 8082 for the web container over the docker network only — deliberately NOT
+# EXPOSEd/published to the host (no compose `ports:` entry either).
+COPY importer.py /opt/importer.py
 
 COPY entrypoint.sh /entrypoint.sh
 RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh

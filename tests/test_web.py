@@ -274,7 +274,9 @@ def _stub_import(
 ) -> Any:
     """Build an async stand-in for ``server.import_binary``."""
 
-    async def _imp(name: str, data: bytes, repo: str | None = None) -> ImportResult:
+    async def _imp(
+        name: str, data: bytes, repo: str | None = None, **_hints: Any
+    ) -> ImportResult:
         if exc is not None:
             raise exc
         assert result is not None
@@ -322,7 +324,9 @@ def test_upload_traversal_name_reduced_to_basename(
 ) -> None:
     seen: dict[str, str] = {}
 
-    async def _imp(name: str, data: bytes, repo: str | None = None) -> ImportResult:
+    async def _imp(
+        name: str, data: bytes, repo: str | None = None, **_hints: Any
+    ) -> ImportResult:
         seen["name"] = name
         return ImportResult(200, {"name": name})
 
@@ -359,3 +363,72 @@ def test_upload_service_down_is_502(
     with client:
         resp = client.post("/api/upload", params={"name": "true"}, content=b"x")
     assert resp.status_code == 502
+
+
+def test_upload_forwards_import_hints(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+
+    async def _imp(
+        name: str, data: bytes, repo: str | None = None, **hints: Any
+    ) -> ImportResult:
+        seen.update(hints)
+        return ImportResult(200, {"name": name})
+
+    monkeypatch.setattr(server, "import_binary", _imp)
+    with client:
+        resp = client.post(
+            "/api/upload",
+            params={
+                "name": "blob.bin",
+                "processor": "ARM:LE:32:v8",
+                "cspec": "default",
+                "base": "0x8000",
+            },
+            content=b"x",
+        )
+    assert resp.status_code == 200
+    assert seen == {
+        "loader": None,
+        "processor": "ARM:LE:32:v8",
+        "cspec": "default",
+        "base": "0x8000",
+    }
+
+
+@pytest.mark.parametrize(
+    ("param", "value"),
+    [
+        ("processor", "ARM LE 32"),  # space not allowed
+        ("base", "nothex"),
+        ("loader", "Binary Loader"),  # space not allowed
+    ],
+)
+def test_upload_invalid_hint_is_400(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, param: str, value: str
+) -> None:
+    called = {"hit": False}
+
+    async def _imp(name: str, data: bytes, **_k: Any) -> ImportResult:
+        called["hit"] = True
+        return ImportResult(200, {})
+
+    monkeypatch.setattr(server, "import_binary", _imp)
+    with client:
+        resp = client.post(
+            "/api/upload", params={"name": "blob", param: value}, content=b"x"
+        )
+    assert resp.status_code == 400
+    assert called["hit"] is False
+
+
+def test_languages_route(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _langs() -> ImportResult:
+        return ImportResult(200, {"languages": [{"id": "ARM:LE:32:v8"}], "count": 1})
+
+    monkeypatch.setattr(server, "list_languages", _langs)
+    with client:
+        resp = client.get("/api/languages")
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 1

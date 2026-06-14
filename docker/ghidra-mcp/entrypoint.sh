@@ -36,10 +36,8 @@ USER_OPT=""
 
 engine_pid=""
 bridge_pid=""
-importer_pid=""
 terminate() {
   echo "Shutting down GhidraMCP container..."
-  [ -n "${importer_pid}" ] && kill "${importer_pid}" 2>/dev/null || true
   [ -n "${bridge_pid}" ] && kill "${bridge_pid}" 2>/dev/null || true
   [ -n "${engine_pid}" ] && kill "${engine_pid}" 2>/dev/null || true
 }
@@ -81,13 +79,6 @@ GHIDRA_MCP_URL="http://127.0.0.1:${ENGINE_PORT}" \
     --mcp-host 0.0.0.0 \
     --mcp-port "${BRIDGE_PORT}" &
 bridge_pid=$!
-
-# Start the binary import service. It runs analyzeHeadless to commit uploaded
-# binaries into the shared repo (the web container has no Ghidra). It reads the
-# same GHIDRA_SERVER_* env the engine uses, plus GHIDRA_DEFAULT_REPOSITORY.
-echo "Starting import service on 0.0.0.0:${IMPORTER_PORT:-8082}..."
-python3 /app/importer.py &
-importer_pid=$!
 
 # Exit as soon as any background process exits, then clean up the others.
 wait -n

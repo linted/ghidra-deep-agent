@@ -23,8 +23,31 @@ echo "Ghidra Server: starting in console mode..."
 "${SVR_DIR}/ghidraSvr" console &
 server_pid=$!
 
-# Forward termination to the server child so `docker stop` shuts it down cleanly.
+# Binary import service (upload -> analyzeHeadless -> shared repo), co-located
+# with the server. Stdlib-only; reachable by the web container on the docker
+# network (8082), never published to the host. It connects to the server's RMI
+# at import time, so it can start now regardless of provisioning progress.
+#
+# Supervise it in a restart loop rather than crash-coupling it to the server:
+# this is the single persistent component every agent session depends on, so an
+# importer hiccup must not bounce the server (unlike the per-session ghidra-mcp,
+# where the engine and bridge are intentionally coupled).
+echo "Ghidra Server: starting importer on :${IMPORTER_PORT:-8082}..."
+supervise_importer() {
+  while true; do
+    python3 /opt/importer.py
+    echo "Ghidra Server: importer exited (code $?); restarting in 2s..." >&2
+    sleep 2
+  done
+}
+supervise_importer &
+importer_supervisor_pid=$!
+
+# Forward termination cleanly: stop the supervisor (so it stops relaunching),
+# kill any live importer, and shut down the server.
 terminate() {
+  kill "${importer_supervisor_pid}" 2>/dev/null || true
+  pkill -f '/opt/importer.py' 2>/dev/null || true
   kill "${server_pid}" 2>/dev/null || true
 }
 trap terminate SIGTERM SIGINT
@@ -119,5 +142,7 @@ seed_repository() {
 # Provision in the background so it can wait for init without blocking the server.
 provision_user &
 
-# Track the server as PID 1's main child; exit when it does.
+# The container's lifecycle tracks the server only: if the server dies the
+# container exits (docker restarts it); the importer is supervised separately
+# above and restarted in place without disrupting connected sessions.
 wait "${server_pid}"

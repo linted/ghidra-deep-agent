@@ -41,7 +41,16 @@ class ImportResult:
 
 
 def _importer_url() -> str:
-    return os.environ.get("GHIDRA_IMPORTER_URL", "http://ghidra-mcp:8082/import")
+    # The importer is co-located with the persistent Ghidra Server (the single
+    # owner of the shared repo), not the per-session ghidra-mcp engine.
+    return os.environ.get("GHIDRA_IMPORTER_URL", "http://ghidra-server:8082/import")
+
+
+def _languages_url() -> str:
+    base = _importer_url()
+    if base.endswith("/import"):
+        base = base[: -len("/import")]
+    return f"{base}/languages"
 
 
 def _decode(status: int, body: bytes) -> ImportResult:
@@ -71,10 +80,31 @@ def _post(url: str, params: dict[str, str], data: bytes) -> ImportResult:
         raise RuntimeError(f"import service unreachable: {exc}") from exc
 
 
+def _get(url: str) -> ImportResult:
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return _decode(resp.status, resp.read())
+    except urllib.error.HTTPError as exc:
+        return _decode(exc.code, exc.read())
+    except (urllib.error.URLError, OSError) as exc:
+        raise RuntimeError(f"import service unreachable: {exc}") from exc
+
+
 async def import_binary(
-    name: str, data: bytes, repo: str | None = None
+    name: str,
+    data: bytes,
+    repo: str | None = None,
+    *,
+    loader: str | None = None,
+    processor: str | None = None,
+    cspec: str | None = None,
+    base: str | None = None,
 ) -> ImportResult:
     """Forward ``data`` to the importer as the program ``name``.
+
+    Optional ``loader``/``processor``/``cspec``/``base`` are import hints for
+    raw/headerless binaries (forwarded verbatim; the importer validates them).
 
     Returns an :class:`ImportResult` carrying the importer's status and body.
     Raises ``RuntimeError`` only when the importer is unreachable, so the caller
@@ -83,4 +113,17 @@ async def import_binary(
     params: dict[str, str] = {"name": name}
     if repo:
         params["repo"] = repo
+    for key, val in (
+        ("loader", loader),
+        ("processor", processor),
+        ("cspec", cspec),
+        ("base", base),
+    ):
+        if val:
+            params[key] = val
     return await asyncio.to_thread(_post, _importer_url(), params, data)
+
+
+async def list_languages() -> ImportResult:
+    """Fetch the installed Ghidra languages (for the upload UI's processor list)."""
+    return await asyncio.to_thread(_get, _languages_url())

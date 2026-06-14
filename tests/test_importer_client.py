@@ -41,12 +41,19 @@ class _Resp:
 
 def test_importer_url_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GHIDRA_IMPORTER_URL", raising=False)
-    assert ic._importer_url() == "http://ghidra-mcp:8082/import"
+    assert ic._importer_url() == "http://ghidra-server:8082/import"
 
 
 def test_importer_url_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GHIDRA_IMPORTER_URL", "http://host:9/import")
     assert ic._importer_url() == "http://host:9/import"
+
+
+def test_languages_url_derived_from_importer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GHIDRA_IMPORTER_URL", raising=False)
+    assert ic._languages_url() == "http://ghidra-server:8082/languages"
+    monkeypatch.setenv("GHIDRA_IMPORTER_URL", "http://host:9/import")
+    assert ic._languages_url() == "http://host:9/languages"
 
 
 def test_decode_valid_object() -> None:
@@ -127,3 +134,36 @@ def test_import_binary_runs_post_off_thread(monkeypatch: pytest.MonkeyPatch) -> 
     assert result.status_code == 200
     assert captured["params"] == {"name": "t", "repo": "r"}
     assert captured["data"] == b"bytes"
+
+
+def test_import_binary_forwards_hints(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_post(url: str, params: dict[str, str], data: bytes) -> ic.ImportResult:
+        captured["params"] = params
+        return ic.ImportResult(200, {"ok": True})
+
+    monkeypatch.setattr(ic, "_post", fake_post)
+    asyncio.run(
+        ic.import_binary(
+            "t", b"x", processor="ARM:LE:32:v8", base="0x8000", cspec="default"
+        )
+    )
+    # Only the set hints are forwarded; an unset hint (loader) is omitted.
+    assert captured["params"] == {
+        "name": "t",
+        "processor": "ARM:LE:32:v8",
+        "cspec": "default",
+        "base": "0x8000",
+    }
+
+
+def test_list_languages_runs_get_off_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_get(url: str) -> ic.ImportResult:
+        assert url.endswith("/languages")
+        return ic.ImportResult(200, {"languages": [], "count": 0})
+
+    monkeypatch.setattr(ic, "_get", fake_get)
+    result = asyncio.run(ic.list_languages())
+    assert result.status_code == 200
+    assert result.payload["count"] == 0

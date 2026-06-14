@@ -36,6 +36,10 @@ services:
       GHIDRA_DEFAULT_REPOSITORY: ${GHIDRA_DEFAULT_REPOSITORY:-agent-shared}
       GHIDRA_SERVER_HOST: ghidra-server
       GHIDRA_SERVER_PORT: "13100"
+      # Binary import service (importer.py) co-located here: it owns uploads into
+      # the shared repo. 8082 is internal to the docker network (not published).
+      IMPORTER_PORT: "8082"
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-256}
     volumes:
       - ghidra-repositories:/repositories
     networks:
@@ -57,11 +61,6 @@ services:
       GHIDRA_SERVER_PORT: "13100"
       GHIDRA_SERVER_USER: ${GHIDRA_SERVER_USER:-agent}
       GHIDRA_SERVER_PASSWORD: ${GHIDRA_SERVER_PASSWORD:-}
-      # Target repo for the binary import service (importer.py) and the max
-      # upload size it will accept (defense in depth; the web tier also caps).
-      GHIDRA_DEFAULT_REPOSITORY: ${GHIDRA_DEFAULT_REPOSITORY:-agent-shared}
-      IMPORTER_PORT: "8082"
-      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-256}
     volumes:
       - ghidra-data:/data
       - ghidra-projects:/projects
@@ -87,11 +86,13 @@ services:
       GHIDRA_MCP_TRANSPORT: ${GHIDRA_MCP_TRANSPORT:-http}
       # Points at the in-network MCP bridge above.
       GHIDRA_MCP_URL: ${GHIDRA_MCP_URL:-http://ghidra-mcp:8081/mcp}
-      # Binary upload import service (importer.py in the ghidra-mcp container).
-      GHIDRA_IMPORTER_URL: ${GHIDRA_IMPORTER_URL:-http://ghidra-mcp:8082/import}
+      # Binary upload import service (importer.py) lives with the persistent
+      # ghidra-server, not the per-session ghidra-mcp engine.
+      GHIDRA_IMPORTER_URL: ${GHIDRA_IMPORTER_URL:-http://ghidra-server:8082/import}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-256}
     depends_on:
       - ghidra-mcp
+      - ghidra-server
     networks:
       - search-community
 

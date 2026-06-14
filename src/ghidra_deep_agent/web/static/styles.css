@@ -209,6 +209,10 @@ button:hover { border-color: var(--primary); color: var(--primary); }
 .modal-sep { border: none; border-top: 1px solid var(--panel); margin: 14px 0 10px; }
 .upload-row { display: flex; gap: 8px; align-items: center; }
 .upload-row input[type="file"] { flex: 1; min-width: 0; }
+.upload-hint-label { margin: 10px 0 4px; font-size: 0.82em; }
+.upload-hints { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.upload-hints label { display: flex; flex-direction: column; gap: 2px; font-size: 0.78em; }
+.upload-hints input, .upload-hints select { min-width: 0; }
 #upload-status { margin-top: 8px; font-size: 0.85em; }
 .error { color: var(--error); margin: 8px 0; }
 .help-table { width: 100%; border-collapse: collapse; }

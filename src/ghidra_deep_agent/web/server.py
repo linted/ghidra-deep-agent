@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from ghidra_deep_agent.importer_client import import_binary
+from ghidra_deep_agent.importer_client import import_binary, list_languages
 from ghidra_deep_agent.web.service import COMPACT_PROMPT, AgentService
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -29,6 +29,12 @@ STATIC_DIR = Path(__file__).parent / "static"
 # Program names become analyzeHeadless args and repo paths in the importer; keep
 # the web-side check identical to the importer's allowlist.
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+# Light shape checks for import hints; the importer validates them authoritatively
+# (processor/cspec against the installed languages).
+_PROCESSOR_RE = re.compile(r"^[A-Za-z0-9:._-]{1,64}$")
+_CSPEC_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_LOADER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,40}$")
+_BASE_RE = re.compile(r"^(0x)?[0-9A-Fa-f]{1,16}$")
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "256"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
@@ -84,14 +90,34 @@ async def get_programs() -> Response:
         return JSONResponse({"error": str(exc)}, status_code=502)
 
 
+@app.get("/api/languages")
+async def get_languages() -> Response:
+    """List the Ghidra languages available for raw-binary import (UI picker)."""
+    try:
+        result = await list_languages()
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return JSONResponse(result.payload, status_code=result.status_code)
+
+
 @app.post("/api/upload")
-async def upload_binary(request: Request, name: str) -> Response:
+async def upload_binary(
+    request: Request,
+    name: str,
+    loader: str | None = None,
+    processor: str | None = None,
+    cspec: str | None = None,
+    base: str | None = None,
+) -> Response:
     """Accept a binary and import it into the shared Ghidra Server repo.
 
     The file is sent as the raw request body (``application/octet-stream``) with
     ``?name=<filename>``; the bytes are forwarded to the importer in the
-    ghidra-mcp container (the only place Ghidra is installed). Duplicate names are
-    rejected (409) and no analysis runs at upload time — both per product decision.
+    ghidra-mcp container (the only place Ghidra is installed). Optional
+    ``loader``/``processor``/``cspec``/``base`` hints let a raw/headerless binary
+    (e.g. firmware) be imported when Ghidra cannot auto-detect a format. Duplicate
+    names are rejected (409) and no analysis runs at upload time — per product
+    decision.
     """
     safe = _safe_program_name(name)
     if safe is None:
@@ -99,6 +125,15 @@ async def upload_binary(request: Request, name: str) -> Response:
             {"error": "invalid filename (allowed: letters, digits, . _ -)"},
             status_code=400,
         )
+
+    for value, pattern, label in (
+        (loader, _LOADER_RE, "loader"),
+        (processor, _PROCESSOR_RE, "processor"),
+        (cspec, _CSPEC_RE, "cspec"),
+        (base, _BASE_RE, "base"),
+    ):
+        if value and not pattern.match(value):
+            return JSONResponse({"error": f"invalid {label}"}, status_code=400)
 
     data = await request.body()
     if not data:
@@ -109,7 +144,9 @@ async def upload_binary(request: Request, name: str) -> Response:
         )
 
     try:
-        result = await import_binary(safe, data)
+        result = await import_binary(
+            safe, data, loader=loader, processor=processor, cspec=cspec, base=base
+        )
     except RuntimeError as exc:
         return JSONResponse({"error": str(exc)}, status_code=502)
     return JSONResponse(result.payload, status_code=result.status_code)

@@ -475,6 +475,7 @@ async function openBinaryPicker() {
   list.innerHTML = "";
   err.classList.add("hidden");
   modal.classList.remove("hidden");
+  loadLanguages();
   try {
     const res = await fetch("/api/programs");
     const data = await res.json();
@@ -502,6 +503,38 @@ async function openBinaryPicker() {
 }
 
 // ---- Binary upload ---------------------------------------------------------
+// {languageID: [compilerSpecID, ...]} for the processor picker; loaded lazily.
+let langSpecs = {};
+
+async function loadLanguages() {
+  const datalist = $("#ghidra-langs");
+  if (!datalist || datalist.dataset.loaded) return;
+  try {
+    const data = await (await fetch("/api/languages")).json();
+    for (const lang of data.languages || []) {
+      langSpecs[lang.id] = lang.compilerSpecs || [];
+      const opt = el("option");
+      opt.value = lang.id; // datalist matches on value, not text content
+      datalist.append(opt);
+    }
+    datalist.dataset.loaded = "1";
+  } catch (e) {
+    // Non-fatal: auto-detect still works; raw-binary import just lacks the list.
+  }
+}
+
+// Populate the compiler-spec dropdown for the chosen processor.
+function onProcessorChange() {
+  const proc = $("#upload-processor").value.trim();
+  const sel = $("#upload-cspec");
+  const specs = langSpecs[proc] || [];
+  sel.innerHTML = "";
+  sel.append(el("option", null, "default"));
+  for (const id of specs) {
+    if (id !== "default") sel.append(el("option", null, id));
+  }
+}
+
 async function uploadBinary() {
   const input = $("#upload-file");
   const status = $("#upload-status");
@@ -515,8 +548,17 @@ async function uploadBinary() {
   status.textContent = `Importing ${file.name}… (this can take a moment)`;
   try {
     // Send the file as the raw request body with the name in the query string
-    // (the server reads request.body() — no multipart parsing needed).
-    const res = await fetch(`/api/upload?name=${encodeURIComponent(file.name)}`, {
+    // (the server reads request.body() — no multipart parsing needed). Optional
+    // loader/processor/cspec/base hints let raw/headerless binaries import.
+    const params = new URLSearchParams({ name: file.name });
+    const hints = {
+      processor: $("#upload-processor").value.trim(),
+      cspec: $("#upload-cspec").value.trim(),
+      base: $("#upload-base").value.trim(),
+      loader: $("#upload-loader").value.trim(),
+    };
+    for (const [k, v] of Object.entries(hints)) if (v) params.set(k, v);
+    const res = await fetch(`/api/upload?${params.toString()}`, {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
       body: file,
@@ -566,6 +608,7 @@ function init() {
 
   $("#new-session").onclick = openBinaryPicker;
   $("#upload-btn").onclick = uploadBinary;
+  $("#upload-processor").addEventListener("change", onProcessorChange);
   $("#binary-cancel").onclick = () => $("#binary-modal").classList.add("hidden");
   $("#toggle-tree").onclick = () => $("#panes").classList.toggle("hide-tree");
   $("#yank").onclick = doYank;
