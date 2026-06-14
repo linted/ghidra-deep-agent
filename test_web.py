@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from ghidra_deep_agent.importer_client import ImportResult
 from ghidra_deep_agent.program_resolver import parse_program_list
 from ghidra_deep_agent.web import server
 from ghidra_deep_agent.web.event_stream import event_to_payloads
@@ -263,3 +264,98 @@ def test_websocket_streams_query(client: TestClient) -> None:
             second = ws.receive_json()
     assert first == {"type": "token", "text": "echo: ping"}
     assert second == {"type": "agent_done"}
+
+
+# ---- upload route ----------------------------------------------------------
+
+
+def _stub_import(
+    result: ImportResult | None = None, exc: Exception | None = None
+) -> Any:
+    """Build an async stand-in for ``server.import_binary``."""
+
+    async def _imp(name: str, data: bytes, repo: str | None = None) -> ImportResult:
+        if exc is not None:
+            raise exc
+        assert result is not None
+        return result
+
+    return _imp
+
+
+def test_upload_success_passes_through_importer(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        server,
+        "import_binary",
+        _stub_import(ImportResult(200, {"status": "imported", "name": "true"})),
+    )
+    with client:
+        resp = client.post("/api/upload", params={"name": "true"}, content=b"\x7fELF")
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "true"
+
+
+def test_upload_duplicate_is_409(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        server,
+        "import_binary",
+        _stub_import(ImportResult(409, {"error": "a program named 'true' exists"})),
+    )
+    with client:
+        resp = client.post("/api/upload", params={"name": "true"}, content=b"x")
+    assert resp.status_code == 409
+
+
+def test_upload_invalid_name_is_400(client: TestClient) -> None:
+    # 'ev!l' survives basename but fails the allowlist; importer is never called.
+    with client:
+        resp = client.post("/api/upload", params={"name": "ev!l"}, content=b"x")
+    assert resp.status_code == 400
+
+
+def test_upload_traversal_name_reduced_to_basename(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, str] = {}
+
+    async def _imp(name: str, data: bytes, repo: str | None = None) -> ImportResult:
+        seen["name"] = name
+        return ImportResult(200, {"name": name})
+
+    monkeypatch.setattr(server, "import_binary", _imp)
+    with client:
+        resp = client.post(
+            "/api/upload", params={"name": "../../etc/passwd"}, content=b"x"
+        )
+    assert resp.status_code == 200
+    assert seen["name"] == "passwd"
+
+
+def test_upload_empty_body_is_400(client: TestClient) -> None:
+    with client:
+        resp = client.post("/api/upload", params={"name": "true"}, content=b"")
+    assert resp.status_code == 400
+
+
+def test_upload_oversize_is_413(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(server, "MAX_UPLOAD_BYTES", 4)
+    with client:
+        resp = client.post("/api/upload", params={"name": "true"}, content=b"12345")
+    assert resp.status_code == 413
+
+
+def test_upload_service_down_is_502(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        server, "import_binary", _stub_import(exc=RuntimeError("unreachable"))
+    )
+    with client:
+        resp = client.post("/api/upload", params={"name": "true"}, content=b"x")
+    assert resp.status_code == 502
