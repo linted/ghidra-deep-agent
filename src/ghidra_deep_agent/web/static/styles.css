@@ -331,6 +331,7 @@ body.resizing #pane-resize { opacity: 1; background: var(--primary); }
   height: 6px;
   margin-top: 10px;
   appearance: none;
+  -webkit-appearance: none;
   border: none;
   border-radius: 3px;
   overflow: hidden;
@@ -339,7 +340,24 @@ body.resizing #pane-resize { opacity: 1; background: var(--primary); }
 #upload-progress::-webkit-progress-bar { background: var(--bg); }
 #upload-progress::-webkit-progress-value { background: var(--primary); transition: width 0.15s; }
 #upload-progress::-moz-progress-bar { background: var(--primary); }
-#upload-progress:indeterminate { background: linear-gradient(90deg, var(--bg), var(--panel), var(--bg)); }
+/* Indeterminate (server-side import phase): appearance:none strips the native
+   indeterminate animation, so animate a moving stripe ourselves. The animation
+   must live on the ::-webkit-progress-bar pseudo-element — it is painted on top
+   of the host element, so a background on #upload-progress itself stays hidden
+   behind it (that was the "static black bar" bug). */
+/* Split per-vendor: a comma-joined selector list is dropped wholesale by a
+   browser that doesn't know one of the pseudo-elements. */
+#upload-progress:indeterminate::-webkit-progress-bar {
+  background: repeating-linear-gradient(90deg, var(--bg) 0 20px, var(--primary) 20px 40px);
+  background-size: 40px 100%;
+  animation: upload-indeterminate 0.8s linear infinite;
+}
+#upload-progress:indeterminate::-moz-progress-bar {
+  background: repeating-linear-gradient(90deg, var(--bg) 0 20px, var(--primary) 20px 40px);
+  background-size: 40px 100%;
+  animation: upload-indeterminate 0.8s linear infinite;
+}
+@keyframes upload-indeterminate { from { background-position: 0 0; } to { background-position: 40px 0; } }
 #upload-status { margin-top: 8px; font-size: 0.85em; }
 .error { color: var(--error); margin: 8px 0; }
 .help-table { width: 100%; border-collapse: collapse; }

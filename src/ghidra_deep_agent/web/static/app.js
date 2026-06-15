@@ -757,7 +757,12 @@ function uploadBinary() {
       /* keep empty */
     }
     if (xhr.status >= 200 && xhr.status < 300) {
-      status.textContent = `Imported "${data.name}" into ${data.repository}. It's in the shared repo — check it out in Ghidra to analyze.`;
+      // Promote the confirmation to its own popup; the upload dialog closes
+      // behind it so the success modal replaces it.
+      $("#binary-modal").classList.add("hidden");
+      $("#upload-done-msg").textContent = `Imported "${data.name}" into ${data.repository}. It's in the shared repo — check it out in Ghidra to analyze.`;
+      $("#upload-done-modal").classList.remove("hidden");
+      status.textContent = "";
       input.value = "";
     } else {
       status.textContent = `Import failed (${xhr.status}): ${data.error || "unknown error"}`;
@@ -845,6 +850,8 @@ function init() {
   $("#upload-btn").onclick = uploadBinary;
   $("#upload-processor").addEventListener("change", onProcessorChange);
   $("#binary-cancel").onclick = () => $("#binary-modal").classList.add("hidden");
+  $("#upload-done-ok").onclick = () =>
+    $("#upload-done-modal").classList.add("hidden");
   $("#toggle-tree").onclick = () => $("#panes").classList.toggle("hide-tree");
   $("#yank").onclick = doYank;
   $("#clear").onclick = () => {
@@ -884,7 +891,9 @@ function init() {
   document.addEventListener("keydown", (e) => {
     if (e.target.id === "query" && !["Escape"].includes(e.key)) return;
     if (e.key === "Escape") {
-      if (!$("#help-modal").classList.contains("hidden")) {
+      if (!$("#upload-done-modal").classList.contains("hidden")) {
+        $("#upload-done-modal").classList.add("hidden");
+      } else if (!$("#help-modal").classList.contains("hidden")) {
         $("#help-modal").classList.add("hidden");
       } else if (!$("#binary-modal").classList.contains("hidden")) {
         $("#binary-modal").classList.add("hidden");
