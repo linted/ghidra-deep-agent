@@ -6,6 +6,7 @@
   <title>Ghidra Deep Agent</title>
   <link rel="stylesheet" href="/static/styles.css" />
   <script src="/static/vendor/marked.umd.min.js" defer></script>
+  <script src="/static/vendor/highlight.min.js" defer></script>
   <script src="/static/app.js" defer></script>
 </head>
 <body>
@@ -15,6 +16,9 @@
       <div class="sidebar-head">
         <span class="brand">Ghidra Agent</span>
         <button id="new-session" title="New session">+ New</button>
+      </div>
+      <div class="sidebar-search">
+        <input id="session-filter" type="search" placeholder="Filter sessions…" autocomplete="off" />
       </div>
       <ul id="session-list"></ul>
     </aside>
@@ -36,8 +40,12 @@
 
       <section id="panes">
         <div id="conversation"></div>
+        <div id="pane-resize" title="Drag to resize"></div>
         <div id="activity">
-          <div class="pane-title">Activity</div>
+          <div class="pane-title">
+            <span>Activity</span>
+            <button id="activity-filter" class="link" title="Show only errors">all</button>
+          </div>
           <div id="activity-tree"></div>
         </div>
       </section>
@@ -52,6 +60,7 @@
       <footer id="statusbar">
         <span id="st-mcp" class="dot" title="Ghidra MCP">MCP</span>
         <span id="st-db" class="dot" title="MongoDB">DB</span>
+        <span id="st-conn" class="dot" title="Live connection">Live</span>
         <span id="st-timer" class="metric">0:00</span>
         <span id="st-tokens" class="metric">↑0 ↓0</span>
         <span id="st-context" class="metric">ctx 0</span>
@@ -96,6 +105,7 @@
           <input id="upload-loader" placeholder="auto (BinaryLoader)" />
         </label>
       </div>
+      <progress id="upload-progress" class="hidden" max="100" value="0"></progress>
       <div id="upload-status" class="muted"></div>
       <div class="modal-actions">
         <button id="binary-cancel">Cancel</button>

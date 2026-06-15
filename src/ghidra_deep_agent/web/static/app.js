@@ -9,12 +9,31 @@ const el = (tag, cls, text) => {
   return n;
 };
 
+// Parse markdown, then syntax-highlight fenced code blocks in-place. marked v18
+// dropped the `highlight` option, so we post-process `pre code` with highlight.js
+// (both vendored). `target` is the element whose innerHTML was just set.
+function renderInto(target, src) {
+  target.innerHTML = window.marked ? window.marked.parse(src) : src;
+  if (!window.hljs) return;
+  for (const block of target.querySelectorAll("pre code")) {
+    try {
+      window.hljs.highlightElement(block);
+    } catch {
+      /* leave the block unhighlighted */
+    }
+  }
+}
+
 // ---- State -----------------------------------------------------------------
 const state = {
   config: { model: "", max_context_tokens: 200000, mcp_ok: false, db_ok: false },
   sessions: [],
+  sessionFilter: "",
   activeId: null,
   ws: null,
+  wsState: "offline", // offline | connecting | connected | reconnecting
+  reconnect: { attempts: 0, timer: null },
+  errorsOnly: false,
   running: false,
   runStart: 0,
   timer: null,
@@ -47,6 +66,15 @@ function fmtClock(secs) {
   const m = Math.floor(secs / 60);
   const s = secs % 60;
   return `${m}:${String(s).padStart(2, "0")}`;
+}
+function fmtRelative(iso) {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return "";
+  const secs = Math.max(0, (Date.now() - t) / 1000);
+  if (secs < 60) return "just now";
+  if (secs < 3600) return Math.floor(secs / 60) + "m ago";
+  if (secs < 86400) return Math.floor(secs / 3600) + "h ago";
+  return Math.floor(secs / 86400) + "d ago";
 }
 
 // ---- Config & status bar ---------------------------------------------------
@@ -108,21 +136,101 @@ async function loadSessions() {
 function renderSessions() {
   const list = $("#session-list");
   list.innerHTML = "";
+  const q = state.sessionFilter.trim().toLowerCase();
+  let shown = 0;
   for (const s of state.sessions) {
+    const label = (s.title || s.binary_name || "").toLowerCase();
+    if (q && !label.includes(q) && !s.binary_name.toLowerCase().includes(q)) {
+      continue;
+    }
+    shown += 1;
     const li = el("li");
     li.classList.toggle("active", s.session_id === state.activeId);
+
+    const main = el("div", "s-main");
     const title = el("span", "s-title", s.title || s.binary_name);
-    title.title = `${s.binary_name} · ${s.session_id}`;
+    title.title = "Double-click to rename";
+    title.ondblclick = (e) => {
+      e.stopPropagation();
+      beginRename(li, s);
+    };
+    const meta = el("div", "s-meta");
+    const when = fmtRelative(s.updated_at);
+    meta.textContent = when ? `${s.binary_name} · ${when}` : s.binary_name;
+    main.append(title, meta);
+
+    const actions = el("div", "s-actions");
+    const ren = el("span", "s-ren", "✎");
+    ren.title = "Rename session";
+    ren.onclick = (e) => {
+      e.stopPropagation();
+      beginRename(li, s);
+    };
     const del = el("span", "s-del", "✕");
     del.title = "Delete session";
     del.onclick = (e) => {
       e.stopPropagation();
       deleteSession(s.session_id);
     };
-    li.append(title, del);
+    actions.append(ren, del);
+
+    li.append(main, actions);
     li.onclick = () => openSession(s);
     list.append(li);
   }
+  if (!shown) {
+    const empty = el("li", "s-empty muted", q ? "No matches" : "No sessions yet");
+    list.append(empty);
+  }
+}
+
+// Swap a session's title for an inline editor; PATCH on commit.
+function beginRename(li, session) {
+  const main = li.querySelector(".s-main");
+  const titleEl = main.querySelector(".s-title");
+  const input = el("input", "s-rename");
+  input.value = session.title || session.binary_name;
+  titleEl.replaceWith(input);
+  input.focus();
+  input.select();
+
+  let done = false;
+  const commit = async (save) => {
+    if (done) return;
+    done = true;
+    const next = input.value.trim();
+    if (save && next && next !== session.title) {
+      await renameSession(session.session_id, next);
+    } else {
+      renderSessions();
+    }
+  };
+  input.onclick = (e) => e.stopPropagation();
+  input.onkeydown = (e) => {
+    if (e.key === "Enter") commit(true);
+    else if (e.key === "Escape") commit(false);
+  };
+  input.onblur = () => commit(true);
+}
+
+async function renameSession(id, title) {
+  try {
+    const res = await fetch(`/api/sessions/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      const s = state.sessions.find((x) => x.session_id === id);
+      if (s) s.title = data.title;
+    } else {
+      flash(data.error || "Rename failed.");
+    }
+  } catch (e) {
+    flash("Rename failed.");
+  }
+  renderSessions();
 }
 
 async function createSession(binaryName) {
@@ -154,6 +262,7 @@ async function deleteSession(id) {
 async function openSession(session) {
   if (state.activeId === session.session_id) return;
   state.activeId = session.session_id;
+  state.reconnect.attempts = 0;
   renderSessions();
   resetConversation();
   state.inputTokens = 0;
@@ -162,8 +271,6 @@ async function openSession(session) {
   renderStatus();
   $("#active-binary").textContent = session.binary_name;
   $("#active-meta").textContent = `${state.config.model} · ${session.session_id.slice(0, 8)}`;
-  $("#query").disabled = false;
-  $("#query").focus();
 
   await loadHistory(session.session_id);
   connectWs(session.session_id);
@@ -186,23 +293,77 @@ async function loadHistory(id) {
 }
 
 // ---- WebSocket -------------------------------------------------------------
+const RECONNECT_MAX_MS = 10000;
+
+// Reflect the live-connection state in the status bar and gate the input on it.
+function setConn(s) {
+  state.wsState = s;
+  const dot = $("#st-conn");
+  dot.classList.toggle("ok", s === "connected");
+  dot.classList.toggle("bad", s === "offline" || s === "reconnecting");
+  dot.title =
+    s === "connected"
+      ? "Live connection"
+      : s === "reconnecting"
+        ? "Reconnecting…"
+        : s === "connecting"
+          ? "Connecting…"
+          : "Disconnected";
+  // Only re-enable input when a session is active and the socket is up.
+  if (state.activeId) $("#query").disabled = s !== "connected";
+}
+
 function closeWs() {
+  clearTimeout(state.reconnect.timer);
+  state.reconnect.timer = null;
   if (state.ws) {
     state.ws.onclose = null;
     state.ws.close();
     state.ws = null;
   }
+  setConn("offline");
 }
 
 function connectWs(id) {
-  closeWs();
+  // Intentional teardown of any prior socket without flipping us to "offline".
+  clearTimeout(state.reconnect.timer);
+  if (state.ws) {
+    state.ws.onclose = null;
+    state.ws.close();
+    state.ws = null;
+  }
+  setConn(state.reconnect.attempts ? "reconnecting" : "connecting");
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/api/sessions/${id}/stream`);
   state.ws = ws;
+  ws.onopen = () => {
+    if (state.reconnect.attempts) flash("Reconnected.");
+    state.reconnect.attempts = 0;
+    setConn("connected");
+    $("#query").focus();
+  };
   ws.onmessage = (ev) => handlePayload(JSON.parse(ev.data));
   ws.onclose = () => {
-    if (state.ws === ws) state.ws = null;
+    if (state.ws !== ws) return; // superseded by a newer socket
+    state.ws = null;
+    // The server cancels any in-flight run when the socket drops.
+    if (state.running) {
+      setBusy(false);
+      showThinking(false);
+      flash("Connection lost — run interrupted.");
+    }
+    scheduleReconnect(id);
   };
+}
+
+function scheduleReconnect(id) {
+  if (state.activeId !== id) return; // user moved on; don't reconnect
+  setConn("reconnecting");
+  const delay = Math.min(RECONNECT_MAX_MS, 1000 * 2 ** state.reconnect.attempts);
+  state.reconnect.attempts += 1;
+  state.reconnect.timer = setTimeout(() => {
+    if (state.activeId === id) connectWs(id);
+  }, delay);
 }
 
 function send(obj) {
@@ -245,8 +406,7 @@ function startAssistantEntry() {
 }
 
 function renderAssistant(entry) {
-  const md = window.marked ? window.marked.parse(entry.raw) : entry.raw;
-  entry.body.innerHTML = md;
+  renderInto(entry.body, entry.raw);
   scrollConversation();
 }
 
@@ -291,7 +451,13 @@ function onToolEnd(p) {
   const dur = (performance.now() - n.start) / 1000;
   n.label.append(el("span", "dur", fmtDuration(dur)));
   if (p.error && p.snippet) {
-    n.el.append(el("div", "err-snip", p.snippet));
+    const snip = el("div", "err-snip", p.snippet);
+    snip.title = "Click to expand";
+    snip.onclick = (e) => {
+      e.stopPropagation();
+      snip.classList.toggle("expanded");
+    };
+    n.el.append(snip);
   }
 }
 
@@ -535,9 +701,10 @@ function onProcessorChange() {
   }
 }
 
-async function uploadBinary() {
+function uploadBinary() {
   const input = $("#upload-file");
   const status = $("#upload-status");
+  const bar = $("#upload-progress");
   const file = input.files && input.files[0];
   if (!file) {
     status.textContent = "Choose a file first.";
@@ -545,40 +712,108 @@ async function uploadBinary() {
   }
   const btn = $("#upload-btn");
   btn.disabled = true;
-  status.textContent = `Importing ${file.name}… (this can take a moment)`;
-  try {
-    // Send the file as the raw request body with the name in the query string
-    // (the server reads request.body() — no multipart parsing needed). Optional
-    // loader/processor/cspec/base hints let raw/headerless binaries import.
-    const params = new URLSearchParams({ name: file.name });
-    const hints = {
-      processor: $("#upload-processor").value.trim(),
-      cspec: $("#upload-cspec").value.trim(),
-      base: $("#upload-base").value.trim(),
-      loader: $("#upload-loader").value.trim(),
-    };
-    for (const [k, v] of Object.entries(hints)) if (v) params.set(k, v);
-    const res = await fetch(`/api/upload?${params.toString()}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/octet-stream" },
-      body: file,
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok) {
+
+  // Send the file as the raw request body with the name in the query string (the
+  // server reads request.body() — no multipart parsing needed). Optional
+  // loader/processor/cspec/base hints let raw/headerless binaries import. XHR
+  // (not fetch) gives us upload progress events for the bar.
+  const params = new URLSearchParams({ name: file.name });
+  const hints = {
+    processor: $("#upload-processor").value.trim(),
+    cspec: $("#upload-cspec").value.trim(),
+    base: $("#upload-base").value.trim(),
+    loader: $("#upload-loader").value.trim(),
+  };
+  for (const [k, v] of Object.entries(hints)) if (v) params.set(k, v);
+
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", `/api/upload?${params.toString()}`);
+  xhr.setRequestHeader("Content-Type", "application/octet-stream");
+
+  bar.classList.remove("hidden");
+  bar.removeAttribute("value"); // indeterminate until the first progress event
+  status.textContent = `Uploading ${file.name}…`;
+
+  xhr.upload.onprogress = (e) => {
+    if (!e.lengthComputable) return;
+    const pct = Math.round((e.loaded / e.total) * 100);
+    bar.value = pct;
+    status.textContent =
+      pct < 100
+        ? `Uploading ${file.name}… ${pct}%`
+        : `Importing ${file.name}… (this can take a moment)`;
+  };
+  xhr.upload.onload = () => {
+    bar.removeAttribute("value"); // back to indeterminate while the server imports
+    status.textContent = `Importing ${file.name}… (this can take a moment)`;
+  };
+  xhr.onload = () => {
+    bar.classList.add("hidden");
+    btn.disabled = false;
+    let data = {};
+    try {
+      data = JSON.parse(xhr.responseText);
+    } catch {
+      /* keep empty */
+    }
+    if (xhr.status >= 200 && xhr.status < 300) {
       status.textContent = `Imported "${data.name}" into ${data.repository}. It's in the shared repo — check it out in Ghidra to analyze.`;
       input.value = "";
     } else {
-      status.textContent = `Import failed (${res.status}): ${data.error || "unknown error"}`;
+      status.textContent = `Import failed (${xhr.status}): ${data.error || "unknown error"}`;
     }
-  } catch (e) {
-    status.textContent = "Upload failed: " + e;
-  } finally {
+  };
+  xhr.onerror = () => {
+    bar.classList.add("hidden");
     btn.disabled = false;
-  }
+    status.textContent = "Upload failed: network error.";
+  };
+  xhr.send(file);
+}
+
+// ---- Resizable activity pane -----------------------------------------------
+const ACTIVITY_MIN = 200;
+const ACTIVITY_MAX = 640;
+
+function setActivityWidth(px) {
+  const w = Math.round(Math.min(ACTIVITY_MAX, Math.max(ACTIVITY_MIN, px)));
+  $("#panes").style.setProperty("--activity-w", w + "px");
+  return w;
+}
+
+function initPaneResize() {
+  const saved = parseInt(localStorage.getItem("activityWidth") || "", 10);
+  if (!Number.isNaN(saved)) setActivityWidth(saved);
+
+  const handle = $("#pane-resize");
+  const panes = $("#panes");
+  let dragging = false;
+
+  const onMove = (e) => {
+    if (!dragging) return;
+    // Width measured from the right edge of the panes to the pointer.
+    const w = setActivityWidth(panes.getBoundingClientRect().right - e.clientX);
+    localStorage.setItem("activityWidth", String(w));
+  };
+  const stop = () => {
+    dragging = false;
+    document.body.classList.remove("resizing");
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", stop);
+  };
+  handle.addEventListener("pointerdown", (e) => {
+    if (panes.classList.contains("hide-tree")) return;
+    dragging = true;
+    e.preventDefault();
+    document.body.classList.add("resizing");
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", stop);
+  });
 }
 
 // ---- Wiring ----------------------------------------------------------------
 function init() {
+  setConn("offline");
   loadConfig();
   loadSessions();
 
@@ -619,6 +854,32 @@ function init() {
   $("#help").onclick = () => $("#help-modal").classList.remove("hidden");
   $("#help-close").onclick = () => $("#help-modal").classList.add("hidden");
   $("#thinking-toggle").onclick = () => showThinking(false);
+
+  $("#session-filter").addEventListener("input", (e) => {
+    state.sessionFilter = e.target.value;
+    renderSessions();
+  });
+
+  $("#activity-filter").onclick = () => {
+    state.errorsOnly = !state.errorsOnly;
+    $("#activity-tree").classList.toggle("errors-only", state.errorsOnly);
+    $("#activity-filter").textContent = state.errorsOnly ? "errors" : "all";
+  };
+
+  // Collapse/expand a subagent's children by clicking its label (event-delegated
+  // so it covers nodes added later). A node is collapsible iff a `.children` box
+  // immediately follows it; CSS draws the caret and hides the children.
+  $("#activity-tree").addEventListener("click", (e) => {
+    const label = e.target.closest(".node-label");
+    if (!label) return;
+    const node = label.parentElement;
+    const next = node.nextElementSibling;
+    if (next && next.classList.contains("children")) {
+      node.classList.toggle("collapsed");
+    }
+  });
+
+  initPaneResize();
 
   document.addEventListener("keydown", (e) => {
     if (e.target.id === "query" && !["Escape"].includes(e.key)) return;

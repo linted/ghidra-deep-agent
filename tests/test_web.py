@@ -179,6 +179,11 @@ class _StubSessions:
     def delete(self, sid: str) -> bool:
         return self._items.pop(sid, None) is not None
 
+    def rename(self, sid: str, title: str) -> None:
+        s = self._items.get(sid)
+        if s is not None:
+            s.title = title
+
 
 class _StubService:
     def __init__(self) -> None:
@@ -247,6 +252,26 @@ def test_session_crud_and_history(client: TestClient) -> None:
         assert hist["messages"][0]["content"] == "hi"
         deleted = client.delete(f"/api/sessions/{created['session_id']}").json()
         assert deleted["deleted"] is True
+
+
+def test_session_rename(client: TestClient) -> None:
+    with client:
+        created = client.post("/api/sessions", json={"binary_name": "a.bin"}).json()
+        sid = created["session_id"]
+        resp = client.patch(f"/api/sessions/{sid}", json={"title": "  renamed  "})
+        assert resp.status_code == 200
+        assert resp.json()["title"] == "renamed"
+        listed = client.get("/api/sessions").json()["sessions"]
+        assert next(s for s in listed if s["session_id"] == sid)["title"] == "renamed"
+
+
+def test_session_rename_empty_title_400(client: TestClient) -> None:
+    with client:
+        created = client.post("/api/sessions", json={"binary_name": "a.bin"}).json()
+        resp = client.patch(
+            f"/api/sessions/{created['session_id']}", json={"title": "   "}
+        )
+    assert resp.status_code == 400
 
 
 def test_history_unknown_session_404(client: TestClient) -> None:

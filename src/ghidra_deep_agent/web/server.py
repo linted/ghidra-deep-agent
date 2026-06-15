@@ -67,6 +67,10 @@ class NewSession(BaseModel):
     binary_name: str
 
 
+class RenameSession(BaseModel):
+    title: str
+
+
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
@@ -160,6 +164,15 @@ async def list_sessions() -> dict[str, Any]:
 @app.post("/api/sessions")
 async def create_session(body: NewSession) -> dict[str, Any]:
     return service.create_session(body.binary_name).to_dict()
+
+
+@app.patch("/api/sessions/{session_id}")
+async def rename_session(session_id: str, body: RenameSession) -> Response:
+    title = body.title.strip()[:128]
+    if not title:
+        return JSONResponse({"error": "title cannot be empty"}, status_code=400)
+    service.sessions.rename(session_id, title)
+    return JSONResponse({"ok": True, "title": title})
 
 
 @app.delete("/api/sessions/{session_id}")
