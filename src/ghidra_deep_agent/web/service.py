@@ -15,7 +15,11 @@ from langgraph.checkpoint.mongodb import MongoDBSaver
 
 from ghidra_deep_agent.knowledge import build_knowledge_tools
 from ghidra_deep_agent.models import build_embeddings, build_model
-from ghidra_deep_agent.program_resolver import list_open_programs
+from ghidra_deep_agent.program_resolver import (
+    is_program_open,
+    list_project_programs,
+    open_program,
+)
 from ghidra_deep_agent.runtime import (
     Settings,
     build_agent,
@@ -110,7 +114,7 @@ class AgentService:
     # -- programs / sessions -------------------------------------------------
 
     async def list_programs(self) -> list[str]:
-        return await list_open_programs(self._tools)
+        return await list_project_programs(self._tools)
 
     def create_session(self, binary_name: str) -> Session:
         return self.sessions.create(binary_name)
@@ -137,6 +141,23 @@ class AgentService:
         session = self.sessions.get(session_id)
         if session is None:
             raise KeyError(f"unknown session {session_id}")
+
+        # Lazily open the session's binary into the engine. Sessions are created
+        # without touching Ghidra (so "New Session" is instant); the program is
+        # opened on the first query against it. Opening is idempotent — skip it
+        # when the binary is already open in the engine.
+        try:
+            if not await is_program_open(self._tools, session.binary_name):
+                await open_program(self._tools, f"/{session.binary_name}")
+        except RuntimeError as exc:
+            yield {
+                "type": "toast",
+                "severity": "error",
+                "title": "Open failed",
+                "message": str(exc),
+            }
+            yield {"type": "agent_done"}
+            return
 
         agent = self._agent_for(session.binary_name)
         config = self._config(session_id)

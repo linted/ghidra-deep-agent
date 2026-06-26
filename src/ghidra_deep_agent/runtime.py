@@ -36,6 +36,7 @@ class Settings:
     recursion_limit: int
     output_dir: str
     agents_md: str
+    shared_repo: str
 
 
 def resolve_settings() -> Settings:
@@ -52,6 +53,7 @@ def resolve_settings() -> Settings:
         recursion_limit=int(os.environ.get("RECURSION_LIMIT", "10000")),
         output_dir=os.environ.get("AGENT_OUTPUT_DIR", ""),
         agents_md=os.environ.get("AGENTS_MD", ""),
+        shared_repo=os.environ.get("GHIDRA_DEFAULT_REPOSITORY", "agent-shared"),
     )
 
 

@@ -61,6 +61,13 @@ services:
       GHIDRA_SERVER_PORT: "13100"
       GHIDRA_SERVER_USER: ${GHIDRA_SERVER_USER:-agent}
       GHIDRA_SERVER_PASSWORD: ${GHIDRA_SERVER_PASSWORD:-}
+      # Repo the engine mounts as a shared, server-bound project at startup so
+      # list_project_files enumerates it and /open_program can open from it (the
+      # web picker depends on this). The headless server reads this exact var name
+      # in mountSharedProjectIfConfigured(); we source its value from the shared
+      # GHIDRA_DEFAULT_REPOSITORY the ghidra-server seeds so both stay aligned. The
+      # local project cache persists in the ghidra-projects volume (/projects).
+      GHIDRA_SERVER_REPOSITORY: ${GHIDRA_DEFAULT_REPOSITORY:-agent-shared}
     volumes:
       - ghidra-data:/data
       - ghidra-projects:/projects

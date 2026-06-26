@@ -74,7 +74,7 @@ echo "Starting MCP bridge on 0.0.0.0:${BRIDGE_PORT}..."
 # distinct from the deep-agent web service's GHIDRA_MCP_URL, which points at this
 # bridge's /mcp. The bridge defaults to this value, but we set it explicitly.
 GHIDRA_MCP_URL="http://127.0.0.1:${ENGINE_PORT}" \
-  python3 /app/bridge_mcp_ghidra.py \
+  python3 -m bridge_mcp_ghidra \
     --transport streamable-http \
     --mcp-host 0.0.0.0 \
     --mcp-port "${BRIDGE_PORT}" &

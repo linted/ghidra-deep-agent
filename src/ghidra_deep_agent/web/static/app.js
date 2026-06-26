@@ -659,7 +659,7 @@ async function openBinaryPicker() {
       list.append(li);
     }
     if (!(data.programs || []).length) {
-      err.textContent = "No open programs in Ghidra.";
+      err.textContent = "No binaries uploaded yet — upload one to start.";
       err.classList.remove("hidden");
     }
   } catch (e) {
