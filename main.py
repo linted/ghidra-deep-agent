@@ -8,15 +8,13 @@ from typing import Any
 from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
 from deepagents.backends.filesystem import FilesystemBackend
-from deepagents.middleware.summarization import (
-    create_summarization_tool_middleware,
-)
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.interceptors import MCPToolCallRequest
 from langgraph.checkpoint.mongodb import MongoDBSaver
 from pymongo.errors import ServerSelectionTimeoutError
 
+from ghidra_deep_agent.compaction import create_forced_summarization_tool_middleware
 from ghidra_deep_agent.ghidra_transport import get_mcp_config
 from ghidra_deep_agent.knowledge import build_knowledge_tools
 from ghidra_deep_agent.models import build_embeddings, build_model
@@ -133,7 +131,9 @@ async def main() -> None:
                 tools=knowledge_tools + tools,
                 system_prompt=SYSTEM_PROMPT,
                 checkpointer=checkpointer,
-                middleware=[create_summarization_tool_middleware(built_model, backend)],
+                middleware=[
+                    create_forced_summarization_tool_middleware(built_model, backend)
+                ],
                 backend=backend,
                 memory=[agents_md] if agents_md else None,
             )
