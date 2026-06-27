@@ -7,4 +7,5 @@
 # In Progress
 
 # Completed
+ - add a cancel/stop button to the web interface to interrupt a running analysis/session. — done: added a red "✕ Stop" button in the input row (index.html), shown only while running via setBusy() (app.js), reusing the existing WebSocket "cancel" flow. Escape-key cancel still works.
  - the select binary popup says "No open programs in Ghidra." even after you upload a binary. how do we actually start a session then? — fixed: engine now mounts the shared server-bound repo as a project at startup (fork commit 2ae45da, GHIDRA_SERVER_REPOSITORY); web picker lists via list_project_files and lazily opens via open_program. Verified e2e.

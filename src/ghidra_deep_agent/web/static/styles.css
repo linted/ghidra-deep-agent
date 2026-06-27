@@ -282,9 +282,11 @@ body.resizing #pane-resize { opacity: 1; background: var(--primary); }
 #statusbar.busy { border-top-color: var(--primary); }
 
 /* Input */
-#input-row { padding: 10px 14px; border-top: 1px solid var(--border); background: var(--surface); }
+#input-row { padding: 10px 14px; border-top: 1px solid var(--border); background: var(--surface); display: flex; gap: 8px; align-items: center; }
+#cancel { color: var(--error); border-color: var(--error); white-space: nowrap; }
+#cancel:hover { background: var(--error); color: var(--bg); border-color: var(--error); }
 #query {
-  width: 100%;
+  flex: 1;
   background: var(--bg);
   color: var(--fg);
   border: 1px solid var(--border);

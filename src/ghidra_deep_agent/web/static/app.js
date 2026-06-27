@@ -111,6 +111,7 @@ function flash(text) {
 function setBusy(busy) {
   state.running = busy;
   $("#query").classList.toggle("busy", busy);
+  $("#cancel").classList.toggle("hidden", !busy);
   $("#statusbar").classList.toggle("busy", busy);
   if (busy) {
     state.runStart = Date.now();
@@ -853,6 +854,7 @@ function init() {
   $("#upload-done-ok").onclick = () =>
     $("#upload-done-modal").classList.add("hidden");
   $("#toggle-tree").onclick = () => $("#panes").classList.toggle("hide-tree");
+  $("#cancel").onclick = () => { if (state.running) send({ type: "cancel" }); };
   $("#yank").onclick = doYank;
   $("#clear").onclick = () => {
     resetConversation();
