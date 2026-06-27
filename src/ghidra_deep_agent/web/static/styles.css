@@ -47,6 +47,7 @@ button:disabled:hover { border-color: var(--border); color: var(--fg); }
 #app {
   display: grid;
   grid-template-columns: 240px 1fr;
+  grid-template-rows: minmax(0, 1fr);
   height: 100vh;
 }
 
@@ -123,7 +124,7 @@ button:disabled:hover { border-color: var(--border); color: var(--fg); }
 #session-list li:hover .s-del { visibility: visible; }
 
 /* Main */
-#main { display: flex; flex-direction: column; min-width: 0; }
+#main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 #topbar {
   display: flex;
   justify-content: space-between;
