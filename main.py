@@ -3,6 +3,7 @@ import asyncio
 import os
 import sys
 import uuid
+from pathlib import Path
 from typing import Any
 
 from deepagents import create_deep_agent
@@ -19,7 +20,7 @@ from ghidra_deep_agent.ghidra_transport import get_mcp_config
 from ghidra_deep_agent.knowledge import build_knowledge_tools
 from ghidra_deep_agent.models import build_embeddings, build_model
 from ghidra_deep_agent.program_resolver import resolve_binary_name
-from ghidra_deep_agent.prompt import SYSTEM_PROMPT
+from ghidra_deep_agent.prompt import SYSTEM_PROMPT, format_agent_memory
 from ghidra_deep_agent.tui import GhidraAgentApp
 
 
@@ -40,7 +41,19 @@ async def main() -> None:
 
     mcp_config = get_mcp_config()
     model = os.environ.get("MODEL", "anthropic:claude-sonnet-4-6")
-    agents_md = os.environ.get("AGENTS_MD", "")
+
+    agents_md_path = os.environ.get("AGENTS_MD", "")
+    agents_md = ""
+    if agents_md_path:
+        resolved = Path(agents_md_path).expanduser()
+        try:
+            agents_md = resolved.read_text(encoding="utf-8")
+            print(f"AGENTS.md memory loaded [{resolved}]")
+        except OSError as exc:
+            print(
+                f"Warning: could not read AGENTS_MD file {resolved} ({exc})",
+                file=sys.stderr,
+            )
 
     transport_desc = mcp_config["ghidra"].get("transport", "stdio")
     if transport_desc == "stdio":
@@ -129,13 +142,12 @@ async def main() -> None:
             agent_kwargs: dict[str, Any] = dict(
                 model=built_model,
                 tools=knowledge_tools + tools,
-                system_prompt=SYSTEM_PROMPT,
+                system_prompt=SYSTEM_PROMPT + format_agent_memory(agents_md),
                 checkpointer=checkpointer,
                 middleware=[
                     create_forced_summarization_tool_middleware(built_model, backend)
                 ],
                 backend=backend,
-                memory=[agents_md] if agents_md else None,
             )
 
             agent = create_deep_agent(**agent_kwargs)

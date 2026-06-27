@@ -100,3 +100,17 @@ SYSTEM_PROMPT = (
 )
 # - List all functions and their addresses
 # - Check imports, exports, and strings for hints about purpose
+
+
+def format_agent_memory(content: str) -> str:
+    """Wrap AGENTS.md content as a system-prompt section, or '' if empty."""
+    content = content.strip()
+    if not content:
+        return ""
+    return (
+        "\n\n## Project memory (AGENTS.md)\n\n"
+        "The following project-specific context was provided by the user. "
+        "Treat it as authoritative background, but defer to the assembly and "
+        "verified evidence when they conflict.\n\n"
+        f"{content}\n"
+    )
