@@ -23,7 +23,7 @@ Latency
 - [ ] **Parallelize the ~118s monolithic analysis tools** (`find_anti_analysis_techniques`, `detect_malware_behaviors`, `extract_iocs_with_context`, `detect_crypto_constants`, `analyze_api_call_chains`) via `asyncio.gather` / LangGraph `Send`
 - [ ] **Enable streaming LLM responses** to overlap generation with tool execution
 - [ ] **Route routine/structured-output LLM calls to a smaller, faster model** (model-router at middleware layer)
-- [ ] **Batch independent read-only tool calls** — prompt the agent to call independent read-only tools simultaneously
+- [x] **Batch independent read-only tool calls** — prompt the agent to call independent read-only tools simultaneously. Added "Batch independent tool calls" section to SYSTEM_PROMPT (prompt.py).
 
 Sub-agent design
 - [ ] **`function-analyst` sub-agent (build first)** — decompile/xref/analysis tools behind a delegation boundary so only structured findings return to the main agent
