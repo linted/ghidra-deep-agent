@@ -9,7 +9,6 @@ Cost
 - [ ] **Right-size subagent model & context** — pass only task-specific artifacts to subagents (not full history); route structured/retrieval subagent work to a lighter model
 - [ ] **Tune forced compaction** — lower trigger threshold, truncate tool outputs before they enter context, route summarization call to a cheaper/smaller model
 - [ ] **Trim per-call prompt bloat** — compress tool descriptions, conditionally inject middleware content (skip filesystem tree / todo list when irrelevant), audit system prompt
-- [ ] **Spill large tool outputs to a file instead of re-injecting** — when a tool result (e.g. `decompile_function`, `search_strings`) exceeds a size threshold, write it to disk via the `FilesystemBackend` and return a compact pointer/summary, so the agent can `grep`/`read_file` the relevant parts on demand rather than carrying the full payload in context (still worth adding `limit` params where natural)
 - [x] **Conditionally disable `AnthropicPromptCachingMiddleware`** when running non-Anthropic providers (e.g. DeepSeek) — no-op: the middleware isn't wired into this codebase, and the library version already no-ops for non-Anthropic models (isinstance check). Nothing to do.
 
 Errors
@@ -30,6 +29,7 @@ Sub-agent design
 - [ ] Keep search primitives, knowledge queries, and filesystem tools on the main agent (no sub-agent)
 
 ### Backlog (deferred — not now)
+- [ ] **Spill large tool outputs to a file instead of re-injecting** — *already implemented in deepagents:* `FilesystemMiddleware` offloads tool results over `tool_token_limit_before_evict` (default 20k tokens / ~80 KB) to `large_tool_results/`, leaving a preview + pointer. The hard part is lowering that threshold: `create_deep_agent` doesn't expose it, hardcodes `FilesystemMiddleware` in 3 places (graph.py:645/720/779), and the clean overrides are blocked — duplicate-instance assertion (factory.py:1080) and `_REQUIRED_MIDDLEWARE` blocks `excluded_middleware` (graph.py:230). Lowering it needs a monkeypatch (subclass + swap `deepagents.graph.FilesystemMiddleware`) or a custom offload middleware (~80 lines). Not worth it now for a non-urgent latency/cost win; revisit if deepagents exposes the knob or context bloat becomes a measured problem.
 - [ ] **Add graph-level timeout & error boundary** to top-level LangGraph — wall-clock timeout (~20 min) / recursion limit with graceful early-exit returning partial findings
 - [ ] **Bound `task` sub-agents** — max tool-call rounds + wall-clock timeout, return partial results on expiry
 
