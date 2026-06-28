@@ -22,6 +22,7 @@ from ghidra_deep_agent.models import build_embeddings, build_model
 from ghidra_deep_agent.program_resolver import resolve_binary_name
 from ghidra_deep_agent.prompt import SYSTEM_PROMPT, format_agent_memory
 from ghidra_deep_agent.tui import GhidraAgentApp
+from ghidra_deep_agent.validation import create_argument_validation_middleware
 
 
 async def main() -> None:
@@ -145,7 +146,8 @@ async def main() -> None:
                 system_prompt=SYSTEM_PROMPT + format_agent_memory(agents_md),
                 checkpointer=checkpointer,
                 middleware=[
-                    create_forced_summarization_tool_middleware(built_model, backend)
+                    create_argument_validation_middleware(),
+                    create_forced_summarization_tool_middleware(built_model, backend),
                 ],
                 backend=backend,
             )

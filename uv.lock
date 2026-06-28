@@ -377,6 +377,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "deepagents" },
+    { name = "jsonschema" },
     { name = "langchain", extra = ["anthropic"] },
     { name = "langchain-deepseek" },
     { name = "langchain-mcp-adapters" },
@@ -404,6 +405,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "deepagents" },
+    { name = "jsonschema" },
     { name = "langchain", extras = ["anthropic"] },
     { name = "langchain-deepseek" },
     { name = "langchain-mcp-adapters" },

@@ -17,7 +17,7 @@ Errors
 - [ ] **Add graph-level timeout & error boundary** to top-level LangGraph — wall-clock timeout (~20 min) / recursion limit with graceful early-exit returning partial findings
 - [ ] **Add retry logic to filesystem tool calls** for transient I/O errors; return structured edit-failure errors so the LLM self-corrects
 - [ ] **Bound `task` sub-agents** — max tool-call rounds + wall-clock timeout, return partial results on expiry
-- [ ] **Pydantic argument-validation shim** before tool execution — return `{"validation_error": ...}` for self-correction
+- [x] **Pydantic argument-validation shim** before tool execution — return `{"validation_error": ...}` for self-correction. Implemented as `ArgumentValidationMiddleware` (validation.py); validates dict-schema MCP tools client-side via jsonschema (pydantic-schema tools already validated by the framework).
 
 Latency
 - [ ] **Parallelize the ~118s monolithic analysis tools** (`find_anti_analysis_techniques`, `detect_malware_behaviors`, `extract_iocs_with_context`, `detect_crypto_constants`, `analyze_api_call_chains`) via `asyncio.gather` / LangGraph `Send`
