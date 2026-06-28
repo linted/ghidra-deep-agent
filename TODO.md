@@ -3,6 +3,34 @@
 - [ ] **Plan mode for the RE agent**
 - [x] **OpenRouter support**
 
+### From optimization report (2026-06-28, 7d window)
+
+Cost
+- [ ] **Right-size subagent model & context** — pass only task-specific artifacts to subagents (not full history); route structured/retrieval subagent work to a lighter model
+- [ ] **Tune forced compaction** — lower trigger threshold, truncate tool outputs before they enter context, route summarization call to a cheaper/smaller model
+- [ ] **Trim per-call prompt bloat** — compress tool descriptions, conditionally inject middleware content (skip filesystem tree / todo list when irrelevant), audit system prompt
+- [ ] **Spill large tool outputs to a file instead of re-injecting** — when a tool result (e.g. `decompile_function`, `search_strings`) exceeds a size threshold, write it to disk via the `FilesystemBackend` and return a compact pointer/summary, so the agent can `grep`/`read_file` the relevant parts on demand rather than carrying the full payload in context (still worth adding `limit` params where natural)
+- [ ] **Conditionally disable `AnthropicPromptCachingMiddleware`** when running non-Anthropic providers (e.g. DeepSeek)
+
+Errors
+- [ ] **Harden `update_knowledge`** — retries + backoff, entity-exists guard, return structured warning instead of raising (highest per-tool error rate, 5.6%)
+- [ ] **Add graph-level timeout & error boundary** to top-level LangGraph — wall-clock timeout (~20 min) / recursion limit with graceful early-exit returning partial findings
+- [ ] **Add retry logic to filesystem tool calls** for transient I/O errors; return structured edit-failure errors so the LLM self-corrects
+- [ ] **Bound `task` sub-agents** — max tool-call rounds + wall-clock timeout, return partial results on expiry
+- [ ] **Pydantic argument-validation shim** before tool execution — return `{"validation_error": ...}` for self-correction
+
+Latency
+- [ ] **Parallelize the ~118s monolithic analysis tools** (`find_anti_analysis_techniques`, `detect_malware_behaviors`, `extract_iocs_with_context`, `detect_crypto_constants`, `analyze_api_call_chains`) via `asyncio.gather` / LangGraph `Send`
+- [ ] **Enable streaming LLM responses** to overlap generation with tool execution
+- [ ] **Route routine/structured-output LLM calls to a smaller, faster model** (model-router at middleware layer)
+- [ ] **Batch independent read-only tool calls** — prompt the agent to call independent read-only tools simultaneously
+
+Sub-agent design
+- [ ] **`function-analyst` sub-agent (build first)** — decompile/xref/analysis tools behind a delegation boundary so only structured findings return to the main agent
+- [ ] **`program-recon` sub-agent (quick win)** — consolidate the "what binary is this" preamble into one delegation returning a compact JSON brief
+- [ ] **`threat-hunter` sub-agent (latency isolation)** — fan-out-and-aggregate wrapper for the heavy threat-analysis tools off the main critical path
+- [ ] Keep search primitives, knowledge queries, and filesystem tools on the main agent (no sub-agent)
+
 ## Plan mode for the RE agent
 Add a "plan mode" inspired by Claude Code's plan mode. When invoked, the agent
 should reason about a presented problem, produce a **markdown plan for the human

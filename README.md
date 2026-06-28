@@ -47,7 +47,6 @@ All configuration is done via environment variables (`.env` file or shell export
 | `ANTHROPIC_API_KEY` | — | API key for Anthropic *(not needed for Ollama)* |
 | `MODEL` | `anthropic:claude-sonnet-4-6` | Any `provider:model` string supported by LangChain (also `openrouter:<model-id>` — see [Using OpenRouter](#using-openrouter)) |
 | `OPENROUTER_API_KEY` | — | API key for OpenRouter *(required for `openrouter:` models)* |
-| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter API base URL *(only needed if non-default)* |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL *(only needed if non-default)* |
 | `EMBED_MODEL` | `ollama:nomic-embed-text` | `provider:model` for embeddings — supports `ollama`, `openai`, `huggingface`, `cohere`, `automated` (MongoDB Atlas Automated Embeddings via Voyage AI; requires an Atlas cluster with Voyage AI configured at the project level, e.g. `automated:voyage-4`) |
 | `MONGODB_URI` | `mongodb://localhost:27017` | MongoDB connection string for checkpoint persistence |
@@ -85,13 +84,13 @@ Ollama must be running (`ollama serve`) and the model must already be pulled bef
 ### Using OpenRouter
 
 [OpenRouter](https://openrouter.ai) provides a single API key for many models across
-providers via an OpenAI-compatible endpoint. Set `MODEL` to `openrouter:<model-id>`
-(using the model id as it appears on OpenRouter) and provide `OPENROUTER_API_KEY`:
+providers. It is a built-in LangChain provider (via the bundled `langchain-openrouter`
+package), so set `MODEL` to `openrouter:<model-id>` (using the model id as it appears
+on OpenRouter) and provide `OPENROUTER_API_KEY`:
 
 ```env
 MODEL=openrouter:anthropic/claude-3.5-sonnet
 OPENROUTER_API_KEY=sk-or-...
-# OPENROUTER_BASE_URL=https://openrouter.ai/api/v1  # only if non-default
 ```
 
 The selected model **must support tool calling**.

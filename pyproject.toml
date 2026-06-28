@@ -18,7 +18,7 @@ dependencies = [
     "langchain[anthropic]",
     "langchain-deepseek",
     "langchain-ollama",
-    "langchain-openai",
+    "langchain-openrouter",
     "langgraph",
     "langgraph-checkpoint-mongodb",
     "pymongo",

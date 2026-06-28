@@ -1,8 +1,6 @@
-import os
 from typing import Any, cast
 
 from langchain_core.embeddings import Embeddings
-from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_deepseek import ChatDeepSeek
 
@@ -80,30 +78,15 @@ def build_embeddings(embed_string: str) -> Embeddings:
     )
 
 
-def build_model(model_string: str) -> BaseChatModel | str:
+def build_model(model_string: str) -> _ChatDeepSeekFixed | str:
     """Return a configured chat model for the given provider:model string.
 
     For DeepSeek models we return _ChatDeepSeekFixed so reasoning_content is
-    correctly round-tripped.  For OpenRouter models we return a ChatOpenAI
-    instance pointed at OpenRouter's OpenAI-compatible API (configured via
-    OPENROUTER_API_KEY and OPENROUTER_BASE_URL).  All other provider strings are
-    returned as-is for init_chat_model to resolve.
+    correctly round-tripped.  All other provider strings (including
+    ``openrouter:<model>``, resolved via langchain-openrouter's ChatOpenRouter)
+    are returned as-is for init_chat_model to resolve.
     """
     if model_string.startswith("deepseek:"):
         model_name = model_string.split(":", 1)[1]
         return _ChatDeepSeekFixed(model=model_name)
-    if model_string.startswith("openrouter:"):
-        model_name = model_string.split(":", 1)[1]
-        from langchain_openai import ChatOpenAI
-
-        api_key = os.environ.get("OPENROUTER_API_KEY")
-        if not api_key:
-            raise ValueError("OPENROUTER_API_KEY must be set for openrouter: models")
-        return ChatOpenAI(
-            model=model_name,
-            base_url=os.environ.get(
-                "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
-            ),
-            api_key=cast(Any, api_key),
-        )
     return model_string
