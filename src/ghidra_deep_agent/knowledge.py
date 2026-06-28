@@ -1,5 +1,6 @@
 import os
 from collections import Counter
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -10,6 +11,45 @@ from langchain_core.tools.retriever import create_retriever_tool
 from langchain_mongodb import MongoDBAtlasVectorSearch
 from langchain_mongodb.embeddings import AutoEmbeddings
 from pymongo import MongoClient
+from pymongo.errors import (
+    AutoReconnect,
+    ConnectionFailure,
+    ExecutionTimeout,
+    NetworkTimeout,
+    PyMongoError,
+    ServerSelectionTimeoutError,
+    WaitQueueTimeoutError,
+)
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+# Transient MongoDB failures worth retrying — network blips, server-selection
+# timeouts, primary step-downs. Persistent errors (bad query, auth) fall through
+# to the caller's PyMongoError handler immediately.
+_TRANSIENT_MONGO_ERRORS = (
+    AutoReconnect,
+    ConnectionFailure,
+    NetworkTimeout,
+    ServerSelectionTimeoutError,
+    WaitQueueTimeoutError,
+    ExecutionTimeout,
+)
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=0.5, max=4),
+    retry=retry_if_exception_type(_TRANSIENT_MONGO_ERRORS),
+)
+def _mongo_write_with_retry[T](fn: Callable[[], T]) -> T:
+    """Run a MongoDB write, retrying transient failures with backoff."""
+    return fn()
+
 
 # Caps applied when rendering the session-start summary so the result
 # stays predictable as the knowledge base grows.
@@ -208,8 +248,14 @@ def build_knowledge_tools(
                 "saved_at": datetime.now(UTC).isoformat(),
             },
         )
-        vector_store.add_documents([doc])
         label = function_name or address or category
+        try:
+            _mongo_write_with_retry(lambda: vector_store.add_documents([doc]))
+        except PyMongoError as exc:
+            return (
+                f"Warning: could not save finding ({label}) — {exc}. "
+                "Not saved; retry later."
+            )
         return f"Saved: [{binary_name} | {label}]"
 
     @tool
@@ -243,10 +289,18 @@ def build_knowledge_tools(
         if not updates:
             return "Nothing to update — no fields provided."
 
-        result = collection.update_many(
-            {"binary_name": binary_name, "address": address},
-            {"$set": updates},
-        )
+        try:
+            result = _mongo_write_with_retry(
+                lambda: collection.update_many(
+                    {"binary_name": binary_name, "address": address},
+                    {"$set": updates},
+                )
+            )
+        except PyMongoError as exc:
+            return (
+                f"Warning: could not update entries for '{address}' — {exc}. "
+                "No changes applied; retry later."
+            )
         if result.matched_count == 0:
             return f"No entries found for address '{address}'."
         return (

@@ -13,7 +13,7 @@ Cost
 - [ ] **Conditionally disable `AnthropicPromptCachingMiddleware`** when running non-Anthropic providers (e.g. DeepSeek)
 
 Errors
-- [ ] **Harden `update_knowledge`** — retries + backoff, entity-exists guard, return structured warning instead of raising (highest per-tool error rate, 5.6%)
+- [x] **Harden `update_knowledge`** — retries + backoff, entity-exists guard, return structured warning instead of raising (highest per-tool error rate, 5.6%). Also applied to `save_knowledge` (sibling write tool).
 - [ ] **Add graph-level timeout & error boundary** to top-level LangGraph — wall-clock timeout (~20 min) / recursion limit with graceful early-exit returning partial findings
 - [ ] **Add retry logic to filesystem tool calls** for transient I/O errors; return structured edit-failure errors so the LLM self-corrects
 - [ ] **Bound `task` sub-agents** — max tool-call rounds + wall-clock timeout, return partial results on expiry
