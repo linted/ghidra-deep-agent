@@ -18,10 +18,16 @@ from pymongo.errors import ServerSelectionTimeoutError
 from ghidra_deep_agent.compaction import create_forced_summarization_tool_middleware
 from ghidra_deep_agent.ghidra_transport import get_mcp_config
 from ghidra_deep_agent.knowledge import build_knowledge_tools
-from ghidra_deep_agent.models import build_embeddings, build_model
+from ghidra_deep_agent.models import build_embeddings
 from ghidra_deep_agent.program_resolver import resolve_binary_name
 from ghidra_deep_agent.prompt import SYSTEM_PROMPT, format_agent_memory
-from ghidra_deep_agent.subagents import build_subagents
+from ghidra_deep_agent.subagents import (
+    build_main_tools,
+    build_subagents,
+    load_agent_config,
+    make_model_resolver,
+    resolve_model_spec,
+)
 from ghidra_deep_agent.tui import GhidraAgentApp
 from ghidra_deep_agent.validation import create_argument_validation_middleware
 
@@ -42,7 +48,13 @@ async def main() -> None:
     session_id = args.session_id or str(uuid.uuid4())
 
     mcp_config = get_mcp_config()
-    model = os.environ.get("MODEL", "anthropic:claude-sonnet-4-6")
+    # Fail fast on a bad config before connecting to anything.
+    try:
+        agent_config = load_agent_config()
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    resolve_model = make_model_resolver(agent_config.default_model)
 
     agents_md_path = os.environ.get("AGENTS_MD", "")
     agents_md = ""
@@ -123,22 +135,20 @@ async def main() -> None:
         print(f"Warning: knowledge base unavailable ({exc})", file=sys.stderr)
         knowledge_tools = []
 
-    built_model = build_model(model)
-
-    # Sub-agents run on SUBAGENT_MODEL, defaulting to the main model. Reuse the
-    # already-built main model when the string is unchanged to avoid a second
-    # client.
-    subagent_model_string = os.environ.get("SUBAGENT_MODEL", model)
-    built_subagent_model = (
-        built_model
-        if subagent_model_string == model
-        else build_model(subagent_model_string)
-    )
-    subagents = build_subagents(knowledge_tools + tools, built_subagent_model)
-    print(
-        f"Sub-agents ready: {', '.join(s['name'] for s in subagents)}  "
-        f"[model: {subagent_model_string}]"
-    )
+    # Resolve per-agent models and tool sets from the config. The coordinator
+    # gets a restricted, high-level tool set; sub-agents are built from the full
+    # tool list so their allowlists are unaffected by that restriction.
+    all_tools = knowledge_tools + tools
+    built_model = resolve_model(agent_config.main_model)
+    main_model_spec = resolve_model_spec(agent_config.main_model, agent_config)
+    main_tools = build_main_tools(all_tools, agent_config)
+    subagents = build_subagents(all_tools, agent_config, resolve_model)
+    print(f"Main agent: {main_model_spec}  [{len(main_tools)} tool(s)]")
+    for sub_cfg in agent_config.subagents:
+        print(
+            f"  sub-agent {sub_cfg.name}: "
+            f"{resolve_model_spec(sub_cfg.model, agent_config)}"
+        )
 
     recursion_limit = int(os.environ.get("RECURSION_LIMIT", "10000"))
     config = {
@@ -159,7 +169,7 @@ async def main() -> None:
         ) as checkpointer:
             agent_kwargs: dict[str, Any] = dict(
                 model=built_model,
-                tools=knowledge_tools + tools,
+                tools=main_tools,
                 system_prompt=SYSTEM_PROMPT + format_agent_memory(agents_md),
                 checkpointer=checkpointer,
                 middleware=[
@@ -180,7 +190,7 @@ async def main() -> None:
             app = GhidraAgentApp(
                 agent=agent,
                 config=config,
-                model=model,
+                model=main_model_spec,
                 session_id=session_id,
                 mcp_ok=True,
                 db_ok=True,

@@ -6,7 +6,7 @@
 ### From optimization report (2026-06-28, 7d window)
 
 Cost
-- [ ] **Right-size subagent model & context** — pass only task-specific artifacts to subagents (not full history); route structured/retrieval subagent work to a lighter model
+- [x] **Right-size subagent model & context** — agents are now defined declaratively in `subagents.toml` (per-agent model + tool allowlist), loaded by `subagents.py`; the coordinator is restricted to orchestration + navigation/search (analysis/mutation tools moved to sub-agents). Per-agent models leverage OpenRouter. "Task-specific artifacts, not full history" is already handled by deepagents' `task` isolation. (The *dynamic* per-call model-router is still the separate Latency item below.)
 - [ ] **Tune forced compaction** — lower trigger threshold, truncate tool outputs before they enter context, route summarization call to a cheaper/smaller model
 - [ ] **Trim per-call prompt bloat** — compress tool descriptions, conditionally inject middleware content (skip filesystem tree / todo list when irrelevant), audit system prompt
 - [x] **Conditionally disable `AnthropicPromptCachingMiddleware`** when running non-Anthropic providers (e.g. DeepSeek) — no-op: the middleware isn't wired into this codebase, and the library version already no-ops for non-Anthropic models (isinstance check). Nothing to do.
