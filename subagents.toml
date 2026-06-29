@@ -12,13 +12,14 @@
 # Point AGENT_CONFIG at a different file to override this one.
 
 # Optional fallback model for any agent without its own `model`.
-default = "openrouter:deepseek/deepseek-v4-pro"
+default = "deepseek:deepseek-v4-pro"
 
 [main]
 # The coordinator: orchestrates sub-agents, navigates/searches, and uses the
 # knowledge base. It does NOT decompile, disassemble, xref, run threat tools, or
 # mutate Ghidra — those are delegated to sub-agents.
 model = "openrouter:z-ai/glm-5.2"
+# model = "openrouter:cohere/north-mini-code:free"
 tools = [
   # knowledge base (read + record high-level hypotheses)
   "query_knowledge",
@@ -43,7 +44,7 @@ tools = [
 [[subagents]]
 name = "program-recon"
 description = "Read-only reconnaissance. Delegate at the start of a session to get a compact brief on an unfamiliar binary (format, architecture, entry points, notable imports/exports/strings, prior knowledge)."
-model = "openrouter:deepseek/deepseek-v4-pro"
+model = "deepseek:deepseek-v4-pro"
 tools = [
   "get_current_program_info",
   "list_functions",
@@ -83,7 +84,7 @@ base. Do NOT paste full catalog listings or raw tool dumps — summarize.
 [[subagents]]
 name = "function-analyst"
 description = "Deep analysis of one function (or a few related ones). It decompiles, traces data flow, applies the warranted renames/retypes/comments/prototype in Ghidra, saves findings to the knowledge base, and returns a compact summary. Delegate per function; several may run in parallel."
-model = "openrouter:deepseek/deepseek-v4-pro"
+model = "deepseek:deepseek-v4-pro"
 tools = [
   # analysis (read)
   "decompile_function",
@@ -149,7 +150,7 @@ conclusions.
 [[subagents]]
 name = "threat-hunter"
 description = "Runs the heavy, slow threat-analysis tools (anti-analysis, malware behaviors, IOC extraction, crypto constants, API call chains) off the main critical path, writes findings to the knowledge base, and returns a compact threat summary."
-model = "openrouter:deepseek/deepseek-v4-pro"
+model = "deepseek:deepseek-v4-pro"
 tools = [
   # heavy threat analysis
   "find_anti_analysis_techniques",

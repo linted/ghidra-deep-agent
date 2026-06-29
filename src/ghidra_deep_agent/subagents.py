@@ -28,10 +28,15 @@ from typing import Any
 
 from deepagents import SubAgent
 from deepagents.middleware.subagents import DEFAULT_SUBAGENT_PROMPT
+from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
 
 from ghidra_deep_agent.models import build_model
+from ghidra_deep_agent.resilience import (
+    build_model_resilience_middleware,
+    build_tool_retry_middleware,
+)
 from ghidra_deep_agent.validation import create_argument_validation_middleware
 
 _DEFAULT_MODEL = "anthropic:claude-sonnet-4-6"
@@ -247,11 +252,15 @@ def build_subagents(
     all_tools: Sequence[BaseTool],
     config: AgentConfig,
     resolve_model: ModelResolver,
+    *,
+    cache_middleware: AgentMiddleware | None = None,
 ) -> list[SubAgent]:
     """Build ``SubAgent`` specs from config, filtered against the live tools.
 
-    Each sub-agent gets its own ``ArgumentValidationMiddleware`` (sub-agent
-    middleware does not inherit from the main agent) and its resolved model.
+    Each sub-agent gets its own middleware (sub-agent middleware does not inherit
+    from the main agent): model resilience (retry + optional provider fallback),
+    argument validation, the shared immutable-read cache (when enabled), and
+    transient filesystem-tool retry. Plus its resolved model.
     """
     by_name = {tool.name: tool for tool in all_tools}
     specs: list[SubAgent] = []
@@ -269,7 +278,12 @@ def build_subagents(
             "system_prompt": sub.system_prompt,
             "tools": tools,
             "model": resolve_model(sub.model),
-            "middleware": [create_argument_validation_middleware()],
+            "middleware": [
+                *build_model_resilience_middleware(resolve_model),
+                create_argument_validation_middleware(),
+                *([cache_middleware] if cache_middleware is not None else []),
+                build_tool_retry_middleware(),
+            ],
         }
         specs.append(spec)
     return specs

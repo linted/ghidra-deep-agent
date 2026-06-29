@@ -47,11 +47,22 @@ All configuration is done via environment variables (`.env` file or shell export
 | `ANTHROPIC_API_KEY` | — | API key for Anthropic *(not needed for Ollama)* |
 | `MODEL` | `anthropic:claude-sonnet-4-6` | Any `provider:model` string supported by LangChain (also `openrouter:<model-id>` — see [Using OpenRouter](#using-openrouter)) |
 | `OPENROUTER_API_KEY` | — | API key for OpenRouter *(required for `openrouter:` models)* |
+| `OPENROUTER_CONFIG` | `./openrouter.toml` | Optional TOML of per-model OpenRouter provider-routing presets — see [Pinning providers](#pinning-providers-provider-routing) |
+| `SUMMARY_MODEL` | *(main `MODEL`)* | Optional `provider:model` for the conversation-summarization call (manual `/compact` **and** the auto summarizer) — route it to a smaller/cheaper model |
+| `COMPACT_TRIGGER_FRACTION` | *(deepagents default ~0.85)* | Auto-compact when context usage reaches this fraction (0-1) — lower compacts earlier |
+| `COMPACT_TRIGGER_TOKENS` | *(unset)* | Absolute token trigger for auto-compaction (used if fraction unset) |
+| `COMPACT_KEEP_MESSAGES` | *(deepagents default)* | Recent messages to keep after a compaction |
+| `MODEL_FALLBACK` | *(unset)* | Comma-separated `provider:model` fallbacks tried, in order, after the primary model's retries are exhausted |
+| `MODEL_MAX_RETRIES` | `3` | Retry attempts per model call on transient errors (5xx/429/timeouts) |
+| `TOOL_MAX_RETRIES` | `3` | Retry attempts for transient filesystem-tool I/O errors |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL *(only needed if non-default)* |
 | `EMBED_MODEL` | `ollama:nomic-embed-text` | `provider:model` for embeddings — supports `ollama`, `openai`, `huggingface`, `cohere`, `automated` (MongoDB Atlas Automated Embeddings via Voyage AI; requires an Atlas cluster with Voyage AI configured at the project level, e.g. `automated:voyage-4`) |
 | `MONGODB_URI` | `mongodb://localhost:27017` | MongoDB connection string for checkpoint persistence |
 | `MONGODB_DB` | `checkpointing_db` | Database used by the checkpointer and knowledge base |
 | `MONGODB_VECTOR_COLLECTION` | `re_knowledge` | Collection for the vector knowledge base |
+| `MONGODB_TOOL_CACHE_COLLECTION` | `tool_cache` | Collection caching immutable read-only MCP tool results |
+| `MONGODB_TOOL_CACHE_TTL` | `86400` | Cache entry lifetime in seconds (TTL index); sized to a session |
+| `MONGODB_TOOL_CACHE_TOOLS` | *(immutable read set)* | Comma-separated allowlist override; empty disables the cache |
 | `BINARY_NAME` | *(auto-detected)* | Override the binary name used to scope the knowledge base — see [Binary selection](#binary-selection) |
 | `GHIDRA_MCP_TRANSPORT` | `stdio` | Transport type: `stdio`, `http`, or `sse` |
 | `GHIDRA_MCP_COMMAND` | `ghidra-mcp` | *(stdio only)* Command to launch the MCP bridge |
@@ -94,6 +105,22 @@ OPENROUTER_API_KEY=sk-or-...
 ```
 
 The selected model **must support tool calling**.
+
+#### Pinning providers (provider routing)
+
+OpenRouter can route the same model to different upstream providers. To control
+which providers it picks (e.g. pin to one, set an order, or sort by throughput),
+copy `openrouter.toml.example` to `openrouter.toml` (or point `OPENROUTER_CONFIG`
+at a file) and add a preset per model id:
+
+```toml
+[providers."anthropic/claude-3.5-sonnet"]
+order = ["Anthropic"]
+allow_fallbacks = false
+```
+
+With no file present, OpenRouter's default routing is used. See
+[provider routing](https://openrouter.ai/docs/features/provider-routing) for all fields.
 
 ### Transport options
 

@@ -1,0 +1,26 @@
+# OpenRouter provider-routing presets.
+#
+# Copy this file to `openrouter.toml` (repo root) — or point OPENROUTER_CONFIG at
+# it — to pin which upstream providers OpenRouter routes each model to. With no
+# file present, every `openrouter:<id>` model resolves with OpenRouter's default
+# routing (unchanged behavior).
+#
+# Each table key is the OpenRouter model id (the part after `openrouter:` in
+# MODEL / subagents.toml). Each table is OpenRouter's `provider` routing object,
+# passed through verbatim. See https://openrouter.ai/docs/features/provider-routing
+# for all fields (order, allow_fallbacks, only, ignore, sort, quantizations,
+# require_parameters, data_collection, max_price, ...).
+
+# Prefer z-ai, then Novita; allow falling back to others if both are down.
+[providers."z-ai/glm-5.2"]
+order = ["z-ai", "novita"]
+allow_fallbacks = true
+
+# Pin DeepSeek to a single provider and never fall back.
+[providers."deepseek/deepseek-chat"]
+order = ["deepseek"]
+allow_fallbacks = false
+
+# Route purely by throughput.
+[providers."anthropic/claude-3.5-sonnet"]
+sort = "throughput"

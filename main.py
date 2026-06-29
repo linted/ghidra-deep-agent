@@ -15,12 +15,21 @@ from langchain_mcp_adapters.interceptors import MCPToolCallRequest
 from langgraph.checkpoint.mongodb import MongoDBSaver
 from pymongo.errors import ServerSelectionTimeoutError
 
-from ghidra_deep_agent.compaction import create_forced_summarization_tool_middleware
+from ghidra_deep_agent.compaction import (
+    auto_summarization_tuning_enabled,
+    create_forced_summarization_tool_middleware,
+    install_tuned_summarization,
+)
 from ghidra_deep_agent.ghidra_transport import get_mcp_config
 from ghidra_deep_agent.knowledge import build_knowledge_tools
+from ghidra_deep_agent.mcp_cache import build_mcp_cache_middleware
 from ghidra_deep_agent.models import build_embeddings
 from ghidra_deep_agent.program_resolver import resolve_binary_name
 from ghidra_deep_agent.prompt import SYSTEM_PROMPT, format_agent_memory
+from ghidra_deep_agent.resilience import (
+    build_model_resilience_middleware,
+    build_tool_retry_middleware,
+)
 from ghidra_deep_agent.subagents import (
     build_main_tools,
     build_subagents,
@@ -142,7 +151,12 @@ async def main() -> None:
     built_model = resolve_model(agent_config.main_model)
     main_model_spec = resolve_model_spec(agent_config.main_model, agent_config)
     main_tools = build_main_tools(all_tools, agent_config)
-    subagents = build_subagents(all_tools, agent_config, resolve_model)
+    # Shared across the coordinator and sub-agents: one cache for the whole
+    # session (same binary, same Mongo collection). None when disabled/unreachable.
+    cache_mw = build_mcp_cache_middleware(mongodb_uri, mongodb_db, binary_name)
+    subagents = build_subagents(
+        all_tools, agent_config, resolve_model, cache_middleware=cache_mw
+    )
     print(f"Main agent: {main_model_spec}  [{len(main_tools)} tool(s)]")
     for sub_cfg in agent_config.subagents:
         print(
@@ -167,14 +181,35 @@ async def main() -> None:
         with MongoDBSaver.from_conn_string(
             mongodb_uri, db_name=mongodb_db
         ) as checkpointer:
+            # SUMMARY_MODEL routes the (cheap, structured) summarization call to a
+            # smaller/cheaper model; unset keeps the prior behavior of summarizing
+            # with the main model.
+            summary_spec = os.environ.get("SUMMARY_MODEL")
+            summary_model = resolve_model(summary_spec) if summary_spec else built_model
+
+            # Tune the auto-summarizer create_deep_agent wires internally (lower
+            # trigger / cheaper summary model) when any compaction knob is set.
+            # Routes the auto summary to SUMMARY_MODEL too, not just /compact.
+            if auto_summarization_tuning_enabled():
+                install_tuned_summarization(
+                    resolve_model(summary_spec) if summary_spec else None
+                )
+
             agent_kwargs: dict[str, Any] = dict(
                 model=built_model,
                 tools=main_tools,
                 system_prompt=SYSTEM_PROMPT + format_agent_memory(agents_md),
                 checkpointer=checkpointer,
                 middleware=[
+                    # Model-call resilience (outermost): provider fallback wraps
+                    # transient-error retry of the primary model.
+                    *build_model_resilience_middleware(resolve_model),
+                    # Tool calls: validate args (reject bad calls without retry),
+                    # serve immutable reads from cache, then retry transient I/O.
                     create_argument_validation_middleware(),
-                    create_forced_summarization_tool_middleware(built_model, backend),
+                    *([cache_mw] if cache_mw is not None else []),
+                    build_tool_retry_middleware(),
+                    create_forced_summarization_tool_middleware(summary_model, backend),
                 ],
                 subagents=subagents,
                 backend=backend,

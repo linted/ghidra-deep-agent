@@ -1,6 +1,11 @@
+import os
+import sys
+import tomllib
+from pathlib import Path
 from typing import Any, cast
 
 from langchain_core.embeddings import Embeddings
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_deepseek import ChatDeepSeek
 
@@ -78,15 +83,82 @@ def build_embeddings(embed_string: str) -> Embeddings:
     )
 
 
-def build_model(model_string: str) -> _ChatDeepSeekFixed | str:
+_OPENROUTER_CONFIG_FILENAME = "openrouter.toml"
+# Cache the parsed presets so we read the file once per process.
+_openrouter_presets_cache: dict[str, dict[str, Any]] | None = None
+
+
+def _openrouter_config_path() -> Path:
+    """Resolve presets path: ``OPENROUTER_CONFIG`` env, else repo-root TOML."""
+    env = os.environ.get("OPENROUTER_CONFIG")
+    if env:
+        return Path(env).expanduser()
+    # models.py -> ghidra_deep_agent -> src -> <repo root>
+    return Path(__file__).resolve().parents[2] / _OPENROUTER_CONFIG_FILENAME
+
+
+def _load_openrouter_presets() -> dict[str, dict[str, Any]]:
+    """Load per-model OpenRouter provider-routing presets from TOML.
+
+    The file is optional: a missing default file means "no presets" (every
+    ``openrouter:`` model resolves as before). An explicitly-pointed
+    ``OPENROUTER_CONFIG`` that is missing/invalid is warned about, not fatal.
+
+    Schema — each model id (the part after ``openrouter:``) maps to OpenRouter's
+    ``provider`` routing object::
+
+        [providers."z-ai/glm-5.2"]
+        order = ["z-ai", "novita"]
+        allow_fallbacks = true
+    """
+    global _openrouter_presets_cache
+    if _openrouter_presets_cache is not None:
+        return _openrouter_presets_cache
+
+    path = _openrouter_config_path()
+    explicit = bool(os.environ.get("OPENROUTER_CONFIG"))
+    presets: dict[str, dict[str, Any]] = {}
+    try:
+        with path.open("rb") as fh:
+            raw = tomllib.load(fh)
+        providers = raw.get("providers", {})
+        if isinstance(providers, dict):
+            presets = {
+                str(model): prefs
+                for model, prefs in providers.items()
+                if isinstance(prefs, dict)
+            }
+    except FileNotFoundError:
+        if explicit:
+            print(
+                f"Warning: OPENROUTER_CONFIG file not found at {path}; "
+                "ignoring provider presets.",
+                file=sys.stderr,
+            )
+    except tomllib.TOMLDecodeError as exc:
+        print(f"Warning: {path} is not valid TOML ({exc}); ignoring.", file=sys.stderr)
+
+    _openrouter_presets_cache = presets
+    return presets
+
+
+def build_model(model_string: str) -> BaseChatModel | str:
     """Return a configured chat model for the given provider:model string.
 
     For DeepSeek models we return _ChatDeepSeekFixed so reasoning_content is
-    correctly round-tripped.  All other provider strings (including
-    ``openrouter:<model>``, resolved via langchain-openrouter's ChatOpenRouter)
-    are returned as-is for init_chat_model to resolve.
+    correctly round-tripped. For ``openrouter:<model>`` models that have a
+    provider-routing preset (see ``openrouter.toml``), we construct
+    ``ChatOpenRouter`` directly with that routing; otherwise the string is
+    returned as-is for init_chat_model to resolve.
     """
     if model_string.startswith("deepseek:"):
         model_name = model_string.split(":", 1)[1]
         return _ChatDeepSeekFixed(model=model_name)
+    if model_string.startswith("openrouter:"):
+        model_id = model_string.split(":", 1)[1]
+        prefs = _load_openrouter_presets().get(model_id)
+        if prefs:
+            from langchain_openrouter import ChatOpenRouter
+
+            return ChatOpenRouter(model=model_id, openrouter_provider=prefs)
     return model_string
