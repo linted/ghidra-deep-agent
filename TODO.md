@@ -22,11 +22,11 @@ Latency
 - [ ] **Route routine/structured-output LLM calls to a smaller, faster model** (model-router at middleware layer)
 - [x] **Batch independent read-only tool calls** — prompt the agent to call independent read-only tools simultaneously. Added "Batch independent tool calls" section to SYSTEM_PROMPT (prompt.py).
 
-Sub-agent design
-- [ ] **`function-analyst` sub-agent (build first)** — decompile/xref/analysis tools behind a delegation boundary so only structured findings return to the main agent
-- [ ] **`program-recon` sub-agent (quick win)** — consolidate the "what binary is this" preamble into one delegation returning a compact JSON brief
-- [ ] **`threat-hunter` sub-agent (latency isolation)** — fan-out-and-aggregate wrapper for the heavy threat-analysis tools off the main critical path
-- [ ] Keep search primitives, knowledge queries, and filesystem tools on the main agent (no sub-agent)
+Sub-agent design — implemented in `src/ghidra_deep_agent/subagents.py` (`build_subagents`), wired via `subagents=` in main.py, delegation guidance in prompt.py. Sub-agents run on `SUBAGENT_MODEL` (defaults to main `MODEL`).
+- [x] **`function-analyst` sub-agent (build first)** — full per-function loop: decompile/xref/analysis + applies renames/retypes/comments/prototype + saves findings; returns a compact summary.
+- [x] **`program-recon` sub-agent (quick win)** — read-only "what binary is this" delegation returning a compact brief.
+- [x] **`threat-hunter` sub-agent (latency isolation)** — isolates the heavy threat-analysis tools off the main critical path; writes findings to the KB, returns a compact summary.
+- [x] Keep search primitives, knowledge queries, and filesystem tools on the main agent (no sub-agent) — prompt steers quick searches/KB queries/filesystem reads to the main agent; sub-agent tool allowlists exclude them.
 
 ### Backlog (deferred — not now)
 - [ ] **Spill large tool outputs to a file instead of re-injecting** — *already implemented in deepagents:* `FilesystemMiddleware` offloads tool results over `tool_token_limit_before_evict` (default 20k tokens / ~80 KB) to `large_tool_results/`, leaving a preview + pointer. The hard part is lowering that threshold: `create_deep_agent` doesn't expose it, hardcodes `FilesystemMiddleware` in 3 places (graph.py:645/720/779), and the clean overrides are blocked — duplicate-instance assertion (factory.py:1080) and `_REQUIRED_MIDDLEWARE` blocks `excluded_middleware` (graph.py:230). Lowering it needs a monkeypatch (subclass + swap `deepagents.graph.FilesystemMiddleware`) or a custom offload middleware (~80 lines). Not worth it now for a non-urgent latency/cost win; revisit if deepagents exposes the knob or context bloat becomes a measured problem.

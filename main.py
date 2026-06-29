@@ -21,6 +21,7 @@ from ghidra_deep_agent.knowledge import build_knowledge_tools
 from ghidra_deep_agent.models import build_embeddings, build_model
 from ghidra_deep_agent.program_resolver import resolve_binary_name
 from ghidra_deep_agent.prompt import SYSTEM_PROMPT, format_agent_memory
+from ghidra_deep_agent.subagents import build_subagents
 from ghidra_deep_agent.tui import GhidraAgentApp
 from ghidra_deep_agent.validation import create_argument_validation_middleware
 
@@ -123,6 +124,22 @@ async def main() -> None:
         knowledge_tools = []
 
     built_model = build_model(model)
+
+    # Sub-agents run on SUBAGENT_MODEL, defaulting to the main model. Reuse the
+    # already-built main model when the string is unchanged to avoid a second
+    # client.
+    subagent_model_string = os.environ.get("SUBAGENT_MODEL", model)
+    built_subagent_model = (
+        built_model
+        if subagent_model_string == model
+        else build_model(subagent_model_string)
+    )
+    subagents = build_subagents(knowledge_tools + tools, built_subagent_model)
+    print(
+        f"Sub-agents ready: {', '.join(s['name'] for s in subagents)}  "
+        f"[model: {subagent_model_string}]"
+    )
+
     recursion_limit = int(os.environ.get("RECURSION_LIMIT", "10000"))
     config = {
         "configurable": {"thread_id": session_id},
@@ -149,6 +166,7 @@ async def main() -> None:
                     create_argument_validation_middleware(),
                     create_forced_summarization_tool_middleware(built_model, backend),
                 ],
+                subagents=subagents,
                 backend=backend,
             )
 
