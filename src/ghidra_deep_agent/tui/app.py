@@ -14,6 +14,7 @@ from textual.timer import Timer
 from textual.widgets import Footer, Header, Input
 from textual.worker import Worker, WorkerState
 
+from ghidra_deep_agent.sessions import SessionStore
 from ghidra_deep_agent.toasts import ToastRequest, register_toast_sink
 from ghidra_deep_agent.tui.events import handle_event
 from ghidra_deep_agent.tui.help_screen import HelpScreen
@@ -24,6 +25,7 @@ from ghidra_deep_agent.tui.messages import (
     TokenUpdate,
     ToolCountChanged,
 )
+from ghidra_deep_agent.tui.session_select import SessionSelectScreen
 from ghidra_deep_agent.tui.widgets import (
     PLACEHOLDER_BUSY,
     PLACEHOLDER_IDLE,
@@ -73,12 +75,16 @@ class GhidraAgentApp(App[None]):
         mcp_ok: bool = True,
         db_ok: bool = True,
         max_context_tokens: int = 200_000,
+        session_store: SessionStore | None = None,
+        binary_name: str = "",
     ) -> None:
         super().__init__()
         self._agent = agent
         self._config = config
         self._model = model
         self._session_id = session_id
+        self._session_store = session_store
+        self._binary_name = binary_name
         self._agent_running = False
         self._agent_worker: Worker[None] | None = None
         self._unregister_toast_sink: Callable[[], None] | None = None
@@ -171,7 +177,19 @@ class GhidraAgentApp(App[None]):
         self._set_busy(True)
         self.query_one(ResponseLog).log_user(display)
         self.query_one(ActivityTree).reset()
+        self._touch_session(display)
         self._agent_worker = self._run_agent(agent_input)
+
+    @work(exclusive=False)
+    async def _touch_session(self, prompt: str) -> None:
+        """Bump the session's activity time (fire-and-forget, best-effort)."""
+        if self._session_store is None:
+            return
+        try:
+            await self._session_store.atouch(self._session_id, first_prompt=prompt)
+        except Exception:
+            # Session bookkeeping must never disrupt the run.
+            pass
 
     def _dispatch_slash(self, command: str) -> None:
         cmd = command.split()[0].lower()
@@ -192,10 +210,47 @@ class GhidraAgentApp(App[None]):
                 "Call the `compact_conversation` tool now to compact the "
                 "conversation history.",
             )
+        elif cmd == "/resume":
+            if self._agent_running:
+                bar.flash("[yellow]Agent still running — please wait.[/yellow]")
+                return
+            self._open_resume_picker()
         elif cmd == "/help":
             self.action_help()
         else:
             bar.flash(f"[red]Unknown command: {cmd}[/red]")
+
+    @work(exclusive=False)
+    async def _open_resume_picker(self) -> None:
+        bar = self.query_one(StatusBar)
+        if self._session_store is None:
+            bar.flash("[yellow]Session registry unavailable.[/yellow]")
+            return
+        store = self._session_store
+        sessions = await store.alist_sessions(self._binary_name)
+        if not sessions:
+            bar.flash("[yellow]No previous sessions for this binary.[/yellow]")
+            return
+
+        async def fetch(show_all: bool) -> list[dict[str, Any]]:
+            return await store.alist_sessions(None if show_all else self._binary_name)
+
+        chosen = await self.push_screen_wait(
+            SessionSelectScreen(sessions, self._session_id, self._binary_name, fetch)
+        )
+        if chosen and chosen != self._session_id:
+            await self._switch_session(chosen)
+
+    async def _switch_session(self, session_id: str) -> None:
+        self._session_id = session_id
+        self._config["configurable"]["thread_id"] = session_id
+        self.action_clear_log()
+        self.sub_title = f"{self._model}  ·  session: {session_id}"
+        if self._session_store is not None:
+            await self._session_store.arecord_start(session_id, self._binary_name)
+        self.query_one(StatusBar).flash(
+            f"[green]Resumed session {session_id[:8]}.[/green]"
+        )
 
     # -- bindings ------------------------------------------------------------
 

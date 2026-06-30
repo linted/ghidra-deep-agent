@@ -1,6 +1,17 @@
 # TODOs
 
 - [ ] **Plan mode for the RE agent**
+- [x] **`/resume` — list & resume previous sessions** — implemented: a dedicated
+  `sessions` collection (`sessions.py`, `SessionStore`/`build_session_store`,
+  `MONGODB_SESSIONS_COLLECTION`) records `{session_id, binary_name, created_at,
+  last_active_at, title}` on session start (main.py) and on each turn (TUI
+  `_touch_session`). The `/resume` TUI command opens a `SessionSelectScreen`
+  modal (`tui/session_select.py`) listing sessions most-recent-first, scoped to
+  the open binary by default with an 'a' key to toggle all binaries; picking one
+  swaps the checkpointer `thread_id`/`session_id` and clears the log (minimal
+  switch — context stays server-side). Degrades gracefully when Mongo is
+  unreachable. Cross-binary resume is a documented soft footgun (tools stay bound
+  to the open binary).
 - [x] **OpenRouter support**
 
 ### From optimization report (2026-06-28, 7d window)
@@ -100,6 +111,35 @@ Design thoughts (from how plan mode works):
     plan-specific system-prompt variant alongside src/ghidra_deep_agent/prompt.py.
   - Reuse the FilesystemBackend already wired up in main.py for writing the
     plan file.
+
+## `/resume` — list & resume previous sessions
+Add a `/resume` slash command (TUI dispatcher in src/ghidra_deep_agent/tui/app.py)
+that lists previous sessions sorted most-recent-first and lets the human pick one
+to continue. Today sessions can only be resumed by passing an explicit
+`--session-id` (main.py:48), with no way to discover what prior session IDs exist
+— `/resume` should surface that list interactively.
+
+Design thoughts:
+- **Where the data lives.** Sessions are persisted as LangGraph checkpoints via
+  `MongoDBSaver` (main.py:120 `MongoDBSaver`, `MONGODB_DB` default
+  `checkpointing_db`), keyed by `thread_id` (= our `session_id`, main.py:57).
+- **Sorting by recency may need a new collection.** The checkpoint documents are
+  not obviously timestamped in a way that's cheap to sort/query by "most recent",
+  and the saver's schema is an implementation detail we shouldn't depend on. We
+  likely need a dedicated **`sessions` collection** that we write a small record
+  to on session start / each turn — e.g. `{session_id, binary_name, created_at,
+  last_active_at, title/summary}` — so `/resume` can do a simple
+  `find().sort("last_active_at", -1)`. (Confirm first whether the checkpoint docs
+  already carry a usable timestamp before adding the collection.)
+- **Filter by open binary.** A `/resume` list is most useful scoped to the
+  binary currently open in Ghidra (we already track `binary_name` for knowledge
+  isolation — main.py:129 `binary_name_override`, `BINARY_NAME`). Default to
+  filtering the list to the current binary, and offer an option to show all
+  sessions across binaries.
+- **Plug-in points:** the `/resume` command in the TUI dispatcher
+  (src/ghidra_deep_agent/tui/app.py); session-record writes wired alongside the
+  `MongoDBSaver`/`binary_name` setup in main.py; reuse the existing `session_id`
+  / `thread_id` plumbing to actually re-attach to the chosen checkpoint thread.
 
 ## OpenRouter support
 Add support for using OpenRouter as a model provider. LangChain should have a

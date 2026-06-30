@@ -11,6 +11,7 @@ _HELP_TEXT = """\
   /clear    clear the response log and activity tree
   /yank     copy the last response to the clipboard
   /compact  compact the conversation history
+  /resume   list & resume a previous session
   /help     show this help
   /quit     exit
 

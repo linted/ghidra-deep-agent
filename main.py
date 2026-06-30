@@ -30,6 +30,7 @@ from ghidra_deep_agent.resilience import (
     build_model_resilience_middleware,
     build_tool_retry_middleware,
 )
+from ghidra_deep_agent.sessions import build_session_store
 from ghidra_deep_agent.subagents import (
     build_main_tools,
     build_subagents,
@@ -134,6 +135,12 @@ async def main() -> None:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    # Registry of resumable sessions backing the TUI's /resume command. None when
+    # MongoDB is unreachable — /resume then reports nothing to resume.
+    session_store = build_session_store(mongodb_uri, mongodb_db)
+    if session_store is not None:
+        session_store.record_start(session_id, binary_name)
+
     try:
         embeddings = build_embeddings(embed_string)
         knowledge_tools = build_knowledge_tools(
@@ -230,6 +237,8 @@ async def main() -> None:
                 mcp_ok=True,
                 db_ok=True,
                 max_context_tokens=ctx_max,
+                session_store=session_store,
+                binary_name=binary_name,
             )
             await app.run_async()
     except ServerSelectionTimeoutError as e:
