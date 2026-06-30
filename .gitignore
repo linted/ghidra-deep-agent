@@ -9,3 +9,4 @@ mongodb/firmware_pwfile
 mongodb/admin_pwfile
 mongodb/tls/
 agent_output*/
+openrouter.toml

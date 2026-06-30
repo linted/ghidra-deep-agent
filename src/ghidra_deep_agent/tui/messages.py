@@ -51,6 +51,14 @@ class TextToken(Message):
         self.text = text
 
 
+class ResponseFinal(Message):
+    """The main agent's final message text, to replace the response buffer."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self.text = text
+
+
 class AgentDone(Message):
     pass
 

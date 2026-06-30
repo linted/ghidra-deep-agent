@@ -4,7 +4,7 @@ from rich.markdown import Markdown
 from rich.rule import Rule
 from textual.widgets import RichLog
 
-from ghidra_deep_agent.tui.messages import AgentDone, TextToken
+from ghidra_deep_agent.tui.messages import AgentDone, ResponseFinal
 
 
 class ResponseLog(RichLog):
@@ -27,8 +27,8 @@ class ResponseLog(RichLog):
         self.write(f"[bold cyan]❯ {shown}[/bold cyan]")
         self.write(Rule(style="dim cyan"))
 
-    def on_text_token(self, msg: TextToken) -> None:
-        self._response_buf += msg.text
+    def on_response_final(self, msg: ResponseFinal) -> None:
+        self._response_buf = msg.text
 
     def on_agent_done(self, _msg: AgentDone) -> None:
         if self._response_buf:

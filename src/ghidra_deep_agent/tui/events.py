@@ -14,6 +14,7 @@ from ghidra_deep_agent.tui.messages import (
     ContextUpdate,
     LLMDone,
     LLMThinking,
+    ResponseFinal,
     StatusFlash,
     TextToken,
     TokenUpdate,
@@ -85,6 +86,11 @@ def handle_event(
             app.post_message(TokenUpdate(usage.input_tokens, usage.output_tokens))
         if not is_compaction and "|" not in checkpoint_ns and usage.input_tokens:
             app.post_message(ContextUpdate(usage.input_tokens))
+        # Capture the main thread's latest message; the final one (the turn that
+        # ends the loop) wins, so the main window renders only that — not the
+        # intermediate narration accumulated mid-run.
+        if not is_compaction and "|" not in checkpoint_ns:
+            response.post_message(ResponseFinal(extract_text(output)))
 
     elif kind == "on_chat_model_stream":
         if is_compaction:
@@ -94,5 +100,4 @@ def handle_event(
             return
         text = extract_text(chunk)
         if text:
-            response.post_message(TextToken(text))
             thinking.post_message(TextToken(text))
