@@ -160,6 +160,47 @@ PLAN_MODE_SYSTEM_PROMPT = (
 )
 
 
+PLAN_CONTEXT_SUMMARY_PROMPT = (
+    "Below is the transcript of a reverse-engineering session with a Ghidra "
+    "agent. Write a concise, factual digest of what has happened so far, for "
+    "use as background context by a separate planning process.\n"
+    "\n"
+    "Capture: the binary/scope under analysis, functions and addresses already "
+    "examined, concrete findings, any renames/retypes/comments already applied, "
+    "the current working hypothesis, and open questions or areas still needing "
+    "investigation. Prefer specifics (names, addresses, evidence) over prose.\n"
+    "\n"
+    "Write in neutral third person about the work — do NOT write in the first "
+    "person and do NOT say what 'you' will do next; this is background, not "
+    "instructions. Keep it compact.\n"
+    "\n"
+    "<transcript>\n{transcript}\n</transcript>"
+)
+
+
+# Frames the marked prior-context summary seeded onto a fresh planning thread,
+# so the planner treats it as background rather than its own investigation.
+MARKED_BACKGROUND = (
+    "=== BACKGROUND FROM THE MAIN ANALYSIS SESSION "
+    "(context only — NOT your own investigation) ===\n"
+    "{summary}\n"
+    "=== END BACKGROUND ===\n"
+    "Use the above only as context for the read-only planning task that follows."
+)
+
+
+# Frames the approved plan handed to the execution agent on the main thread. The
+# full plan text is inlined so it works regardless of backend (with StateBackend
+# the plan file lives in the planning thread's state, invisible to this thread).
+APPROVED_PLAN_INSTRUCTION = (
+    "A separate, read-only planning session produced the following approved "
+    "plan. Plan mode is over — you are no longer read-only. Execute it now, "
+    "applying the changes in Ghidra. Do NOT re-plan, do NOT re-investigate from "
+    "scratch, and do NOT ask for approval again.\n\n"
+    "Plan (`{plan_path}`):\n\n{plan_text}"
+)
+
+
 def format_agent_memory(content: str) -> str:
     """Wrap AGENTS.md content as a system-prompt section, or '' if empty."""
     content = content.strip()

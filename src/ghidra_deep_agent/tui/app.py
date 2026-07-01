@@ -18,9 +18,15 @@ from textual.timer import Timer
 from textual.widgets import Footer, Header, Input
 from textual.worker import Worker, WorkerState
 
+from ghidra_deep_agent.prompt import (
+    APPROVED_PLAN_INSTRUCTION,
+    MARKED_BACKGROUND,
+    PLAN_CONTEXT_SUMMARY_PROMPT,
+)
 from ghidra_deep_agent.sessions import SessionStore
 from ghidra_deep_agent.toasts import ToastRequest, register_toast_sink
 from ghidra_deep_agent.tui.events import handle_event
+from ghidra_deep_agent.tui.formatting import extract_text
 from ghidra_deep_agent.tui.help_screen import HelpScreen
 from ghidra_deep_agent.tui.messages import (
     AgentDone,
@@ -55,6 +61,11 @@ GHIDRA_THEME = Theme(
     dark=True,
     variables={"footer-key-foreground": "#4ebf71"},
 )
+
+
+# Skip building a prior-context summary when the main thread has fewer than this
+# many messages (nothing meaningful to hand the planner yet).
+MIN_MESSAGES_FOR_SUMMARY = 3
 
 
 def _slug(text: str, max_len: int = 40) -> str:
@@ -98,6 +109,7 @@ class GhidraAgentApp(App[None]):
         agent: Any,
         config: dict[str, Any],
         plan_agent: Any = None,
+        summary_model: Any = None,
         model: str = "",
         session_id: str = "",
         mcp_ok: bool = True,
@@ -109,8 +121,15 @@ class GhidraAgentApp(App[None]):
         super().__init__()
         self._agent = agent
         self._plan_agent = plan_agent
+        self._summary_model = summary_model
         self._plan_mode = False
         self._plan_path: str | None = None
+        # Ephemeral planning-thread config, minted per `/plan`, cleared on
+        # approve/cancel. Keeps planning off the main thread.
+        self._plan_config: dict[str, Any] | None = None
+        # Set on fresh plan-mode entry; the first planning turn seeds the marked
+        # background summary and clears it (revisions don't re-seed).
+        self._plan_needs_seed = False
         self._output_dir = os.environ.get("AGENT_OUTPUT_DIR", "")
         self._config = config
         self._model = model
@@ -262,8 +281,7 @@ class GhidraAgentApp(App[None]):
             if not self._plan_mode:
                 bar.flash("[yellow]Not in plan mode.[/yellow]")
                 return
-            self._set_plan_mode(False)
-            self._plan_path = None
+            self._exit_plan_mode()
             bar.flash("[magenta]Plan mode cancelled.[/magenta]")
         elif cmd == "/help":
             self.action_help()
@@ -292,15 +310,21 @@ class GhidraAgentApp(App[None]):
             await self._switch_session(chosen)
 
     async def _switch_session(self, session_id: str) -> None:
+        plan_was_active = self._plan_mode
+        if plan_was_active:
+            # The planning thread was seeded from the old main session; drop it
+            # rather than carry it across a session switch.
+            self._exit_plan_mode()
         self._session_id = session_id
         self._config["configurable"]["thread_id"] = session_id
         self.action_clear_log()
         self.sub_title = f"{self._model}  ·  session: {session_id}"
         if self._session_store is not None:
             await self._session_store.arecord_start(session_id, self._binary_name)
-        self.query_one(StatusBar).flash(
-            f"[green]Resumed session {session_id[:8]}.[/green]"
-        )
+        msg = f"[green]Resumed session {session_id[:8]}.[/green]"
+        if plan_was_active:
+            msg += " [magenta]Plan mode cancelled.[/magenta]"
+        self.query_one(StatusBar).flash(msg)
 
     # -- plan mode -----------------------------------------------------------
 
@@ -309,50 +333,110 @@ class GhidraAgentApp(App[None]):
         self._plan_mode = on
         self.query_one(StatusBar).plan_mode = on
 
-    def _enter_plan_mode(self, goal: str) -> None:
-        """Enter plan mode, minting a fresh timestamped plan file.
+    def _exit_plan_mode(self) -> None:
+        """Leave plan mode and drop the ephemeral planning thread + file."""
+        self._set_plan_mode(False)
+        self._plan_path = None
+        self._plan_config = None
+        self._plan_needs_seed = False
 
-        A new plan file is minted only when entering from the normal state;
-        while already in plan mode the current plan file keeps being revised.
+    def _enter_plan_mode(self, goal: str) -> None:
+        """Enter plan mode, minting a fresh timestamped plan file + thread.
+
+        A new plan file and planning thread are minted only when entering from
+        the normal state; while already in plan mode the current plan file and
+        thread keep being revised (and no background summary is re-seeded).
         """
         bar = self.query_one(StatusBar)
         if not self._plan_mode or self._plan_path is None:
             stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
             self._plan_path = f"plans/{stamp}-{_slug(goal)}.md"
+            self._plan_config = {
+                "configurable": {"thread_id": f"{self._session_id}::plan::{stamp}"},
+                "recursion_limit": self._config.get("recursion_limit", 10000),
+            }
+            self._plan_needs_seed = True
         self._set_plan_mode(True)
         if goal:
             self._start_run("/plan " + goal, goal)
         else:
             bar.flash("[magenta]Plan mode ON — describe what to plan.[/magenta]")
 
+    async def _build_marked_prior_context(self) -> str | None:
+        """Summarize the main session so far into a marked background block.
+
+        Returns None (skip seeding) when there's no summary model, the main
+        thread is empty/tiny, or the summary call fails — the planner then just
+        starts from the goal.
+        """
+        if self._summary_model is None:
+            return None
+        try:
+            state = await self._agent.aget_state(self._config)
+        except Exception:
+            return None
+        messages = state.values.get("messages", [])
+        if len(messages) < MIN_MESSAGES_FOR_SUMMARY:
+            return None
+        from langchain_core.messages import get_buffer_string
+
+        transcript = get_buffer_string(messages, format="xml")
+        try:
+            reply = await self._summary_model.ainvoke(
+                PLAN_CONTEXT_SUMMARY_PROMPT.format(transcript=transcript)
+            )
+        except Exception:
+            return None
+        summary = extract_text(reply).strip()
+        return MARKED_BACKGROUND.format(summary=summary) if summary else None
+
     def _approve_plan(self) -> None:
-        """Leave plan mode and tell the normal agent to execute the plan."""
+        """Leave plan mode and tell the normal agent to execute the plan.
+
+        The plan text is read back from the planning thread and inlined into the
+        instruction (backend-agnostic: with StateBackend the plan file lives in
+        the planning thread's state and is invisible to the main thread). The
+        execution agent runs on the MAIN thread, so it never inherits any
+        planner-authored messages.
+        """
         bar = self.query_one(StatusBar)
         if not self._plan_mode:
             bar.flash("[yellow]Not in plan mode — nothing to approve.[/yellow]")
             return
         plan_path = self._plan_path
-        self._set_plan_mode(False)
-        self._plan_path = None
+        plan_text = (
+            self._read_plan_text(plan_path, self._plan_config)
+            if plan_path and self._plan_config is not None
+            else None
+        )
+        if not plan_text:
+            bar.flash("[yellow]No plan to approve yet — write a plan first.[/yellow]")
+            return
+        self._exit_plan_mode()
         self._start_run(
             "/approve",
-            f"The plan at `{plan_path}` is approved. Read it and execute it now, "
-            "applying the changes in Ghidra.",
+            APPROVED_PLAN_INSTRUCTION.format(plan_path=plan_path, plan_text=plan_text),
         )
 
-    def _read_plan_text(self, plan_path: str) -> str | None:
+    def _read_plan_text(
+        self, plan_path: str, config: dict[str, Any] | None
+    ) -> str | None:
         """Read the current plan back from disk (FilesystemBackend) or state.
 
-        Returns None if it can't be found, so the caller can fall back to the
-        streamed reply (the prompt also makes the model echo the full plan).
+        ``config`` selects which thread's state to read (the planning thread);
+        it is only needed for the StateBackend branch. Returns None if it can't
+        be found, so the caller can fall back to the streamed reply (the prompt
+        also makes the model echo the full plan).
         """
         if self._output_dir:
             try:
                 return (Path(self._output_dir) / plan_path).read_text(encoding="utf-8")
             except OSError:
                 return None
+        if config is None:
+            return None
         try:
-            files = self._plan_agent.get_state(self._config).values.get("files", {})
+            files = self._plan_agent.get_state(config).values.get("files", {})
         except Exception:
             return None
         return _file_content(files.get(plan_path))
@@ -435,28 +519,49 @@ class GhidraAgentApp(App[None]):
 
     @work(exclusive=True)
     async def _run_agent(self, query: str) -> None:
-        # Pick the graph and capture the mode for the lifetime of this turn so a
-        # later mode flip can't change how this run is read back.
+        # Pick the graph AND its thread config together, captured for the lifetime
+        # of this turn so a later mode flip can't change which thread we stream to.
         plan_run = self._plan_mode
         plan_path = self._plan_path
         agent = self._plan_agent if plan_run else self._agent
+        config = self._plan_config if plan_run else self._config
+        response = self.query_one(ResponseLog)
+        if plan_run and config is None:
+            # Programming error: plan mode on but no plan thread minted. Never
+            # fall back to the main config (that reintroduces the bug we fixed).
+            self.query_one(StatusBar).flash(
+                "[red]Plan mode has no thread — aborting run.[/red]"
+            )
+            self._set_busy(False)
+            self.query_one("#query", Input).focus()
+            return
+
+        messages: list[dict[str, str]] = []
+        # On the first planning turn, seed the fresh plan thread with a marked
+        # summary of the main session so far (background, not the planner's work).
+        if plan_run and self._plan_needs_seed:
+            self._plan_needs_seed = False
+            background = await self._build_marked_prior_context()
+            if background:
+                messages.append({"role": "user", "content": background})
         if plan_run and plan_path:
             query = (
                 f"[Plan mode — write/maintain the complete plan at `{plan_path}`]"
                 f"\n\n{query}"
             )
-        input_data = {"messages": [{"role": "user", "content": query}]}
+        messages.append({"role": "user", "content": query})
+        input_data = {"messages": messages}
+
         activity = self.query_one(ActivityTree)
-        response = self.query_one(ResponseLog)
         thinking = self.query_one(ThinkingPanel)
         thinking.reset()
         try:
             async for event in agent.astream_events(
-                input_data, config=self._config, version="v2"
+                input_data, config=config, version="v2"
             ):
                 handle_event(self, event, activity, response, thinking)
             if plan_run and plan_path:
-                plan_text = self._read_plan_text(plan_path)
+                plan_text = self._read_plan_text(plan_path, config)
                 if plan_text:
                     response.log_plan(plan_text)
         except Exception as exc:

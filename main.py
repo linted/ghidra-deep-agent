@@ -263,6 +263,7 @@ async def main() -> None:
             app = GhidraAgentApp(
                 agent=agent,
                 plan_agent=plan_agent,
+                summary_model=summary_model,
                 config=config,
                 model=main_model_spec,
                 session_id=session_id,
