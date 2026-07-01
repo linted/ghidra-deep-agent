@@ -130,6 +130,12 @@ class GhidraAgentApp(App[None]):
         # Set on fresh plan-mode entry; the first planning turn seeds the marked
         # background summary and clears it (revisions don't re-seed).
         self._plan_needs_seed = False
+        # The last top-level assistant reply text, captured synchronously from
+        # the stream loop (see events.py). During plan mode this is the full plan
+        # markdown the planner echoed; `_last_plan_text` snapshots it per turn so
+        # `/approve` never depends on reading the plan file back from disk/state.
+        self._last_reply_text = ""
+        self._last_plan_text: str | None = None
         self._output_dir = os.environ.get("AGENT_OUTPUT_DIR", "")
         self._config = config
         self._model = model
@@ -339,6 +345,7 @@ class GhidraAgentApp(App[None]):
         self._plan_path = None
         self._plan_config = None
         self._plan_needs_seed = False
+        self._last_plan_text = None
 
     def _enter_plan_mode(self, goal: str) -> None:
         """Enter plan mode, minting a fresh timestamped plan file + thread.
@@ -393,18 +400,19 @@ class GhidraAgentApp(App[None]):
     def _approve_plan(self) -> None:
         """Leave plan mode and tell the normal agent to execute the plan.
 
-        The plan text is read back from the planning thread and inlined into the
-        instruction (backend-agnostic: with StateBackend the plan file lives in
-        the planning thread's state and is invisible to the main thread). The
-        execution agent runs on the MAIN thread, so it never inherits any
-        planner-authored messages.
+        The plan text is taken from the planner's streamed reply (captured per
+        turn as `_last_plan_text`), which the plan prompt guarantees contains the
+        full plan markdown. This is backend-agnostic and does not depend on where
+        the planner persisted the plan file — the disk/state read is only a
+        fallback. The execution agent runs on the MAIN thread, so it never
+        inherits any planner-authored messages.
         """
         bar = self.query_one(StatusBar)
         if not self._plan_mode:
             bar.flash("[yellow]Not in plan mode — nothing to approve.[/yellow]")
             return
         plan_path = self._plan_path
-        plan_text = (
+        plan_text = self._last_plan_text or (
             self._read_plan_text(plan_path, self._plan_config)
             if plan_path and self._plan_config is not None
             else None
@@ -555,13 +563,21 @@ class GhidraAgentApp(App[None]):
         activity = self.query_one(ActivityTree)
         thinking = self.query_one(ThinkingPanel)
         thinking.reset()
+        # Reset before streaming so a turn that produces no top-level reply can't
+        # reuse a stale capture (see events.py for where this gets set).
+        self._last_reply_text = ""
         try:
             async for event in agent.astream_events(
                 input_data, config=config, version="v2"
             ):
                 handle_event(self, event, activity, response, thinking)
             if plan_run and plan_path:
-                plan_text = self._read_plan_text(plan_path, config)
+                # The streamed reply is the source of truth for the plan; the
+                # disk/state read is only a fallback. Snapshot it for `/approve`.
+                plan_text = self._last_reply_text or self._read_plan_text(
+                    plan_path, config
+                )
+                self._last_plan_text = plan_text
                 if plan_text:
                     response.log_plan(plan_text)
         except Exception as exc:

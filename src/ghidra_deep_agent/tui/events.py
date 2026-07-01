@@ -90,7 +90,12 @@ def handle_event(
         # ends the loop) wins, so the main window renders only that — not the
         # intermediate narration accumulated mid-run.
         if not is_compaction and "|" not in checkpoint_ns:
-            response.post_message(ResponseFinal(extract_text(output)))
+            text = extract_text(output)
+            # Stash on the app synchronously so `_run_agent` can read it right
+            # after the stream loop (used as the plan text for `/approve`,
+            # independent of the async ResponseFinal/AgentDone message flow).
+            app._last_reply_text = text
+            response.post_message(ResponseFinal(text))
 
     elif kind == "on_chat_model_stream":
         if is_compaction:
