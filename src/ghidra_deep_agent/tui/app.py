@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import os
+import re
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from rich.rule import Rule
@@ -53,6 +57,29 @@ GHIDRA_THEME = Theme(
 )
 
 
+def _slug(text: str, max_len: int = 40) -> str:
+    """A filesystem-safe slug for a plan goal; 'plan' when empty."""
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:max_len].strip("-") or "plan"
+
+
+def _file_content(value: Any) -> str | None:
+    """Best-effort extract text from a deepagents state ``files`` entry."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        content = value.get("content")
+        if isinstance(content, list):
+            return "\n".join(str(line) for line in content)
+        if content is not None:
+            return str(content)
+    if isinstance(value, list):
+        return "\n".join(str(line) for line in value)
+    return None
+
+
 class GhidraAgentApp(App[None]):
     TITLE = "Ghidra Agent"
     CSS_PATH = "styles.tcss"
@@ -70,6 +97,7 @@ class GhidraAgentApp(App[None]):
         self,
         agent: Any,
         config: dict[str, Any],
+        plan_agent: Any = None,
         model: str = "",
         session_id: str = "",
         mcp_ok: bool = True,
@@ -80,6 +108,10 @@ class GhidraAgentApp(App[None]):
     ) -> None:
         super().__init__()
         self._agent = agent
+        self._plan_agent = plan_agent
+        self._plan_mode = False
+        self._plan_path: str | None = None
+        self._output_dir = os.environ.get("AGENT_OUTPUT_DIR", "")
         self._config = config
         self._model = model
         self._session_id = session_id
@@ -215,6 +247,24 @@ class GhidraAgentApp(App[None]):
                 bar.flash("[yellow]Agent still running — please wait.[/yellow]")
                 return
             self._open_resume_picker()
+        elif cmd == "/plan":
+            if self._agent_running:
+                bar.flash("[yellow]Agent still running — please wait.[/yellow]")
+                return
+            goal = command[len(cmd) :].strip()
+            self._enter_plan_mode(goal)
+        elif cmd == "/approve":
+            if self._agent_running:
+                bar.flash("[yellow]Agent still running — please wait.[/yellow]")
+                return
+            self._approve_plan()
+        elif cmd == "/plan-cancel":
+            if not self._plan_mode:
+                bar.flash("[yellow]Not in plan mode.[/yellow]")
+                return
+            self._set_plan_mode(False)
+            self._plan_path = None
+            bar.flash("[magenta]Plan mode cancelled.[/magenta]")
         elif cmd == "/help":
             self.action_help()
         else:
@@ -251,6 +301,61 @@ class GhidraAgentApp(App[None]):
         self.query_one(StatusBar).flash(
             f"[green]Resumed session {session_id[:8]}.[/green]"
         )
+
+    # -- plan mode -----------------------------------------------------------
+
+    def _set_plan_mode(self, on: bool) -> None:
+        """Flip plan mode and mirror it onto the status bar indicator."""
+        self._plan_mode = on
+        self.query_one(StatusBar).plan_mode = on
+
+    def _enter_plan_mode(self, goal: str) -> None:
+        """Enter plan mode, minting a fresh timestamped plan file.
+
+        A new plan file is minted only when entering from the normal state;
+        while already in plan mode the current plan file keeps being revised.
+        """
+        bar = self.query_one(StatusBar)
+        if not self._plan_mode or self._plan_path is None:
+            stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+            self._plan_path = f"plans/{stamp}-{_slug(goal)}.md"
+        self._set_plan_mode(True)
+        if goal:
+            self._start_run("/plan " + goal, goal)
+        else:
+            bar.flash("[magenta]Plan mode ON — describe what to plan.[/magenta]")
+
+    def _approve_plan(self) -> None:
+        """Leave plan mode and tell the normal agent to execute the plan."""
+        bar = self.query_one(StatusBar)
+        if not self._plan_mode:
+            bar.flash("[yellow]Not in plan mode — nothing to approve.[/yellow]")
+            return
+        plan_path = self._plan_path
+        self._set_plan_mode(False)
+        self._plan_path = None
+        self._start_run(
+            "/approve",
+            f"The plan at `{plan_path}` is approved. Read it and execute it now, "
+            "applying the changes in Ghidra.",
+        )
+
+    def _read_plan_text(self, plan_path: str) -> str | None:
+        """Read the current plan back from disk (FilesystemBackend) or state.
+
+        Returns None if it can't be found, so the caller can fall back to the
+        streamed reply (the prompt also makes the model echo the full plan).
+        """
+        if self._output_dir:
+            try:
+                return (Path(self._output_dir) / plan_path).read_text(encoding="utf-8")
+            except OSError:
+                return None
+        try:
+            files = self._plan_agent.get_state(self._config).values.get("files", {})
+        except Exception:
+            return None
+        return _file_content(files.get(plan_path))
 
     # -- bindings ------------------------------------------------------------
 
@@ -330,16 +435,30 @@ class GhidraAgentApp(App[None]):
 
     @work(exclusive=True)
     async def _run_agent(self, query: str) -> None:
+        # Pick the graph and capture the mode for the lifetime of this turn so a
+        # later mode flip can't change how this run is read back.
+        plan_run = self._plan_mode
+        plan_path = self._plan_path
+        agent = self._plan_agent if plan_run else self._agent
+        if plan_run and plan_path:
+            query = (
+                f"[Plan mode — write/maintain the complete plan at `{plan_path}`]"
+                f"\n\n{query}"
+            )
         input_data = {"messages": [{"role": "user", "content": query}]}
         activity = self.query_one(ActivityTree)
         response = self.query_one(ResponseLog)
         thinking = self.query_one(ThinkingPanel)
         thinking.reset()
         try:
-            async for event in self._agent.astream_events(
+            async for event in agent.astream_events(
                 input_data, config=self._config, version="v2"
             ):
                 handle_event(self, event, activity, response, thinking)
+            if plan_run and plan_path:
+                plan_text = self._read_plan_text(plan_path)
+                if plan_text:
+                    response.log_plan(plan_text)
         except Exception as exc:
             response.write(Rule(style="red"))
             response.write(f"[bold red]✗ Error: {exc}[/bold red]")

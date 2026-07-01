@@ -9,7 +9,17 @@ from textual.widgets import Input
 PLACEHOLDER_IDLE = "Enter task (Ctrl+C quit · /help for commands)…"
 PLACEHOLDER_BUSY = "Agent is running… type ahead, Enter to queue"
 
-SLASH_COMMANDS = ["/clear", "/compact", "/help", "/quit", "/resume", "/yank"]
+SLASH_COMMANDS = [
+    "/approve",
+    "/clear",
+    "/compact",
+    "/help",
+    "/plan",
+    "/plan-cancel",
+    "/quit",
+    "/resume",
+    "/yank",
+]
 
 
 class CommandInput(Input):

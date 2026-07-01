@@ -33,6 +33,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
 
 from ghidra_deep_agent.models import build_model
+from ghidra_deep_agent.prompt import RESEARCH_SUBAGENT_PROMPT
 from ghidra_deep_agent.resilience import (
     build_model_resilience_middleware,
     build_tool_retry_middleware,
@@ -43,6 +44,29 @@ _DEFAULT_MODEL = "anthropic:claude-sonnet-4-6"
 _CONFIG_FILENAME = "subagents.toml"
 # `tools = "*"` in the config means "every available tool".
 _ALL_TOOLS = "*"
+
+# Tools that mutate the Ghidra DB or persist knowledge — excluded from plan mode.
+# Read-only is then "everything else", so newly added read tools are auto-covered.
+# This frozenset is the single source of truth for what "read-only" means, shared
+# by ``build_research_subagent`` and ``build_plan_mode_main_tools``.
+PLAN_MODE_BLOCKED_TOOLS = frozenset(
+    {
+        "rename_function",
+        "rename_variable",
+        "set_local_variable_type",
+        "set_decompiler_variable_type",
+        "set_parameter_type",
+        "set_function_prototype",
+        "set_decompiler_comment",
+        "set_disassembly_comment",
+        "batch_rename_function_components",
+        "batch_add_function_tags",
+        "save_knowledge",  # KB writes blocked too
+        "update_knowledge",
+    }
+)
+# The read-only research sub-agent's name, referenced by both graphs.
+RESEARCH_SUBAGENT_NAME = "research"
 
 ModelResolver = Callable[[str | None], str | BaseChatModel]
 
@@ -287,3 +311,63 @@ def build_subagents(
         }
         specs.append(spec)
     return specs
+
+
+# --- Plan mode (read-only) -----------------------------------------------------
+
+
+def _read_only_tools(all_tools: Sequence[BaseTool]) -> list[BaseTool]:
+    """Every tool except the mutating ones in ``PLAN_MODE_BLOCKED_TOOLS``."""
+    return [tool for tool in all_tools if tool.name not in PLAN_MODE_BLOCKED_TOOLS]
+
+
+def build_research_subagent(
+    all_tools: Sequence[BaseTool],
+    config: AgentConfig,
+    resolve_model: ModelResolver,
+    *,
+    cache_middleware: AgentMiddleware | None = None,
+) -> SubAgent:
+    """Build the read-only ``research`` sub-agent shared by both graphs.
+
+    It holds every tool except ``PLAN_MODE_BLOCKED_TOOLS`` (so it cannot mutate
+    the Ghidra DB or write the knowledge base), runs on the default model, and
+    uses the same per-sub-agent middleware stack as ``build_subagents``.
+    """
+    _ = config  # signature parity / future per-config tuning
+    return {
+        "name": RESEARCH_SUBAGENT_NAME,
+        "description": (
+            "Read-only deep-investigation specialist. Decompiles, disassembles, "
+            "traces cross-references, runs threat scans, and queries the "
+            "knowledge base to gather evidence, but applies NO changes (cannot "
+            "mutate Ghidra or write the knowledge base). Delegate when you want "
+            "analysis/evidence without applying it."
+        ),
+        "system_prompt": RESEARCH_SUBAGENT_PROMPT,
+        "tools": _read_only_tools(all_tools),
+        "model": resolve_model(None),
+        "middleware": [
+            *build_model_resilience_middleware(resolve_model),
+            create_argument_validation_middleware(),
+            *([cache_middleware] if cache_middleware is not None else []),
+            build_tool_retry_middleware(),
+        ],
+    }
+
+
+def build_plan_mode_main_tools(
+    all_tools: Sequence[BaseTool], config: AgentConfig
+) -> list[BaseTool]:
+    """The plan-mode coordinator's tools: ``build_main_tools`` minus mutations.
+
+    Drops ``save_knowledge``/``update_knowledge`` (and any other blocked tool),
+    keeping read-only navigation/search + knowledge-base reads. Filesystem
+    ``write_file``/``read_file``/``edit_file`` come from middleware, so the plan
+    can still be written to disk.
+    """
+    return [
+        tool
+        for tool in build_main_tools(all_tools, config)
+        if tool.name not in PLAN_MODE_BLOCKED_TOOLS
+    ]

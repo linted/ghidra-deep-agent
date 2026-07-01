@@ -20,6 +20,14 @@ class ResponseLog(RichLog):
         self.transcript = []
         return super().clear()
 
+    def log_plan(self, text: str) -> None:
+        """Render the authoritative current plan read back from disk/state."""
+        self.transcript.append(text)
+        self.write(Rule(style="dim magenta"))
+        self.write("[bold magenta]📋 Current plan[/bold magenta]")
+        self.write(Rule(style="dim magenta"))
+        self.write(Markdown(text))
+
     def log_user(self, text: str) -> None:
         self.transcript.append(f"❯ {text}")
         self.write(Rule(style="dim cyan"))

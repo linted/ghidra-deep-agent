@@ -1,6 +1,21 @@
 # TODOs
 
-- [ ] **Plan mode for the RE agent**
+- [x] **Plan mode for the RE agent** — implemented as a separate read-only agent
+  graph rather than a tool-blocking middleware. A `PLAN_MODE_BLOCKED_TOOLS` denylist
+  (`subagents.py`) defines the mutating tools (Ghidra renames/retypes/comments/
+  prototypes + `save_knowledge`/`update_knowledge`); read-only is "everything else".
+  `build_research_subagent` builds a shared read-only `research` sub-agent (full tool
+  set minus the denylist) used by **both** the normal coordinator (delegate
+  investigation without applying changes) and a new plan-mode coordinator graph
+  (`build_plan_mode_main_tools` + `PLAN_MODE_SYSTEM_PROMPT`), built in main.py and
+  passed to the TUI. Both graphs share the checkpointer `thread_id`/backend so
+  history + the plan file carry over. TUI (`tui/app.py`): `/plan [goal]` mints a
+  fresh timestamped `plans/<ts>-<slug>.md`, flips a magenta **PLAN** status chip, and
+  routes every typed message through the plan graph (re-writing/overwriting that file
+  each turn and reading it back as the authoritative "Current plan" block); `/approve`
+  exits and tells the normal agent to execute; `/plan-cancel` exits without executing.
+  Durable plans need `AGENT_OUTPUT_DIR` (FilesystemBackend); otherwise the plan lives
+  in agent state and is read back from there.
 - [x] **`/resume` — list & resume previous sessions** — implemented: a dedicated
   `sessions` collection (`sessions.py`, `SessionStore`/`build_session_store`,
   `MONGODB_SESSIONS_COLLECTION`) records `{session_id, binary_name, created_at,
@@ -41,6 +56,10 @@ Sub-agent design — implemented in `src/ghidra_deep_agent/subagents.py` (`build
 - [x] Keep search primitives, knowledge queries, and filesystem tools on the main agent (no sub-agent) — prompt steers quick searches/KB queries/filesystem reads to the main agent; sub-agent tool allowlists exclude them.
 
 ### Backlog (deferred — not now)
+- [ ] **TUI approval affordance for plan mode** — replace/augment the `/approve`
+  command with an interactive popup or buttons to **Approve / Reject / Keep working**
+  on the plan (modal in the `SessionSelectScreen` style, `tui/session_select.py`),
+  instead of a typed command.
 - [ ] **Spill large tool outputs to a file instead of re-injecting** — *already implemented in deepagents:* `FilesystemMiddleware` offloads tool results over `tool_token_limit_before_evict` (default 20k tokens / ~80 KB) to `large_tool_results/`, leaving a preview + pointer. The hard part is lowering that threshold: `create_deep_agent` doesn't expose it, hardcodes `FilesystemMiddleware` in 3 places (graph.py:645/720/779), and the clean overrides are blocked — duplicate-instance assertion (factory.py:1080) and `_REQUIRED_MIDDLEWARE` blocks `excluded_middleware` (graph.py:230). Lowering it needs a monkeypatch (subclass + swap `deepagents.graph.FilesystemMiddleware`) or a custom offload middleware (~80 lines). Not worth it now for a non-urgent latency/cost win; revisit if deepagents exposes the knob or context bloat becomes a measured problem.
 - [ ] **Add graph-level timeout & error boundary** to top-level LangGraph — wall-clock timeout (~20 min) / recursion limit with graceful early-exit returning partial findings
 - [ ] **Bound `task` sub-agents** — max tool-call rounds + wall-clock timeout, return partial results on expiry

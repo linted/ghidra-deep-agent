@@ -25,7 +25,11 @@ from ghidra_deep_agent.knowledge import build_knowledge_tools
 from ghidra_deep_agent.mcp_cache import build_mcp_cache_middleware
 from ghidra_deep_agent.models import build_embeddings
 from ghidra_deep_agent.program_resolver import resolve_binary_name
-from ghidra_deep_agent.prompt import SYSTEM_PROMPT, format_agent_memory
+from ghidra_deep_agent.prompt import (
+    PLAN_MODE_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+    format_agent_memory,
+)
 from ghidra_deep_agent.resilience import (
     build_model_resilience_middleware,
     build_tool_retry_middleware,
@@ -33,6 +37,8 @@ from ghidra_deep_agent.resilience import (
 from ghidra_deep_agent.sessions import build_session_store
 from ghidra_deep_agent.subagents import (
     build_main_tools,
+    build_plan_mode_main_tools,
+    build_research_subagent,
     build_subagents,
     load_agent_config,
     make_model_resolver,
@@ -161,9 +167,16 @@ async def main() -> None:
     # Shared across the coordinator and sub-agents: one cache for the whole
     # session (same binary, same Mongo collection). None when disabled/unreachable.
     cache_mw = build_mcp_cache_middleware(mongodb_uri, mongodb_db, binary_name)
+    # The read-only `research` sub-agent is shared by both graphs: the normal
+    # coordinator gets it (read-only deep investigation without applying changes)
+    # and the plan-mode graph uses it as its only delegate.
+    research_sub = build_research_subagent(
+        all_tools, agent_config, resolve_model, cache_middleware=cache_mw
+    )
     subagents = build_subagents(
         all_tools, agent_config, resolve_model, cache_middleware=cache_mw
     )
+    subagents.append(research_sub)
     print(f"Main agent: {main_model_spec}  [{len(main_tools)} tool(s)]")
     for sub_cfg in agent_config.subagents:
         print(
@@ -202,27 +215,45 @@ async def main() -> None:
                     resolve_model(summary_spec) if summary_spec else None
                 )
 
+            # Shared by both graphs (normal + plan mode). Built once so the two
+            # agents carry identical middleware behavior.
+            shared_middleware: list[Any] = [
+                # Model-call resilience (outermost): provider fallback wraps
+                # transient-error retry of the primary model.
+                *build_model_resilience_middleware(resolve_model),
+                # Tool calls: validate args (reject bad calls without retry),
+                # serve immutable reads from cache, then retry transient I/O.
+                create_argument_validation_middleware(),
+                *([cache_mw] if cache_mw is not None else []),
+                build_tool_retry_middleware(),
+                create_forced_summarization_tool_middleware(summary_model, backend),
+            ]
+
             agent_kwargs: dict[str, Any] = dict(
                 model=built_model,
                 tools=main_tools,
                 system_prompt=SYSTEM_PROMPT + format_agent_memory(agents_md),
                 checkpointer=checkpointer,
-                middleware=[
-                    # Model-call resilience (outermost): provider fallback wraps
-                    # transient-error retry of the primary model.
-                    *build_model_resilience_middleware(resolve_model),
-                    # Tool calls: validate args (reject bad calls without retry),
-                    # serve immutable reads from cache, then retry transient I/O.
-                    create_argument_validation_middleware(),
-                    *([cache_mw] if cache_mw is not None else []),
-                    build_tool_retry_middleware(),
-                    create_forced_summarization_tool_middleware(summary_model, backend),
-                ],
+                middleware=shared_middleware,
                 subagents=subagents,
                 backend=backend,
             )
 
             agent = create_deep_agent(**agent_kwargs)
+
+            # Plan-mode graph: read-only coordinator (no mutating tools) whose
+            # only delegate is the shared read-only `research` sub-agent. Shares
+            # the checkpointer thread_id and backend with `agent`, so conversation
+            # history and the plan file carry over when the human approves.
+            plan_agent = create_deep_agent(
+                model=built_model,
+                tools=build_plan_mode_main_tools(all_tools, agent_config),
+                system_prompt=PLAN_MODE_SYSTEM_PROMPT + format_agent_memory(agents_md),
+                checkpointer=checkpointer,
+                middleware=shared_middleware,
+                subagents=[research_sub],
+                backend=backend,
+            )
 
             profile = getattr(built_model, "profile", None) or {}
             ctx_max = profile.get("max_input_tokens") or int(
@@ -231,6 +262,7 @@ async def main() -> None:
 
             app = GhidraAgentApp(
                 agent=agent,
+                plan_agent=plan_agent,
                 config=config,
                 model=main_model_spec,
                 session_id=session_id,

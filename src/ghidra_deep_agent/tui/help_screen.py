@@ -12,6 +12,9 @@ _HELP_TEXT = """\
   /yank     copy the last response to the clipboard
   /compact  compact the conversation history
   /resume   list & resume a previous session
+  /plan [goal]  enter read-only plan mode (investigate & draft a plan)
+  /approve  approve the current plan and execute it
+  /plan-cancel  leave plan mode without executing
   /help     show this help
   /quit     exit
 

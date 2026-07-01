@@ -18,6 +18,7 @@ class StatusBar(Static):
     current_context: reactive[int] = reactive(0)
     max_context: reactive[int] = reactive(200_000)
     active_tools: reactive[int] = reactive(0)
+    plan_mode: reactive[bool] = reactive(False)
     flash_text: reactive[str] = reactive("")
 
     def on_mount(self) -> None:
@@ -48,6 +49,9 @@ class StatusBar(Static):
     def watch_active_tools(self, _old: int, _new: int) -> None:
         self._refresh_status()
 
+    def watch_plan_mode(self, _old: bool, _new: bool) -> None:
+        self._refresh_status()
+
     def watch_flash_text(self, _old: str, _new: str) -> None:
         self._refresh_status()
 
@@ -72,17 +76,16 @@ class StatusBar(Static):
         toks_out = fmt_tokens(self.output_tokens)
         ctx = self._format_context()
         sep = " [dim]│[/dim] "
-        self.update(
-            sep.join(
-                [
-                    f" mcp {mcp}  db {db}",
-                    f"⏱ {elapsed}",
-                    f"↓ {toks_in} in · ↑ {toks_out} out",
-                    ctx,
-                    f"⚙ {self.active_tools} active",
-                ]
-            )
-        )
+        segments = [
+            f" mcp {mcp}  db {db}",
+            f"⏱ {elapsed}",
+            f"↓ {toks_in} in · ↑ {toks_out} out",
+            ctx,
+            f"⚙ {self.active_tools} active",
+        ]
+        if self.plan_mode:
+            segments.insert(0, "[magenta]PLAN[/magenta]")
+        self.update(sep.join(segments))
 
     def _format_context(self) -> str:
         max_ctx = max(self.max_context, 1)
