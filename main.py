@@ -40,6 +40,7 @@ from ghidra_deep_agent.subagents import (
     build_plan_mode_main_tools,
     build_research_subagent,
     build_subagents,
+    filter_withheld_tools,
     load_agent_config,
     make_model_resolver,
     resolve_model_spec,
@@ -160,7 +161,7 @@ async def main() -> None:
     # Resolve per-agent models and tool sets from the config. The coordinator
     # gets a restricted, high-level tool set; sub-agents are built from the full
     # tool list so their allowlists are unaffected by that restriction.
-    all_tools = knowledge_tools + tools
+    all_tools = filter_withheld_tools(knowledge_tools + tools)
     built_model = resolve_model(agent_config.main_model)
     main_model_spec = resolve_model_spec(agent_config.main_model, agent_config)
     main_tools = build_main_tools(all_tools, agent_config)

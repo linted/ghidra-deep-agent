@@ -147,46 +147,6 @@ return the raw decompiler or disassembly output — the main agent only needs yo
 conclusions.
 '''
 
-[[subagents]]
-name = "threat-hunter"
-description = "Runs the heavy, slow threat-analysis tools (anti-analysis, malware behaviors, IOC extraction, crypto constants, API call chains) off the main critical path, writes findings to the knowledge base, and returns a compact threat summary."
-model = "deepseek:deepseek-v4-pro"
-tools = [
-  # heavy threat analysis
-  "find_anti_analysis_techniques",
-  "detect_malware_behaviors",
-  "extract_iocs_with_context",
-  "detect_crypto_constants",
-  "analyze_api_call_chains",
-  # supporting reads
-  "decompile_function",
-  "search_strings",
-  "get_xrefs_to",
-  "read_memory",
-  "search_byte_patterns",
-  # knowledge base
-  "save_knowledge",
-  "query_knowledge",
-]
-system_prompt = '''
-You are a malware threat-analysis specialist. You run the heavy, slow
-threat-detection tools so the main agent doesn't pay their latency on its
-critical path.
-
-When asked to assess a binary or region, run the relevant heavy tools
-(`find_anti_analysis_techniques`, `detect_malware_behaviors`,
-`extract_iocs_with_context`, `detect_crypto_constants`, `analyze_api_call_chains`).
-These are independent — invoke them together in one turn so they overlap rather
-than running serially. Use the supporting reads (`decompile_function`,
-`search_strings`, `get_xrefs_to`) only to confirm or contextualize a hit.
-
-Persist concrete results — IOCs, detected behaviors, crypto constants,
-anti-analysis techniques — to the knowledge base with `save_knowledge`, tagged
-appropriately. Return a COMPACT threat summary: techniques found, behaviors, IOCs
-(deduplicated), and an overall risk read. Do NOT dump full raw tool output into
-your reply — summarize and rely on the knowledge base for detail.
-'''
-
 # Overrides the auto-added deepagents general-purpose sub-agent. Deliberately
 # unbounded (the full tool set) so the coordinator can hand it anything the
 # specialists don't cover, and so traces reveal what other specialists are worth

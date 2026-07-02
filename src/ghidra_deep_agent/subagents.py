@@ -65,6 +65,20 @@ PLAN_MODE_BLOCKED_TOOLS = frozenset(
         "update_knowledge",
     }
 )
+# Tools withheld from every agent: expensive to run with high false-positive
+# rates and little real benefit. Filtered out of the full tool set once at
+# startup (main.py), before any per-agent selection — the only reliable block,
+# since `tools = "*"` agents and the read-only research sub-agent would otherwise
+# still receive them. (analyze_api_call_chains is heavy but useful — NOT here.)
+WITHHELD_TOOLS = frozenset(
+    {
+        "detect_malware_behaviors",
+        "detect_crypto_constants",
+        "find_anti_analysis_techniques",
+        "extract_iocs_with_context",
+    }
+)
+
 # The read-only research sub-agent's name, referenced by both graphs.
 RESEARCH_SUBAGENT_NAME = "research"
 
@@ -262,6 +276,11 @@ def _select(
             file=sys.stderr,
         )
     return selected
+
+
+def filter_withheld_tools(all_tools: Sequence[BaseTool]) -> list[BaseTool]:
+    """Drop globally-withheld tools from the full tool set (see main.py)."""
+    return [tool for tool in all_tools if tool.name not in WITHHELD_TOOLS]
 
 
 def build_main_tools(
