@@ -19,6 +19,7 @@ class StatusBar(Static):
     max_context: reactive[int] = reactive(200_000)
     active_tools: reactive[int] = reactive(0)
     plan_mode: reactive[bool] = reactive(False)
+    ask_mode: reactive[bool] = reactive(False)
     flash_text: reactive[str] = reactive("")
 
     def on_mount(self) -> None:
@@ -50,6 +51,9 @@ class StatusBar(Static):
         self._refresh_status()
 
     def watch_plan_mode(self, _old: bool, _new: bool) -> None:
+        self._refresh_status()
+
+    def watch_ask_mode(self, _old: bool, _new: bool) -> None:
         self._refresh_status()
 
     def watch_flash_text(self, _old: str, _new: str) -> None:
@@ -85,6 +89,8 @@ class StatusBar(Static):
         ]
         if self.plan_mode:
             segments.insert(0, "[magenta]PLAN[/magenta]")
+        elif self.ask_mode:
+            segments.insert(0, "[cyan]ASK[/cyan]")
         self.update(sep.join(segments))
 
     def _format_context(self) -> str:

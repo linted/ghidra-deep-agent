@@ -15,6 +15,8 @@ _HELP_TEXT = """\
   /plan [goal]  enter read-only plan mode (investigate & draft a plan)
   /approve  approve the current plan and execute it
   /plan-cancel  leave plan mode without executing
+  /ask [question(s)]  enter read-only ask mode (answer questions, no changes)
+  /ask-cancel  leave ask mode
   /help     show this help
   /quit     exit
 

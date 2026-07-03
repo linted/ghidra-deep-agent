@@ -11,6 +11,8 @@ PLACEHOLDER_BUSY = "Agent is running… type ahead, Enter to queue"
 
 SLASH_COMMANDS = [
     "/approve",
+    "/ask",
+    "/ask-cancel",
     "/clear",
     "/compact",
     "/help",
