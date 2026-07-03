@@ -16,8 +16,8 @@ default = "deepseek:deepseek-v4-pro"
 
 [main]
 # The coordinator: orchestrates sub-agents, navigates/searches, and uses the
-# knowledge base. It does NOT decompile, disassemble, xref, run threat tools, or
-# mutate Ghidra — those are delegated to sub-agents.
+# knowledge base. It does NOT decompile, disassemble, xref, or mutate Ghidra —
+# those are delegated to sub-agents.
 model = "openrouter:z-ai/glm-5.2"
 # model = "openrouter:cohere/north-mini-code:free"
 tools = [
@@ -32,12 +32,12 @@ tools = [
   "save_knowledge",
   "update_knowledge",
   # read-only navigation / search
-  "get_current_program_info",
-  "list_functions",
-  "list_imports",
-  "list_exports",
+  "get_binary_info",
+  "get_functions",
+  "get_imports",
+  "get_exports",
   "get_entry_points",
-  "search_functions",
+  "search_functions_by_name",
   "search_strings",
 ]
 
@@ -46,10 +46,10 @@ name = "program-recon"
 description = "Read-only reconnaissance. Delegate at the start of a session to get a compact brief on an unfamiliar binary (format, architecture, entry points, notable imports/exports/strings, prior knowledge)."
 model = "deepseek:deepseek-v4-pro"
 tools = [
-  "get_current_program_info",
-  "list_functions",
-  "list_imports",
-  "list_exports",
+  "get_binary_info",
+  "get_functions",
+  "get_imports",
+  "get_exports",
   "get_entry_points",
   "search_strings",
   "get_knowledge_summary",
@@ -87,30 +87,22 @@ description = "Deep analysis of one function (or a few related ones). It decompi
 model = "deepseek:deepseek-v4-pro"
 tools = [
   # analysis (read)
-  "decompile_function",
-  "batch_decompile",
-  "disassemble_function",
-  "get_function_by_address",
-  "get_function_callers",
-  "get_function_callees",
-  "get_function_xrefs",
-  "get_xrefs_to",
-  "get_xrefs_from",
-  "read_memory",
-  "search_instructions",
-  "analyze_function_complete",
-  "analyze_data_region",
-  # mutations (apply)
-  "rename_function",
-  "rename_variable",
-  "set_local_variable_type",
-  "set_decompiler_variable_type",
-  "set_parameter_type",
-  "set_function_prototype",
-  "set_decompiler_comment",
-  "set_disassembly_comment",
-  "batch_rename_function_components",
-  "batch_add_function_tags",
+  "get_code",             # decompiler / disassembly / pcode (format arg)
+  "disassemble_at",
+  "analyze_function",
+  "get_function_stack_layout",
+  "get_basic_blocks",
+  "xrefs",                # callers/callees, xrefs to/from an address or function
+  "get_data_at",
+  "get_data_vars",
+  # mutations (apply) — action-based consolidated tools
+  "rename_symbol",        # function / data / variable
+  "batch_rename",
+  "variables",            # action: rename / set_type / set_prototype (+ list)
+  "comments",             # action: set / remove (+ get / list)
+  "types",                # action: set / delete (+ list / get_info)
+  "struct",               # create / modify / set_field / ... (+ field_xrefs)
+  "create_function",
   # knowledge base (read + write)
   "save_knowledge",
   "update_knowledge",
@@ -132,13 +124,18 @@ For each function you are asked to analyze:
 6. Query the knowledge base (`query_knowledge`, `query_by_address`) for prior
    findings before deciding anything.
 
-Then APPLY what the evidence supports, directly in Ghidra:
-- Rename variables/parameters to reflect purpose (e.g. `local_10` -> `file_size`).
-- Set correct types (e.g. `int` -> `FILE *`).
-- Rename the function and update its prototype to the real signature.
-- Add inline comments at non-obvious instructions.
-Use lowercase snake_case unless the binary uses another convention; prefix
-uncertain names with `maybe_`. Never rename or retype on speculation alone.
+Then APPLY what the evidence supports, directly in Ghidra using the action-based
+tools (pass the exact `action`/`format`/target from each tool's schema):
+- Rename variables/parameters to purpose (`variables` with `action: rename`;
+  e.g. `local_10` -> `file_size`).
+- Set correct types (`variables` with `action: retype`; e.g. `int` -> `FILE *`).
+- Rename the function (`rename_symbol`) and set its prototype (`variables` with
+  `action: set_prototype`) to the real signature.
+- Add inline comments at non-obvious instructions (`comments` with `action: set`).
+- Recover structures with `struct` and register types with `types` as warranted.
+Read code with `get_code` (`format: decompiler`/`disassembly`). Use lowercase
+snake_case unless the binary uses another convention; prefix uncertain names with
+`maybe_`. Never rename or retype on speculation alone.
 
 Save every finding and decision to the knowledge base with `save_knowledge` (even
 partial or low-confidence ones). When done, return a COMPACT summary: what the
@@ -155,42 +152,23 @@ conclusions.
 # is omitted so it uses deepagents' stock general-purpose prompt.
 [[subagents]]
 name = "general-purpose"
-description = "Catch-all for small, well-defined one-off tasks the specialist sub-agents don't cover. Has the full tool set (all Ghidra tools + knowledge + filesystem). Prefer program-recon / function-analyst / threat-hunter when the task fits their domain."
+description = "Catch-all for small, well-defined one-off tasks the specialist sub-agents don't cover. Has the full tool set (all Ghidra tools + knowledge + filesystem). Prefer program-recon / function-analyst / research when the task fits their domain."
 tools = "*"
 # model omitted -> inherits default/MODEL
 # exclude = ["save_knowledge", "update_knowledge"]  # uncomment to make it read-only on the KB
 
-# Read-only, Ghidra-only prototype auditor. `tools = "*"` grants every tool, and
-# `exclude` removes (a) the mutating Ghidra + KB-write tools so it can't change
-# anything, and (b) the read-only knowledge-base tools so it only ever inspects
-# Ghidra. model omitted -> inherits default/MODEL.
+# Read-only, Ghidra-only prototype auditor. Given an explicit read-only allowlist
+# (no mutation and no knowledge-base tools) so it can only ever inspect Ghidra.
+# model omitted -> inherits default/MODEL.
 [[subagents]]
 name = "prototype-auditor"
 description = "Read-only, Ghidra-only prototype auditor. Given a set of functions, checks whether each declared prototype has the correct number of parameters by examining call-site argument setup and callee prologue register usage in the assembly. Applies NO changes and does not use the knowledge base — returns a terse list of only the functions that need a fix and the corrected prototype. Delegate a batch of functions to validate their signatures."
-tools = "*"
-exclude = [
-  # mutating Ghidra + knowledge writes
-  "rename_function",
-  "rename_variable",
-  "set_local_variable_type",
-  "set_decompiler_variable_type",
-  "set_parameter_type",
-  "set_function_prototype",
-  "set_decompiler_comment",
-  "set_disassembly_comment",
-  "batch_rename_function_components",
-  "batch_add_function_tags",
-  "save_knowledge",
-  "update_knowledge",
-  # read-only knowledge-base tools (Ghidra-only auditor)
-  "query_knowledge",
-  "query_knowledge_global",
-  "query_by_address",
-  "query_by_category",
-  "query_by_tags",
-  "get_knowledge_summary",
-  "list_all_knowledge",
-  "list_analyzed_binaries",
+tools = [
+  "analyze_function",
+  "get_code",
+  "xrefs",
+  "get_function_stack_layout",
+  "get_basic_blocks",
 ]
 system_prompt = '''
 You are a read-only prototype auditor for reverse engineering in Ghidra. You are
@@ -201,15 +179,15 @@ knowledge-base tools and never mutate the Ghidra database; do not ask for such
 tools.
 
 For each function in the set:
-1. Read the current prototype with `get_function_by_address` — note the declared
+1. Read the current prototype with `analyze_function` — note the declared
    parameter count and the calling convention.
 2. Determine the ACTUAL parameter count from the assembly:
-   - Callee side: `disassemble_function` and inspect the prologue — which argument
-     registers (per the ABI: x86-64 SysV rdi, rsi, rdx, rcx, r8, r9; ARM64 x0-x7;
-     adjust for the binary's architecture/convention) and incoming stack slots are
-     READ before being written. A register read before it is written is an
-     incoming parameter.
-   - Caller side: find call sites via `get_function_callers` / `get_xrefs_to`,
+   - Callee side: read the disassembly (`get_code` with `format: disassembly`)
+     and inspect the prologue — which argument registers (per the ABI: x86-64
+     SysV rdi, rsi, rdx, rcx, r8, r9; ARM64 x0-x7; adjust for the binary's
+     architecture/convention) and incoming stack slots are READ before being
+     written. A register read before it is written is an incoming parameter.
+   - Caller side: find call sites with `xrefs` (references TO the function),
      disassemble around each call, and see which argument registers / stack slots
      are SET UP immediately before the call instruction.
    Reconcile the two: the true parameter count is what callers pass and the callee
@@ -224,9 +202,9 @@ OUTPUT — a terse list containing ONLY the functions whose prototype needs to
 change. One line per function:
   <address> <name>: declared <N> params, actual <M> - <corrected prototype>
 Give the corrected prototype string (return type + parameter list) so it can be
-applied directly with `set_function_prototype`. Include NOTHING else: no
-explanations, no per-function narrative, no raw decompiler/disassembly dumps, and
-no functions whose prototype is already correct. If every function in the set is
-already correct, reply with a single line saying so.
+applied directly (via `variables` with `action: set_prototype`). Include NOTHING
+else: no explanations, no per-function narrative, no raw decompiler/disassembly
+dumps, and no functions whose prototype is already correct. If every function in
+the set is already correct, reply with a single line saying so.
 '''
 

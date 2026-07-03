@@ -45,37 +45,68 @@ _CONFIG_FILENAME = "subagents.toml"
 # `tools = "*"` in the config means "every available tool".
 _ALL_TOOLS = "*"
 
-# Tools that mutate the Ghidra DB or persist knowledge — excluded from plan mode.
-# Read-only is then "everything else", so newly added read tools are auto-covered.
-# This frozenset is the single source of truth for what "read-only" means, shared
-# by ``build_research_subagent`` and ``build_plan_mode_main_tools``.
+# GhidrAssistMCP write tools that must be dropped entirely from a read-only
+# context: each one mutates the program/project (or the knowledge base) with no
+# read mode to preserve. Read-only is then "everything else", so newly added
+# *read* tools are auto-covered. Shared by ``build_research_subagent`` and
+# ``build_plan_mode_main_tools``. Dual read/write tools (``variables``,
+# ``comments``, ``types``, ``struct``, ``bookmarks``) are NOT dropped here — they
+# keep their read actions and have their write actions blocked via
+# ``READ_ONLY_WRITE_ACTIONS`` (see ``validation.py``).
 PLAN_MODE_BLOCKED_TOOLS = frozenset(
     {
-        "rename_function",
-        "rename_variable",
-        "set_local_variable_type",
-        "set_decompiler_variable_type",
-        "set_parameter_type",
-        "set_function_prototype",
-        "set_decompiler_comment",
-        "set_disassembly_comment",
-        "batch_rename_function_components",
-        "batch_add_function_tags",
+        "rename_symbol",
+        "batch_rename",
+        "create_function",
+        "create_data_var",
+        "assemble_code",
+        "patch_bytes",
+        "disassemble_at",  # converts undefined bytes to instructions / clears units
+        "open_program",
+        "close_program",
+        "import_file",
+        "export_program",
+        "scripts",
+        "project_files",  # has a `delete` action
+        "analysis_options",
+        "analysis_control",
         "save_knowledge",  # KB writes blocked too
         "update_knowledge",
     }
 )
-# Tools withheld from every agent: expensive to run with high false-positive
-# rates and little real benefit. Filtered out of the full tool set once at
-# startup (main.py), before any per-agent selection — the only reliable block,
-# since `tools = "*"` agents and the read-only research sub-agent would otherwise
-# still receive them. (analyze_api_call_chains is heavy but useful — NOT here.)
+# Write ``action`` values on GhidrAssistMCP's consolidated read/write tools. In a
+# read-only context these actions are rejected by the argument-validation
+# middleware while the tool's read actions (list/get/field_xrefs) still work.
+# Action strings verified against the live server's tool schemas.
+READ_ONLY_WRITE_ACTIONS: dict[str, frozenset[str]] = {
+    "variables": frozenset({"rename", "retype", "set_prototype"}),
+    "comments": frozenset({"set", "remove"}),
+    "types": frozenset(
+        {"set", "delete", "create_struct", "create_enum", "create_typedef"}
+    ),
+    "struct": frozenset(
+        {
+            "create",
+            "modify",
+            "merge",
+            "set_field",
+            "name_gap",
+            "auto_create",
+            "rename_field",
+        }
+    ),
+    "bookmarks": frozenset({"set", "remove"}),
+}
+# Tools withheld from every agent: expensive to run and prone to hanging the
+# session for little benefit. Filtered out of the full tool set once at startup
+# (main.py), before any per-agent selection — the only reliable block, since
+# `tools = "*"` agents and the read-only research sub-agent would otherwise still
+# receive them. ``analyze_program`` runs full Ghidra Auto Analysis over the whole
+# program; the expected workflow is to analyze in the Ghidra GUI first, so the
+# agent triggering (or re-triggering) it is both slow and rarely wanted.
 WITHHELD_TOOLS = frozenset(
     {
-        "detect_malware_behaviors",
-        "detect_crypto_constants",
-        "find_anti_analysis_techniques",
-        "extract_iocs_with_context",
+        "analyze_program",
     }
 )
 
@@ -297,13 +328,15 @@ def build_subagents(
     resolve_model: ModelResolver,
     *,
     cache_middleware: AgentMiddleware | None = None,
+    async_middleware: AgentMiddleware | None = None,
 ) -> list[SubAgent]:
     """Build ``SubAgent`` specs from config, filtered against the live tools.
 
     Each sub-agent gets its own middleware (sub-agent middleware does not inherit
     from the main agent): model resilience (retry + optional provider fallback),
-    argument validation, the shared immutable-read cache (when enabled), and
-    transient filesystem-tool retry. Plus its resolved model.
+    argument validation, the shared immutable-read cache (when enabled),
+    async-task resolution, and transient filesystem-tool retry. Plus its resolved
+    model.
     """
     by_name = {tool.name: tool for tool in all_tools}
     specs: list[SubAgent] = []
@@ -325,6 +358,8 @@ def build_subagents(
                 *build_model_resilience_middleware(resolve_model),
                 create_argument_validation_middleware(),
                 *([cache_middleware] if cache_middleware is not None else []),
+                # Inside the cache so resolved (not stub) results are cached.
+                *([async_middleware] if async_middleware is not None else []),
                 build_tool_retry_middleware(),
             ],
         }
@@ -336,7 +371,12 @@ def build_subagents(
 
 
 def _read_only_tools(all_tools: Sequence[BaseTool]) -> list[BaseTool]:
-    """Every tool except the mutating ones in ``PLAN_MODE_BLOCKED_TOOLS``."""
+    """Every tool except the write-only ones in ``PLAN_MODE_BLOCKED_TOOLS``.
+
+    Consolidated read/write tools (``variables``/``comments``/``types``/
+    ``struct``/``bookmarks``) are kept — their write ``action``s are blocked at
+    call time by the read-only argument-validation middleware, not here.
+    """
     return [tool for tool in all_tools if tool.name not in PLAN_MODE_BLOCKED_TOOLS]
 
 
@@ -346,6 +386,7 @@ def build_research_subagent(
     resolve_model: ModelResolver,
     *,
     cache_middleware: AgentMiddleware | None = None,
+    async_middleware: AgentMiddleware | None = None,
 ) -> SubAgent:
     """Build the read-only ``research`` sub-agent shared by both graphs.
 
@@ -358,7 +399,7 @@ def build_research_subagent(
         "name": RESEARCH_SUBAGENT_NAME,
         "description": (
             "Read-only deep-investigation specialist. Decompiles, disassembles, "
-            "traces cross-references, runs threat scans, and queries the "
+            "traces cross-references, and queries the "
             "knowledge base to gather evidence, but applies NO changes (cannot "
             "mutate Ghidra or write the knowledge base). Delegate when you want "
             "analysis/evidence without applying it."
@@ -368,8 +409,12 @@ def build_research_subagent(
         "model": resolve_model(None),
         "middleware": [
             *build_model_resilience_middleware(resolve_model),
-            create_argument_validation_middleware(),
+            # Read-only: also reject write `action`s on consolidated read/write
+            # tools (variables/comments/types/struct/bookmarks).
+            create_argument_validation_middleware(READ_ONLY_WRITE_ACTIONS),
             *([cache_middleware] if cache_middleware is not None else []),
+            # Inside the cache so resolved (not stub) results are cached.
+            *([async_middleware] if async_middleware is not None else []),
             build_tool_retry_middleware(),
         ],
     }

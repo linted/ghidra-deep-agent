@@ -56,6 +56,23 @@ Sub-agent design — implemented in `src/ghidra_deep_agent/subagents.py` (`build
 - [x] Keep search primitives, knowledge queries, and filesystem tools on the main agent (no sub-agent) — prompt steers quick searches/KB queries/filesystem reads to the main agent; sub-agent tool allowlists exclude them.
 
 ### Backlog (deferred — not now)
+- [ ] **Adopt GhidrAssistMCP MCP resources & prompts** — the new server (see the
+  GhidrAssistMCP migration) exposes, beyond tools, **6 MCP resources**
+  (`ghidra://program/{name}/info` / `functions` / `strings` / `imports` /
+  `exports` / `segments`) and **7 MCP prompts** (`analyze_function`,
+  `identify_vulnerability`, `document_function`, `trace_data_flow`,
+  `trace_network_data`, `compare_functions`, `reverse_engineer_struct`). We
+  currently consume neither. Investigate whether they can upgrade our stack:
+  (a) **resources** could replace some `program-recon`/coordinator read *tool*
+  calls with cheaper resource reads (and langchain_mcp_adapters can surface MCP
+  resources) — worth checking if this trims recon round-trips/latency; (b)
+  **prompts** are server-authored, RE-specific prompt templates that may be
+  worth folding into (or benchmarking against) our own sub-agent system prompts
+  in `subagents.toml` / `prompt.py` (e.g. `reverse_engineer_struct` vs. the
+  `struct` workflow, `trace_data_flow` vs. `function-analyst`). Plug-in points:
+  `MultiServerMCPClient` already loaded in main.py (it can also list resources/
+  prompts); decide per-item whether to wire in or borrow the wording. Low
+  urgency — a capability-upgrade exploration, not a fix.
 - [ ] **TUI approval affordance for plan mode** — replace/augment the `/approve`
   command with an interactive popup or buttons to **Approve / Reject / Keep working**
   on the plan (modal in the `SessionSelectScreen` style, `tui/session_select.py`),
