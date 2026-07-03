@@ -26,6 +26,7 @@ from ghidra_deep_agent.mcp_cache import build_mcp_cache_middleware
 from ghidra_deep_agent.models import build_embeddings
 from ghidra_deep_agent.program_resolver import resolve_binary_name
 from ghidra_deep_agent.prompt import (
+    ASK_MODE_SYSTEM_PROMPT,
     PLAN_MODE_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     format_agent_memory,
@@ -256,6 +257,22 @@ async def main() -> None:
                 backend=backend,
             )
 
+            # Ask-mode graph: read-only question-answering coordinator. Keeps the
+            # full coordinator tool set (all knowledge tools + read-only
+            # navigation/search — no Ghidra mutations) so it can record durable
+            # findings, and delegates investigation to the shared read-only
+            # `research` sub-agent. Shares the checkpointer/backend; runs on its
+            # own ephemeral thread minted by the TUI.
+            ask_agent = create_deep_agent(
+                model=built_model,
+                tools=main_tools,
+                system_prompt=ASK_MODE_SYSTEM_PROMPT + format_agent_memory(agents_md),
+                checkpointer=checkpointer,
+                middleware=shared_middleware,
+                subagents=[research_sub],
+                backend=backend,
+            )
+
             profile = getattr(built_model, "profile", None) or {}
             ctx_max = profile.get("max_input_tokens") or int(
                 os.environ.get("MAX_CONTEXT_TOKENS", "200000")
@@ -264,6 +281,7 @@ async def main() -> None:
             app = GhidraAgentApp(
                 agent=agent,
                 plan_agent=plan_agent,
+                ask_agent=ask_agent,
                 summary_model=summary_model,
                 config=config,
                 model=main_model_spec,
