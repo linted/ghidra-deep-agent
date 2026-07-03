@@ -15,6 +15,7 @@ from langchain_mcp_adapters.interceptors import MCPToolCallRequest
 from langgraph.checkpoint.mongodb import MongoDBSaver
 from pymongo.errors import ServerSelectionTimeoutError
 
+from ghidra_deep_agent.async_tasks import build_async_task_middleware
 from ghidra_deep_agent.compaction import (
     auto_summarization_tuning_enabled,
     create_forced_summarization_tool_middleware,
@@ -87,13 +88,9 @@ async def main() -> None:
                 file=sys.stderr,
             )
 
-    transport_desc = mcp_config["ghidra"].get("transport", "stdio")
-    if transport_desc == "stdio":
-        cmd = mcp_config["ghidra"].get("command", "ghidra-mcp")
-        print(f"Connecting to Ghidra MCP server [stdio: {cmd}]...")
-    else:
-        url = mcp_config["ghidra"].get("url", "")
-        print(f"Connecting to Ghidra MCP server [{transport_desc}: {url}]...")
+    transport_desc = mcp_config["ghidra"].get("transport", "http")
+    url = mcp_config["ghidra"].get("url", "")
+    print(f"Connecting to Ghidra MCP server [{transport_desc}: {url}]...")
 
     async def handle_mcp_errors(request: MCPToolCallRequest, handler: Any) -> Any:
         try:
@@ -107,8 +104,9 @@ async def main() -> None:
     except Exception as exc:
         print(f"Failed to connect to Ghidra MCP server: {exc}", file=sys.stderr)
         print(
-            "Set GHIDRA_MCP_TRANSPORT, GHIDRA_MCP_URL, or "
-            "GHIDRA_MCP_COMMAND as needed.",
+            "Ensure Ghidra is running with the GhidrAssistMCP plugin enabled "
+            "(MCP server on) and a program open, then set GHIDRA_MCP_TRANSPORT / "
+            "GHIDRA_MCP_URL as needed.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -169,14 +167,28 @@ async def main() -> None:
     # Shared across the coordinator and sub-agents: one cache for the whole
     # session (same binary, same Mongo collection). None when disabled/unreachable.
     cache_mw = build_mcp_cache_middleware(mongodb_uri, mongodb_db, binary_name)
+    # GhidrAssistMCP runs slow tools (e.g. get_code) as async tasks that return a
+    # task_id stub; this middleware polls get_task_status so the agent sees the
+    # resolved result. None when the server exposes no get_task_status tool.
+    async_mw = build_async_task_middleware(tools)
+    if async_mw is not None:
+        print("Async task resolution enabled (polling get_task_status).")
     # The read-only `research` sub-agent is shared by both graphs: the normal
     # coordinator gets it (read-only deep investigation without applying changes)
     # and the plan-mode graph uses it as its only delegate.
     research_sub = build_research_subagent(
-        all_tools, agent_config, resolve_model, cache_middleware=cache_mw
+        all_tools,
+        agent_config,
+        resolve_model,
+        cache_middleware=cache_mw,
+        async_middleware=async_mw,
     )
     subagents = build_subagents(
-        all_tools, agent_config, resolve_model, cache_middleware=cache_mw
+        all_tools,
+        agent_config,
+        resolve_model,
+        cache_middleware=cache_mw,
+        async_middleware=async_mw,
     )
     subagents.append(research_sub)
     # Plan mode's delegates: the shared read-only `research` agent plus the
@@ -240,9 +252,12 @@ async def main() -> None:
                 # transient-error retry of the primary model.
                 *build_model_resilience_middleware(resolve_model),
                 # Tool calls: validate args (reject bad calls without retry),
-                # serve immutable reads from cache, then retry transient I/O.
+                # serve immutable reads from cache, resolve async task stubs
+                # (inside the cache so resolved results are what gets cached),
+                # then retry transient I/O.
                 create_argument_validation_middleware(),
                 *([cache_mw] if cache_mw is not None else []),
+                *([async_mw] if async_mw is not None else []),
                 build_tool_retry_middleware(),
                 create_forced_summarization_tool_middleware(summary_model, backend),
             ]

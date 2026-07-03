@@ -1,6 +1,6 @@
 # ghidra-deep-agent
 
-A reverse engineering agent built on the [LangChain Deep Agents SDK](https://docs.langchain.com/oss/python/deepagents/overview). It connects to a running Ghidra instance through the [ghidra-mcp](https://github.com/bethington/ghidra-mcp) MCP server and iteratively analyzes binaries — reading assembly, understanding behavior, and writing its findings back into the Ghidra project as renamed functions, typed variables, and updated prototypes.
+A reverse engineering agent built on the [LangChain Deep Agents SDK](https://docs.langchain.com/oss/python/deepagents/overview). It connects to a running Ghidra instance through the [GhidrAssistMCP](https://github.com/symgraph/GhidrAssistMCP) MCP server and iteratively analyzes binaries — reading assembly, understanding behavior, and writing its findings back into the Ghidra project as renamed functions, typed variables, and updated prototypes.
 
 ## How it works
 
@@ -22,7 +22,7 @@ The knowledge base is scoped per binary — each program analyzed gets its own i
 
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
-- A running [ghidra-mcp](https://github.com/bethington/ghidra-mcp) server (stdio, HTTP, or SSE)
+- Ghidra 11.4+ (tested with 12.1) with the [GhidrAssistMCP](https://github.com/symgraph/GhidrAssistMCP) extension installed and its MCP server enabled (HTTP or SSE)
 - MongoDB instance (local or remote)
 - An Anthropic API key (or any other supported LangChain model provider)
 - [Ollama](https://ollama.com/) (for the vector knowledge base embeddings)
@@ -64,10 +64,8 @@ All configuration is done via environment variables (`.env` file or shell export
 | `MONGODB_TOOL_CACHE_TTL` | `86400` | Cache entry lifetime in seconds (TTL index); sized to a session |
 | `MONGODB_TOOL_CACHE_TOOLS` | *(immutable read set)* | Comma-separated allowlist override; empty disables the cache |
 | `BINARY_NAME` | *(auto-detected)* | Override the binary name used to scope the knowledge base — see [Binary selection](#binary-selection) |
-| `GHIDRA_MCP_TRANSPORT` | `stdio` | Transport type: `stdio`, `http`, or `sse` |
-| `GHIDRA_MCP_COMMAND` | `ghidra-mcp` | *(stdio only)* Command to launch the MCP bridge |
-| `GHIDRA_MCP_ARGS` | *(empty)* | *(stdio only)* Extra CLI flags, space-separated |
-| `GHIDRA_MCP_URL` | `http://localhost:8080/mcp` | *(http/sse only)* URL of the MCP server |
+| `GHIDRA_MCP_TRANSPORT` | `http` | Transport type: `http` or `sse` (GhidrAssistMCP is HTTP-only) |
+| `GHIDRA_MCP_URL` | `http://localhost:8080/mcp` | URL of the GhidrAssistMCP server (`/mcp` for http, `/sse` for sse) |
 | `AGENT_OUTPUT_DIR` | *(unset)* | Optional directory the agent can read/write files in |
 | `RECURSION_LIMIT` | `100` | LangGraph recursion limit for deep analysis sessions |
 | `AGENTS_MD` | *(unset)* | Optional path to an `AGENTS.md` memory file |
@@ -124,25 +122,33 @@ With no file present, OpenRouter's default routing is used. See
 
 ### Transport options
 
-**stdio** (default) — the agent spawns the MCP bridge as a subprocess:
-```env
-GHIDRA_MCP_TRANSPORT=stdio
-GHIDRA_MCP_COMMAND=ghidra-mcp
-```
+The agent connects to [GhidrAssistMCP](https://github.com/symgraph/GhidrAssistMCP),
+a Ghidra 11.4+/12.1 extension that serves MCP over HTTP. Enable the plugin in
+Ghidra (Window → GhidrAssistMCP → turn the MCP server on) with a program open,
+then point the agent at it:
 
-**HTTP / SSE** — connect to an already-running MCP server:
+**HTTP** (default):
 ```env
 GHIDRA_MCP_TRANSPORT=http
 GHIDRA_MCP_URL=http://localhost:8080/mcp
 ```
 
+**SSE**:
+```env
+GHIDRA_MCP_TRANSPORT=sse
+GHIDRA_MCP_URL=http://localhost:8080/sse
+```
+
+> GhidrAssistMCP listens on port `8080` by default. If another service uses that
+> port, change it in the GhidrAssistMCP control panel and update `GHIDRA_MCP_URL`.
+
 ### Binary selection
 
-At startup the agent calls `list_open_programs` on the Ghidra MCP server to determine which binary you are working on. This name is used to scope all knowledge base reads and writes so findings from different binaries never mix.
+At startup the agent calls `list_binaries` on the Ghidra MCP server to determine which binary you are working on. This name is used to scope all knowledge base reads and writes so findings from different binaries never mix.
 
 - **One program open** — selected automatically, printed to console.
 - **Multiple programs open** — a selection screen appears before the main TUI; use arrow keys and Enter to choose.
-- **Override** — set `BINARY_NAME` in `.env` or pass `--binary-name` on the command line to skip detection entirely (useful for scripting or when the MCP server doesn't expose `list_open_programs`).
+- **Override** — set `BINARY_NAME` in `.env` or pass `--binary-name` on the command line to skip detection entirely (useful for scripting or when the MCP server doesn't expose `list_binaries`).
 
 ```env
 BINARY_NAME=firmware_v2.bin

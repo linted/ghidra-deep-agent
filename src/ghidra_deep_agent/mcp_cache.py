@@ -40,14 +40,14 @@ from pymongo.collection import Collection
 
 # Read tools whose output is invariant for a program regardless of any renames /
 # retypes / comments the agent applies during the session. Deliberately
-# conservative: tools like ``list_functions`` / ``search_functions`` are excluded
-# because renaming a function changes their output mid-session.
+# conservative: tools like ``get_functions`` / ``search_functions_by_name`` are
+# excluded because renaming a function changes their output mid-session.
 _DEFAULT_CACHED_TOOLS = (
     "search_strings",
-    "list_imports",
-    "list_exports",
+    "get_imports",
+    "get_exports",
     "get_entry_points",
-    "get_current_program_info",
+    "get_binary_info",
 )
 
 _TTL_INDEX_NAME = "created_at_ttl"
