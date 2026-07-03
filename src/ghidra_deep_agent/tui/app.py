@@ -144,6 +144,11 @@ class GhidraAgentApp(App[None]):
         # `/approve` never depends on reading the plan file back from disk/state.
         self._last_reply_text = ""
         self._last_plan_text: str | None = None
+        # Async-task middleware bookkeeping (see tui/events.py): run_ids of hidden
+        # `get_task_status` polls, and task_id -> run_id for async tool calls whose
+        # "completed" marker is deferred until ASYNC_DONE_EVENT arrives.
+        self._hidden_tool_runs: set[str] = set()
+        self._pending_async: dict[str, str] = {}
         self._output_dir = os.environ.get("AGENT_OUTPUT_DIR", "")
         self._config = config
         self._model = model

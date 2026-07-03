@@ -22,6 +22,7 @@ from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ToolCallRequest
+from langchain_core.callbacks import adispatch_custom_event, dispatch_custom_event
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.types import Command
@@ -32,6 +33,12 @@ _STUB_MARKER = "Task submitted for async execution"
 _TASK_ID_RE = re.compile(r"Task ID:\s*(\S+)")
 # A poll response still in flight.
 _IN_FLIGHT = ("Status: RUNNING", "Status: PENDING")
+
+# Custom event this middleware dispatches once an async task finishes (resolved
+# or timed out), carrying ``{"task_id": ...}``. The TUI uses it to defer the
+# originating tool's "completed" marker until the real result is in (the tool's
+# own on_tool_end fires early, with the submission stub). See tui/events.py.
+ASYNC_DONE_EVENT = "ghidra_async_done"
 
 
 def _to_text(value: Any) -> str:
@@ -76,6 +83,18 @@ def _is_in_flight(content: str) -> bool:
     return any(flag in content for flag in _IN_FLIGHT)
 
 
+def async_task_id(output: Any) -> str | None:
+    """Return the async task id if ``output`` is a submission stub, else ``None``.
+
+    Public helper for the TUI: an async tool's own ``on_tool_end`` fires early
+    with this stub, so the TUI keys the deferred completion on the returned id
+    and matches it against the ``ASYNC_DONE_EVENT`` this middleware dispatches.
+    """
+    # A tool-end event's output may be a ToolMessage or the raw content.
+    content = getattr(output, "content", output)
+    return _task_id(_to_text(content))
+
+
 class AsyncTaskMiddleware(AgentMiddleware):
     """Poll ``get_task_status`` so async tool results resolve transparently."""
 
@@ -84,12 +103,18 @@ class AsyncTaskMiddleware(AgentMiddleware):
         status_tool: BaseTool,
         *,
         timeout_s: float = 180.0,
-        poll_interval_s: float = 1.0,
+        initial_interval_s: float = 0.25,
+        factor: float = 1.6,
+        max_interval_s: float = 2.0,
     ) -> None:
         super().__init__()
         self._status = status_tool
         self._timeout = timeout_s
-        self._interval = poll_interval_s
+        # Exponential backoff between polls: quick at first (fast tasks resolve in
+        # a poll or two) then backing off so long tasks don't hammer the server.
+        self._initial_interval = initial_interval_s
+        self._factor = factor
+        self._max_interval = max_interval_s
 
     def _replace(self, result: ToolMessage, content: Any) -> ToolMessage:
         return ToolMessage(
@@ -98,6 +123,9 @@ class AsyncTaskMiddleware(AgentMiddleware):
             tool_call_id=result.tool_call_id,
             status=result.status,
         )
+
+    def _next_interval(self, interval: float) -> float:
+        return min(interval * self._factor, self._max_interval)
 
     # --- sync ------------------------------------------------------------------
 
@@ -115,13 +143,21 @@ class AsyncTaskMiddleware(AgentMiddleware):
             return result
         assert isinstance(result, ToolMessage)
         deadline = time.monotonic() + self._timeout
+        interval = self._initial_interval
         while True:
             text = _to_text(self._status.invoke({"task_id": task_id}))
-            if not _is_in_flight(text):
+            if not _is_in_flight(text) or time.monotonic() >= deadline:
+                self._signal_done(task_id)
                 return self._replace(result, text)
-            if time.monotonic() >= deadline:
-                return self._replace(result, text)
-            time.sleep(self._interval)
+            time.sleep(interval)
+            interval = self._next_interval(interval)
+
+    def _signal_done(self, task_id: str) -> None:
+        """Tell the TUI the async task finished (see ASYNC_DONE_EVENT)."""
+        try:
+            dispatch_custom_event(ASYNC_DONE_EVENT, {"task_id": task_id})
+        except Exception:  # noqa: BLE001 - purely a UI hint; never break the call
+            pass
 
     # --- async -----------------------------------------------------------------
 
@@ -139,13 +175,21 @@ class AsyncTaskMiddleware(AgentMiddleware):
             return result
         assert isinstance(result, ToolMessage)
         deadline = time.monotonic() + self._timeout
+        interval = self._initial_interval
         while True:
             text = _to_text(await self._status.ainvoke({"task_id": task_id}))
-            if not _is_in_flight(text):
+            if not _is_in_flight(text) or time.monotonic() >= deadline:
+                await self._asignal_done(task_id)
                 return self._replace(result, text)
-            if time.monotonic() >= deadline:
-                return self._replace(result, text)
-            await asyncio.sleep(self._interval)
+            await asyncio.sleep(interval)
+            interval = self._next_interval(interval)
+
+    async def _asignal_done(self, task_id: str) -> None:
+        """Tell the TUI the async task finished (see ASYNC_DONE_EVENT)."""
+        try:
+            await adispatch_custom_event(ASYNC_DONE_EVENT, {"task_id": task_id})
+        except Exception:  # noqa: BLE001 - purely a UI hint; never break the call
+            pass
 
 
 def build_async_task_middleware(
@@ -160,5 +204,13 @@ def build_async_task_middleware(
     if status_tool is None:
         return None
     timeout_s = float(os.environ.get("GHIDRA_ASYNC_TIMEOUT", "180"))
-    poll_s = float(os.environ.get("GHIDRA_ASYNC_POLL_INTERVAL", "1"))
-    return AsyncTaskMiddleware(status_tool, timeout_s=timeout_s, poll_interval_s=poll_s)
+    initial_s = float(os.environ.get("GHIDRA_ASYNC_POLL_INTERVAL", "0.25"))
+    factor = float(os.environ.get("GHIDRA_ASYNC_POLL_FACTOR", "1.6"))
+    max_s = float(os.environ.get("GHIDRA_ASYNC_POLL_MAX", "2.0"))
+    return AsyncTaskMiddleware(
+        status_tool,
+        timeout_s=timeout_s,
+        initial_interval_s=initial_s,
+        factor=factor,
+        max_interval_s=max_s,
+    )

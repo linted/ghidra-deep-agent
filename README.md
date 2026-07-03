@@ -66,6 +66,10 @@ All configuration is done via environment variables (`.env` file or shell export
 | `BINARY_NAME` | *(auto-detected)* | Override the binary name used to scope the knowledge base — see [Binary selection](#binary-selection) |
 | `GHIDRA_MCP_TRANSPORT` | `http` | Transport type: `http` or `sse` (GhidrAssistMCP is HTTP-only) |
 | `GHIDRA_MCP_URL` | `http://localhost:8080/mcp` | URL of the GhidrAssistMCP server (`/mcp` for http, `/sse` for sse) |
+| `GHIDRA_ASYNC_POLL_INTERVAL` | `0.25` | Initial gap (s) between async-task status polls; grows with backoff |
+| `GHIDRA_ASYNC_POLL_FACTOR` | `1.6` | Backoff multiplier applied to the poll gap after each poll |
+| `GHIDRA_ASYNC_POLL_MAX` | `2.0` | Cap (s) on the async-task poll gap |
+| `GHIDRA_ASYNC_TIMEOUT` | `180` | Give up waiting on an async task after this many seconds |
 | `AGENT_OUTPUT_DIR` | *(unset)* | Optional directory the agent can read/write files in |
 | `RECURSION_LIMIT` | `100` | LangGraph recursion limit for deep analysis sessions |
 | `AGENTS_MD` | *(unset)* | Optional path to an `AGENTS.md` memory file |

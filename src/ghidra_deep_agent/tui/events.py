@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from ghidra_deep_agent.async_tasks import ASYNC_DONE_EVENT, async_task_id
 from ghidra_deep_agent.tui.formatting import (
     extract_output_snippet,
     extract_preview,
@@ -54,6 +55,12 @@ def handle_event(
 
     if kind == "on_tool_start":
         name = event.get("name", "")
+        # The async-task middleware polls `get_task_status` internally; those
+        # polls surface as tool runs but aren't the agent's work, so hide them
+        # (tracking the run_id keeps the paired on_tool_end + counter balanced).
+        if name == "get_task_status":
+            app._hidden_tool_runs.add(run_id)
+            return
         raw_input = event.get("data", {}).get("input", {})
         preview = extract_preview(raw_input)
         is_subagent = name == "task"
@@ -63,11 +70,28 @@ def handle_event(
         app.post_message(ToolCountChanged(1))
 
     elif kind == "on_tool_end":
+        if run_id in app._hidden_tool_runs:
+            app._hidden_tool_runs.discard(run_id)
+            return
         output = event.get("data", {}).get("output")
         error = bool(event.get("data", {}).get("error"))
+        # An async tool's own on_tool_end fires immediately with a submission
+        # stub, before the real result is polled. Defer its "completed" marker:
+        # remember the node by task_id and complete it on ASYNC_DONE_EVENT.
+        task_id = async_task_id(output) if not error else None
+        if task_id is not None:
+            app._pending_async[task_id] = run_id
+            return
         snippet = extract_output_snippet(output) if error else ""
         activity.post_message(ToolEnded(run_id, error, snippet))
         app.post_message(ToolCountChanged(-1))
+
+    elif kind == "on_custom_event" and event.get("name") == ASYNC_DONE_EVENT:
+        task_id = event.get("data", {}).get("task_id")
+        run = app._pending_async.pop(task_id, None) if task_id else None
+        if run is not None:
+            activity.post_message(ToolEnded(run))
+            app.post_message(ToolCountChanged(-1))
 
     elif kind == "on_chat_model_start":
         if is_compaction:
