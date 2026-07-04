@@ -293,15 +293,30 @@ async def main() -> None:
             # full coordinator tool set (all knowledge tools + read-only
             # navigation/search — no Ghidra mutations) so it can record durable
             # findings, and delegates investigation to the shared read-only
-            # `research` sub-agent. Shares the checkpointer/backend; runs on its
-            # own ephemeral thread minted by the TUI.
+            # `research` sub-agent plus the read-only, config-defined
+            # `vuln-hunter` (pulled out of the built config sub-agents by name)
+            # so exploitability questions can be routed to it. Both are
+            # read-only, safe for ask mode. Shares the checkpointer/backend; runs
+            # on its own ephemeral thread minted by the TUI.
+            ask_mode_subagents = [research_sub]
+            vuln_hunter_sub = next(
+                (s for s in subagents if s.get("name") == "vuln-hunter"), None
+            )
+            if vuln_hunter_sub is not None:
+                ask_mode_subagents.append(vuln_hunter_sub)
+            else:
+                print(
+                    "Warning: 'vuln-hunter' sub-agent not found in config; "
+                    "ask mode will run without it.",
+                    file=sys.stderr,
+                )
             ask_agent = create_deep_agent(
                 model=built_model,
                 tools=main_tools,
                 system_prompt=ASK_MODE_SYSTEM_PROMPT + format_agent_memory(agents_md),
                 checkpointer=checkpointer,
                 middleware=shared_middleware,
-                subagents=[research_sub],
+                subagents=ask_mode_subagents,
                 backend=backend,
             )
 
