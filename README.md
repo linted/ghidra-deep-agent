@@ -63,6 +63,7 @@ All configuration is done via environment variables (`.env` file or shell export
 | `MONGODB_TOOL_CACHE_COLLECTION` | `tool_cache` | Collection caching immutable read-only MCP tool results |
 | `MONGODB_TOOL_CACHE_TTL` | `86400` | Cache entry lifetime in seconds (TTL index); sized to a session |
 | `MONGODB_TOOL_CACHE_TOOLS` | *(immutable read set)* | Comma-separated allowlist override; empty disables the cache |
+| `MONGODB_TOOL_CACHE_MUTABLE_TOOLS` | `get_code,xrefs,get_data_at` | Mutable-tier allowlist: reads cached until any Ghidra mutation tool succeeds, which flushes the tier for the binary; empty disables the tier |
 | `BINARY_NAME` | *(auto-detected)* | Override the binary name used to scope the knowledge base — see [Binary selection](#binary-selection) |
 | `GHIDRA_MCP_TRANSPORT` | `http` | Transport type: `http` or `sse` (GhidrAssistMCP is HTTP-only) |
 | `GHIDRA_MCP_URL` | `http://localhost:8080/mcp` | URL of the GhidrAssistMCP server (`/mcp` for http, `/sse` for sse) |
