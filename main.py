@@ -174,8 +174,10 @@ async def main() -> None:
     if async_mw is not None:
         print("Async task resolution enabled (polling get_task_status).")
     # The read-only `research` sub-agent is shared by both graphs: the normal
-    # coordinator gets it (read-only deep investigation without applying changes)
-    # and the plan-mode graph uses it as its only delegate.
+    # coordinator gets it (read-only deep investigation without applying
+    # changes) and the plan-mode graph uses it as its only delegate — the
+    # config sub-agents all mutate Ghidra (prototype-fixer included), so none
+    # are safe for plan mode.
     research_sub = build_research_subagent(
         all_tools,
         agent_config,
@@ -191,22 +193,7 @@ async def main() -> None:
         async_middleware=async_mw,
     )
     subagents.append(research_sub)
-    # Plan mode's delegates: the shared read-only `research` agent plus the
-    # read-only, config-defined `prototype-auditor` (pulled out of the built
-    # config sub-agents by name) so a planning session can also delegate
-    # prototype/parameter-count audits. Both are read-only, safe for plan mode.
     plan_mode_subagents = [research_sub]
-    proto_auditor_sub = next(
-        (s for s in subagents if s.get("name") == "prototype-auditor"), None
-    )
-    if proto_auditor_sub is not None:
-        plan_mode_subagents.append(proto_auditor_sub)
-    else:
-        print(
-            "Warning: 'prototype-auditor' sub-agent not found in config; "
-            "plan mode will run without it.",
-            file=sys.stderr,
-        )
     print(f"Main agent: {main_model_spec}  [{len(main_tools)} tool(s)]")
     for sub_cfg in agent_config.subagents:
         print(
@@ -275,10 +262,9 @@ async def main() -> None:
             agent = create_deep_agent(**agent_kwargs)
 
             # Plan-mode graph: read-only coordinator (no mutating tools) whose
-            # delegates are the read-only `research` and `prototype-auditor`
-            # sub-agents. Shares the checkpointer thread_id and backend with
-            # `agent`, so conversation history and the plan file carry over when
-            # the human approves.
+            # only delegate is the read-only `research` sub-agent. Shares the
+            # checkpointer thread_id and backend with `agent`, so conversation
+            # history and the plan file carry over when the human approves.
             plan_agent = create_deep_agent(
                 model=built_model,
                 tools=build_plan_mode_main_tools(all_tools, agent_config),
