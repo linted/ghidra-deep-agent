@@ -133,6 +133,13 @@ tools (pass the exact `action`/`format`/target from each tool's schema):
   `action: set_prototype`) to the real signature.
 - Add inline comments at non-obvious instructions (`comments` with `action: set`).
 - Recover structures with `struct` and register types with `types` as warranted.
+  To reverse a struct at an address: read the raw data (`get_data_at`), find every
+  reference with `xrefs`, and read the referencing functions' decompiled C
+  (`get_code`). Infer the layout from the ACCESS PATTERNS — which offsets are
+  read/written, the size at each offset, pointers vs. integers vs. floats vs.
+  arrays, and any pointers to other structs (linked-list / tree shape). Emit a C
+  `typedef struct` with an offset comment per field, then register it with `struct`
+  (create) and `types`.
 Read code with `get_code` (`format: decompiler`/`disassembly`). Use lowercase
 snake_case unless the binary uses another convention; prefix uncertain names with
 `maybe_`. Never rename or retype on speculation alone.
@@ -279,9 +286,20 @@ Watch for: stack/heap buffer overflows; unbounded or miscomputed copies
 check); integer overflow/underflow/signedness bugs feeding sizes, indices, or
 allocations; format-string bugs (user data as a format argument); command / path
 injection (data into exec/system/open); out-of-bounds read/write and off-by-one;
-use-after-free / double-free; unchecked return values and null-deref; and
-uninitialized-memory use. Compare buffer sizes from `get_function_stack_layout`
-against copy lengths.
+use-after-free / double-free; unchecked return values and null-deref;
+uninitialized-memory use; TOCTOU / race conditions (time-of-check to
+time-of-use); and information disclosure (leaking sensitive data or
+uninitialized memory out to an attacker). Compare buffer sizes from
+`get_function_stack_layout` against copy lengths.
+
+When the attack surface is network I/O (recv/recvfrom/read on a socket, or a
+protocol parser), treat every length field and offset from the wire as
+attacker-controlled: check that recv lengths are bounded against the destination
+buffer, that length/count fields are validated before use as sizes or indices,
+and that byte-order conversions (ntohl/ntohs) don't mask signed/unsigned
+confusion. Watch for integer overflow when parsing length fields, missing
+null-termination on wire strings, double-free on connection error paths, and
+use-after-free in async handlers.
 
 ## Verify before you report (mandatory)
 For EACH candidate, do a second pass and discard it unless BOTH hold:

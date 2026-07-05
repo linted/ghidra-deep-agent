@@ -56,23 +56,29 @@ Sub-agent design — implemented in `src/ghidra_deep_agent/subagents.py` (`build
 - [x] Keep search primitives, knowledge queries, and filesystem tools on the main agent (no sub-agent) — prompt steers quick searches/KB queries/filesystem reads to the main agent; sub-agent tool allowlists exclude them.
 
 ### Backlog (deferred — not now)
-- [ ] **Adopt GhidrAssistMCP MCP resources & prompts** — the new server (see the
+- [~] **Adopt GhidrAssistMCP MCP resources & prompts** — the new server (see the
   GhidrAssistMCP migration) exposes, beyond tools, **6 MCP resources**
   (`ghidra://program/{name}/info` / `functions` / `strings` / `imports` /
   `exports` / `segments`) and **7 MCP prompts** (`analyze_function`,
   `identify_vulnerability`, `document_function`, `trace_data_flow`,
-  `trace_network_data`, `compare_functions`, `reverse_engineer_struct`). We
-  currently consume neither. Investigate whether they can upgrade our stack:
-  (a) **resources** could replace some `program-recon`/coordinator read *tool*
-  calls with cheaper resource reads (and langchain_mcp_adapters can surface MCP
-  resources) — worth checking if this trims recon round-trips/latency; (b)
-  **prompts** are server-authored, RE-specific prompt templates that may be
-  worth folding into (or benchmarking against) our own sub-agent system prompts
-  in `subagents.toml` / `prompt.py` (e.g. `reverse_engineer_struct` vs. the
-  `struct` workflow, `trace_data_flow` vs. `function-analyst`). Plug-in points:
-  `MultiServerMCPClient` already loaded in main.py (it can also list resources/
-  prompts); decide per-item whether to wire in or borrow the wording. Low
-  urgency — a capability-upgrade exploration, not a fix.
+  `trace_network_data`, `compare_functions`, `reverse_engineer_struct`).
+  **Prompt-wording sub-item DONE** (2026-07-05): audited all 7 verbatim server
+  templates (upstream `github.com/symgraph/GhidrAssistMCP`,
+  `src/main/java/ghidrassistmcp/prompts/*.java`) against our sub-agent prompts.
+  Folded the `reverse_engineer_struct` methodology (get_data_at → xrefs →
+  get_code → infer-from-access-patterns → typedef → register) into
+  `function-analyst`, and the `trace_network_data` network-protocol guidance plus
+  the `identify_vulnerability` TOCTOU/race + information-disclosure categories into
+  `vuln-hunter` (all in `subagents.toml`). The other 5 (`analyze_function`,
+  `document_function`, `trace_data_flow`, `compare_functions`, and the
+  `identify_vulnerability` core) already met or beat the server templates —
+  nothing borrowed. **Still open / deliberately deferred:** (a) **resources**
+  could replace some `program-recon`/coordinator read *tool* calls with cheaper
+  resource reads (marginal — data overlaps existing tools; templated URIs must be
+  passed explicitly); (b) any runtime **prompt wiring** — retaining
+  `MultiServerMCPClient` and exposing `get_prompt`/`get_resources` via TUI slash
+  commands or a data-injected sub-agent primer — was scoped out (wording only).
+  Low urgency — a capability-upgrade exploration, not a fix.
 - [ ] **TUI approval affordance for plan mode** — replace/augment the `/approve`
   command with an interactive popup or buttons to **Approve / Reject / Keep working**
   on the plan (modal in the `SessionSelectScreen` style, `tui/session_select.py`),
@@ -121,6 +127,63 @@ Rejected / redundant (recorded so they aren't reconsidered next report)
   tracked above (per-agent tool allowlists, batched parallel tool calls in sub-agent prompts,
   `ArgumentValidationMiddleware`, "Tune forced compaction", "Route routine LLM calls to a smaller
   model", backlog "graph-level timeout", backlog "Bound `task` sub-agents").
+
+### From optimization report (2026-07-04, 2h window)
+
+_Report: `ghidra-deepagents-20260704T003612Z.md`. Triaged against the code 2026-07-03; only one
+item survived. Full implementation plan already written:
+`~/.claude/plans/consider-ghidra-deepagents-20260704t0036-federated-alpaca.md`._
+
+New
+- [x] **Cache `get_code`/`xrefs`/`get_data_at` with write-invalidation** (report Latency #5) — implemented
+  2026-07-03 (PR #14, `289fcfc`) as described below; smoke-tested (both tiers, tiered debug logging,
+  failed-mutation no-flush, per-binary isolation, env opt-out, async path). Judge value via a live
+  `MONGODB_TOOL_CACHE_DEBUG=1` session: if `INVALIDATE ... cleared N` wipes dominate mutable-tier `HIT`s,
+  set `MONGODB_TOOL_CACHE_MUTABLE_TOOLS=` and drop it.
+  Original design notes:
+  extend `MCPReadCacheMiddleware` (mcp_cache.py) with a second, *mutable* tool tier
+  (`get_code`, `xrefs`, `get_data_at`; env `MONGODB_TOOL_CACHE_MUTABLE_TOOLS`, empty = off).
+  Invalidation is whole-binary/whole-tier — `delete_many({binary, mutable: true})` after any
+  successful Ghidra-mutating tool (`rename_symbol`, `batch_rename`, `variables`, `comments`,
+  `types`, `struct`, `create_function`) — because per-address is unsound (renaming A changes the
+  decompilation of every caller of A). Docs gain `binary` + `mutable` fields (no migration; old
+  docs are all immutable-tier). Instrument with an `invalidations` counter + tiered
+  `MONGODB_TOOL_CACHE_DEBUG` `HIT`/`MISS`/`INVALIDATE ... cleared N` logging so one debug session
+  shows whether invalidation churn kills the hit rate (traces showed 226 `get_code` calls/window
+  at ~0.6 re-fetch probability, but mutation-heavy sessions may wipe the tier constantly — if so,
+  disable via env and drop it). Known limitation: Ghidra-GUI edits bypass invalidation; TTL is the
+  backstop.
+
+Rejected / redundant (recorded so they aren't reconsidered next report)
+- **Cost #2 / Latency #1 / Errors #2 (`get_task_status` "polling spin-loop", cap polls):**
+  misdiagnosis — polling is code-driven inside `AsyncTaskMiddleware` (async_tasks.py) with
+  exponential backoff (0.25s→2s) and a 180s timeout; the LLM never sees `get_task_status` and no
+  LLM round-trip happens per poll (the report's own table shows those spans at 0 tokens).
+- **Latency #2/#3 (parallelize tool calls / `task` dispatch):** already concurrent — the app runs
+  fully async and langgraph's `ToolNode` gathers same-turn tool calls (incl. `atask`) via
+  `asyncio.gather`; serial traces mean the *model* emitted one call per turn (prompt guidance for
+  batching already exists).
+- **Cost #1 (truncate verbose tool outputs):** already handled — deepagents `FilesystemMiddleware`
+  offloads tool results over ~20k tokens (~80 KB) to `large_tool_results/`; see the existing
+  backlog item about lowering that threshold. Its 13:1 "chain vs LLM tokens" figure is LangSmith
+  double-counting parent spans, not real spend.
+- **Cost #3 (dedupe sub-agent system prompts):** no client-side action — DeepSeek does automatic
+  server-side prefix caching.
+- **Cost #4 (gate `AnthropicPromptCachingMiddleware`):** N/A again — registered upstream by
+  deepagents with `unsupported_model_behavior="ignore"`, silently no-ops on DeepSeek/OpenRouter
+  (already recorded in the 2026-06-29 pass).
+- **Sub-agent #1 (route `analyze_function` into `function-analyst`):** already done — the
+  coordinator's allowlist (subagents.toml) excludes it; it's scoped to `function-analyst`,
+  `prototype-auditor`, and the wildcard agents. The "inline" calls in traces were sub-agent calls.
+- **Errors #1/#5 (retry + compaction observability), Errors #3 (sub-agent timeouts):** real gaps
+  but declined for now (2026-07-03) — retries are silent until terminal failure and compaction
+  logs no token counts, but neither is currently hurting; timeouts already tracked in Backlog
+  ("graph-level timeout", "Bound `task` sub-agents").
+- **Cost #4 (move coordinator to DeepSeek) / Latency #4 (faster routing model):** config choice,
+  not a code task — `[main] model` in subagents.toml is `openrouter:z-ai/glm-5.2`; flip the one
+  line if desired.
+- **Errors #4 (smoke-test single-call tools), Sub-agent #2/#3 (don't create cluster sub-agents):**
+  generic/no-op advice; nothing to change.
 
 ## Plan mode for the RE agent
 Add a "plan mode" inspired by Claude Code's plan mode. When invoked, the agent
