@@ -18,7 +18,7 @@ default = "deepseek:deepseek-v4-pro"
 # The coordinator: orchestrates sub-agents, navigates/searches, and uses the
 # knowledge base. It does NOT decompile, disassemble, xref, or mutate Ghidra —
 # those are delegated to sub-agents.
-model = "openrouter:z-ai/glm-5.2"
+model = "openrouter:z-ai/glm-5.2:floor"
 # model = "openrouter:cohere/north-mini-code:free"
 tools = [
   # knowledge base (read + record high-level hypotheses)
