@@ -88,6 +88,10 @@ _MUTATING_TOOLS = frozenset(
         "types",
         "struct",
         "create_function",
+        # Local tool (prototype_tools.py) that commits recovered prototypes via a
+        # Ghidra script. It's the name seen in the graph — the coordinator calls
+        # it, not `scripts` — so invalidation keys on it here.
+        "recover_prototypes",
     }
 )
 
