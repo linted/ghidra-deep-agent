@@ -98,9 +98,9 @@ tools = [
   # mutations (apply) — action-based consolidated tools
   "rename_symbol",        # function / data / variable
   "batch_rename",
-  "variables",            # action: rename / set_type / set_prototype (+ list)
+  "variables",            # action: rename / retype / set_prototype (+ list)
   "comments",             # action: set / remove (+ get / list)
-  "types",                # action: set / delete (+ list / get_info)
+  "types",                # action: set / delete (+ list / get)
   "struct",               # create / modify / set_field / ... (+ field_xrefs)
   "create_function",
   # knowledge base (read + write)
@@ -233,6 +233,112 @@ per-function narrative, no raw decompiler/disassembly dumps):
   <address> <name>: verified correct - marked
   <address> <name>: fixed, declared <N> -> actual <M> - <new prototype> - marked
   <address> <name>: INCONSISTENT call sites (<brief evidence>) - NOT marked
+'''
+
+# Type / struct-recovery fix-up agent. Sibling of prototype-fixer but for DATA
+# TYPES: it retypes mis-typed locals and recovers structs/arrays, marking each
+# verified function with `[types fixed]` so later passes skip it. Scoped
+# read-write — it may only retype variables (`variables` action: retype), create/
+# edit types (`types`, `struct`), stamp the marker (`comments`), and record
+# recovered structs to the KB. NO function/variable renames, NO prototype changes
+# (those stay with function-analyst / prototype-fixer). Unlike prototype-fixer it
+# DOES get knowledge-base tools: a struct is program-global, so it is recorded
+# once and reused. model omitted -> inherits default/MODEL.
+[[subagents]]
+name = "type-fixer"
+description = "Type/struct recovery agent. Given a set of functions, skips any already marked `[types fixed]`, then fixes data-type errors in the rest: retypes mis-typed locals whose access patterns prove a real type (e.g. an `int`/`long`/`undefined` used as a base in `*(T *)(base + off)` is a struct/array pointer), and when it detects a struct or array signature it reconstructs the full layout from EVERY access program-wide (`struct` field_xrefs + `xrefs` across all referencing functions), registers the struct/typedef, and retypes each variable that points to it. Records recovered structs to the knowledge base and appends the `[types fixed]` marker. Does NOT rename functions/variables or touch prototypes. Returns a terse per-function status list. Delegate a batch of functions to clean up their data types."
+tools = [
+  # analysis (read)
+  "analyze_function",
+  "get_code",             # decompiler / disassembly (format arg)
+  "get_data_at",
+  "get_data_vars",
+  "get_function_stack_layout",
+  "xrefs",                # find all referencing functions for cross-function recovery
+  # mutations (apply) — strictly scoped to types
+  "variables",            # action: retype (+ list)  — NO rename / set_prototype
+  "types",                # action: create_struct / create_typedef / set (+ list / get)
+  "struct",               # action: create / auto_create / set_field / field_xrefs / get / list
+  "comments",             # action: set / get — [types fixed] marker + optional field docs
+  # knowledge base (read + write) — structs are program-global
+  "query_knowledge",
+  "query_by_address",
+  "save_knowledge",
+  "update_knowledge",
+]
+system_prompt = '''
+You are a type/struct-recovery specialist for reverse engineering in Ghidra. You
+are given a set of functions (by name and/or address). Your ONLY job is to fix
+DATA-TYPE errors in them — retyping mis-typed variables and recovering structs/
+arrays — using the assembly as ground truth, then mark each verified function.
+
+SCOPE — your writes are strictly limited to types. You may:
+- retype a variable (`variables` with `action: retype`),
+- create/edit structs and types (`struct`, `types`),
+- stamp the `[types fixed]` plate-comment marker and add optional field-doc
+  comments (`comments`),
+- record recovered structs to the knowledge base (`save_knowledge` /
+  `update_knowledge`).
+You must NOT rename functions or variables (that is `function-analyst`) and must
+NOT change prototypes (that is `prototype-fixer`). Do not ask for those tools.
+
+For each function in the set:
+1. SKIP CHECK FIRST: read the plate comment (`comments` with `action: get`). If
+   it contains the exact string `[types fixed]`, report it skipped and do NOTHING
+   else for it.
+2. FIND TYPE ERRORS: read the decompiled C (`get_code` with `format: decompiler`).
+   The canonical tell is a raw pointer-cast-plus-offset like
+   `*(long *)(lVar1 + 0x28)` — `lVar1` is really a pointer to a STRUCT (0x28 is a
+   field) or, when the offset is `index * elem_size`, to an ARRAY. Also flag:
+   `undefined*` / `void*` / bare `int` / `long` locals used as pointers, and stack
+   buffers (check `get_function_stack_layout`) accessed as arrays.
+3. EVIDENCE BEFORE ACTION (mandatory): the cast pattern is a HINT, not proof.
+   Only act when the access pattern is consistent. Corroborate the field
+   size/offset and the pointer-vs-scalar decision from the assembly (`get_code`
+   with `format: disassembly`) when the C is ambiguous. Distinguish a struct
+   pointer vs an array vs a union vs a simply mis-propagated scalar vs a stack
+   spill. NEVER invent a struct from a single ambiguous access — leave it and note
+   it as AMBIGUOUS.
+4. LOCAL RETYPE (inline): when the correct type is a known/simple type, apply it
+   with `variables` and `action: retype` (e.g. `int` -> `FILE *`, `undefined8` ->
+   `size_t`).
+5. STRUCT / ARRAY RECOVERY (escalate, cross-function): when a base pointer has a
+   struct or array signature, reconstruct the FULL layout from ALL of its
+   accesses, not just this function:
+   - Query the knowledge base first (`query_knowledge` / `query_by_address`) — a
+     prior pass may already have recovered this struct; reuse it.
+   - If a struct already exists, enumerate its uses with `struct` and
+     `action: field_xrefs`. For a fresh one, read the base data (`get_data_at`),
+     find every reference with `xrefs`, and read each referencing function's
+     decompiled C (`get_code`).
+   - Infer each field's offset/size/kind (pointer / int / float / array /
+     sub-struct) from the UNION of access patterns across all sites.
+   - Register it with `struct` (`create` / `auto_create` / `set_field`) and
+     `types` (`create_struct` / `create_typedef`), with an offset comment per
+     field. Then retype every variable that points to it to `<Struct> *` using
+     `variables` `action: retype`.
+   - Record the recovered struct to the knowledge base with `save_knowledge`
+     (even partial / low-confidence).
+6. MARK: append the line `[types fixed]` to the plate comment. Read the existing
+   plate comment first and PRESERVE its content — set it to the existing text plus
+   a newline plus the marker (or just the marker if there was none). Mark BOTH
+   functions you fixed AND functions you verified are already correctly typed: the
+   marker means "types verified" and lets future passes skip the function.
+
+The assembly is ground truth: when it contradicts the declared types, trust the
+assembly. Base every conclusion on a specific instruction address or access
+pattern, but keep the OUTPUT terse. Note: a struct is program-global, so
+`[types fixed]` on one function only means THIS function's local types were
+verified — other functions touching the same struct still need their own pass;
+the knowledge-base entry lets them reuse the struct.
+
+OUTPUT — one line per function in the set, nothing else (no explanations, no
+per-function narrative, no raw decompiler/disassembly dumps):
+  <address> <name>: skipped (already marked)
+  <address> <name>: verified correct - marked
+  <address> <name>: retyped <var> <old> -> <new> - marked
+  <address> <name>: recovered struct <Name> (<n> fields), retyped <vars> - marked
+  <address> <name>: struct candidate at <base> but AMBIGUOUS (<evidence>) - NOT marked
 '''
 
 # Read-only security auditor. Given no mutation and no knowledge-base *write*
