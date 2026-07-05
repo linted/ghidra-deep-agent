@@ -27,10 +27,13 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.types import Command
 
-# The submission stub is very specific; require both signals to avoid ever
-# mistaking real tool output (decompilation, disassembly) for a task stub.
-_STUB_MARKER = "Task submitted for async execution"
-_TASK_ID_RE = re.compile(r"Task ID:\s*(\S+)")
+# The submission stubs are very specific; require a marker phrase plus an id to
+# avoid ever mistaking real tool output (decompilation, disassembly) for a stub.
+# Two known shapes: the generic async-tool stub ("Task submitted for async
+# execution. ... Task ID: <id>") and the `scripts` run stub ("Script task
+# submitted: <id> ...").
+_STUB_MARKERS = ("Task submitted for async execution", "Script task submitted")
+_TASK_ID_RE = re.compile(r"(?:Task ID:|Script task submitted:)\s*([0-9A-Za-z._-]{6,})")
 # A poll response still in flight.
 _IN_FLIGHT = ("Status: RUNNING", "Status: PENDING")
 
@@ -73,7 +76,7 @@ def _content_text(result: ToolMessage | Command[Any]) -> str | None:
 
 
 def _task_id(content: str) -> str | None:
-    if _STUB_MARKER not in content:
+    if not any(marker in content for marker in _STUB_MARKERS):
         return None
     match = _TASK_ID_RE.search(content)
     return match.group(1) if match else None
@@ -81,6 +84,46 @@ def _task_id(content: str) -> str | None:
 
 def _is_in_flight(content: str) -> bool:
     return any(flag in content for flag in _IN_FLIGHT)
+
+
+def to_text(value: Any) -> str:
+    """Public alias for flattening an MCP tool result to text.
+
+    Tools that call an MCP tool directly (not via the agent graph) use this to
+    normalize the string-or-content-blocks result the adapter returns.
+    """
+    return _to_text(value)
+
+
+async def resolve_async_result(
+    text: str,
+    status_tool: BaseTool | None,
+    *,
+    timeout_s: float = 180.0,
+    initial_interval_s: float = 0.25,
+    factor: float = 1.6,
+    max_interval_s: float = 2.0,
+) -> str:
+    """Resolve an async submission stub the same way ``AsyncTaskMiddleware`` does.
+
+    ``AsyncTaskMiddleware`` only wraps tool calls made *through the agent graph*.
+    A local tool that invokes an MCP tool directly (e.g. ``scripts``) gets the raw
+    submission stub back with no middleware to poll it, so it calls this helper on
+    the result: if ``text`` is a stub and ``status_tool`` is available, poll
+    ``get_task_status`` until the task finishes and return the final text;
+    otherwise return ``text`` unchanged.
+    """
+    task_id = _task_id(text)
+    if task_id is None or status_tool is None:
+        return text
+    deadline = time.monotonic() + timeout_s
+    interval = initial_interval_s
+    while True:
+        status_text = _to_text(await status_tool.ainvoke({"task_id": task_id}))
+        if not _is_in_flight(status_text) or time.monotonic() >= deadline:
+            return status_text
+        await asyncio.sleep(interval)
+        interval = min(interval * factor, max_interval_s)
 
 
 def async_task_id(output: Any) -> str | None:

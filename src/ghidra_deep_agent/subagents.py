@@ -67,6 +67,7 @@ PLAN_MODE_BLOCKED_TOOLS = frozenset(
         "import_file",
         "export_program",
         "scripts",
+        "recover_prototypes",  # local tool: commits recovered prototypes (mutates)
         "project_files",  # has a `delete` action
         "analysis_options",
         "analysis_control",
