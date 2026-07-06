@@ -34,6 +34,12 @@ What the script does, program-wide and deterministically (no LLM):
   carrying that bookmark is counted but not re-reported, so re-runs don't re-flood
   the same ambiguities.
 
+Decompilation — the expensive step — runs in parallel via Ghidra's
+``ParallelDecompiler``/``DecompilerCallback`` (one ``DecompInterface`` and native
+decompiler process per worker; pool defaults to cores + 1). Program-DB writes
+(commits, bookmarks) and all bookkeeping happen only on the script thread, with
+each chunk's results sorted by address so output stays deterministic.
+
 The result is printed to stdout as a single JSON object between the
 ``<<<RECOVER_PROTOTYPES_JSON>>>`` / ``<<<END_RECOVER_PROTOTYPES_JSON>>>`` markers
 so the caller can extract it from surrounding Ghidra console noise.
@@ -48,12 +54,16 @@ MARK_END = "<<<END_RECOVER_PROTOTYPES_JSON>>>"
 SCRIPT_SOURCE: str = r"""// recover_prototypes -- Ghidra Java GhidraScript. Runs inside Ghidra.
 // @category DeepAgent
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 
 import ghidra.app.script.GhidraScript;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileOptions;
 import ghidra.app.decompiler.DecompileResults;
+import ghidra.app.decompiler.parallel.ChunkingParallelDecompiler;
+import ghidra.app.decompiler.parallel.DecompilerCallback;
+import ghidra.app.decompiler.parallel.ParallelDecompiler;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.listing.Bookmark;
@@ -65,6 +75,8 @@ import ghidra.program.model.pcode.HighFunction;
 import ghidra.program.model.pcode.HighFunctionDBUtil;
 import ghidra.program.model.pcode.HighFunctionDBUtil.ReturnCommitOption;
 import ghidra.program.model.symbol.SourceType;
+import ghidra.util.exception.CancelledException;
+import ghidra.util.task.TaskMonitor;
 
 public class gda_recover_prototypes extends GhidraScript {
 
@@ -74,6 +86,30 @@ public class gda_recover_prototypes extends GhidraScript {
     static final int DECOMP_TIMEOUT = 60;   // seconds per function
     static final int MAX_ARGS = 8;          // ABI argument-register budget
     static final int FIXED_DETAIL_CAP = 200;
+    static final int CHUNK_SIZE = 64;       // bounds live HighFunctions per chunk
+
+    // Worker threads only decompile and classify (read-only); every program-DB
+    // write and every counter/StringBuilder update happens on the script thread
+    // in applyResult(). That split is what makes the parallelism safe without
+    // any locking of our own.
+    private static class ProtoResult {
+        static final int ALREADY_CORRECT = 0;
+        static final int DECOMP_FAILED = 1;
+        static final int CLEAN = 2;
+        static final int ESCALATE = 3;
+
+        Function func;
+        int kind;
+        HighFunction hf;    // CLEAN only; nulled after commit to free memory
+        String addrS, nameS, recS, comS, reason;
+    }
+
+    private boolean dryRun = false;
+    private int scanned = 0, alreadyCorrect = 0, fixed = 0;
+    private int escalate = 0, escalateKnown = 0, decompFailed = 0;
+    private int fixedDetail = 0;
+    private StringBuilder fixedJson = new StringBuilder();
+    private StringBuilder escJson = new StringBuilder();
 
     private String typeName(DataType dt) {
         return dt != null ? dt.getName() : "undefined";
@@ -173,59 +209,26 @@ public class gda_recover_prototypes extends GhidraScript {
         target.append(obj);
     }
 
-    @Override
-    public void run() throws Exception {
-        boolean dryRun = false;
-        for (String a : getScriptArgs()) {
-            if (a != null && a.equalsIgnoreCase("dry_run")) {
-                dryRun = true;
-            }
-        }
-
-        DecompInterface di = new DecompInterface();
-        di.setOptions(new DecompileOptions());
-        di.openProgram(currentProgram);
-
-        int scanned = 0, alreadyCorrect = 0, fixed = 0;
-        int escalate = 0, escalateKnown = 0, decompFailed = 0;
-        int fixedDetail = 0;
-        StringBuilder fixedJson = new StringBuilder();
-        StringBuilder escJson = new StringBuilder();
-
-        for (Function func : currentProgram.getFunctionManager().getFunctions(true)) {
-            if (func.isThunk() || func.isExternal()) {
-                continue;
-            }
-            scanned++;
-
-            // Only ever fill in functions with NO committed signature (DEFAULT
-            // source). Anything a human, function-analyst, or Ghidra's analyzer
-            // has already committed (USER_DEFINED / IMPORTED / ANALYSIS) is left
-            // untouched — so we never clobber someone's types, and re-runs are a
-            // true no-op: our own commits use ANALYSIS source and drop out next
-            // pass. (A deliberately-set `void f(void)` is USER_DEFINED, so it is
-            // safe here even though it has zero parameters.)
-            if (func.getSignatureSource() != SourceType.DEFAULT) {
-                alreadyCorrect++;
-                continue;
-            }
-
-            DecompileResults res = di.decompileFunction(func, DECOMP_TIMEOUT, monitor);
-            if (res == null || !res.decompileCompleted()) {
-                decompFailed++;
-                continue;
+    // Runs on ParallelDecompiler worker threads: program READS only (the
+    // decompile result plus the function's committed signature), never writes.
+    private ProtoResult classify(DecompileResults res) {
+        ProtoResult r = new ProtoResult();
+        r.func = res.getFunction();
+        r.kind = ProtoResult.DECOMP_FAILED;
+        try {
+            if (!res.decompileCompleted()) {
+                return r;
             }
             HighFunction hf = res.getHighFunction();
             if (hf == null) {
-                decompFailed++;
-                continue;
+                return r;
             }
             FunctionPrototype proto = hf.getFunctionPrototype();
             if (proto == null) {
-                decompFailed++;
-                continue;
+                return r;
             }
 
+            Function func = r.func;
             int recCount = proto.getNumParams();
             String recRet = typeName(proto.getReturnType());
             String comRet = typeName(func.getReturnType());
@@ -233,8 +236,8 @@ public class gda_recover_prototypes extends GhidraScript {
 
             if (recCount == 0
                     && (recRet.equals("void") || recRet.equals("undefined"))) {
-                alreadyCorrect++;
-                continue;
+                r.kind = ProtoResult.ALREADY_CORRECT;
+                return r;
             }
 
             if (recCount == comParams.length && recRet.equals(comRet)) {
@@ -247,8 +250,8 @@ public class gda_recover_prototypes extends GhidraScript {
                     }
                 }
                 if (allEq) {
-                    alreadyCorrect++;
-                    continue;
+                    r.kind = ProtoResult.ALREADY_CORRECT;
+                    return r;
                 }
             }
 
@@ -260,46 +263,138 @@ public class gda_recover_prototypes extends GhidraScript {
             }
             boolean clean = !isVarargs && recCount <= MAX_ARGS && cleanStorage(proto);
 
-            String addrS = addrString(func.getEntryPoint());
-            String nameS = func.getName();
-            String recS = protoString(recRet, recParamTypes(proto));
-            String comS = protoString(comRet, comParamTypes(comParams));
+            r.addrS = addrString(func.getEntryPoint());
+            r.nameS = func.getName();
+            r.recS = protoString(recRet, recParamTypes(proto));
+            r.comS = protoString(comRet, comParamTypes(comParams));
 
-            String reason;
             if (clean) {
-                if (dryRun || applyPrototype(hf)) {
-                    fixed++;
-                    if (fixedDetail < FIXED_DETAIL_CAP) {
-                        appendObj(fixedJson,
-                            "{\"addr\":\"" + js(addrS) + "\",\"name\":\"" + js(nameS)
-                            + "\",\"old\":\"" + js(comS) + "\",\"new\":\"" + js(recS)
-                            + "\"}");
-                        fixedDetail++;
-                    }
-                    continue;
-                }
-                reason = "decompiler recovery could not be committed";
-            } else if (isVarargs) {
-                reason = "variadic (...) - needs a manual prototype";
+                r.kind = ProtoResult.CLEAN;
+                r.hf = hf;   // DecompileResults are fully decoded; safe to hand
+                             // to the script thread for the later commit
             } else {
-                reason = "recovered args use non-standard storage or exceed " + MAX_ARGS;
+                r.kind = ProtoResult.ESCALATE;
+                r.reason = isVarargs
+                    ? "variadic (...) - needs a manual prototype"
+                    : "recovered args use non-standard storage or exceed " + MAX_ARGS;
             }
+        } catch (Throwable t) {
+            // One bad function must not kill the whole queue.
+            r.kind = ProtoResult.DECOMP_FAILED;
+            r.hf = null;
+        }
+        return r;
+    }
 
-            if (!dryRun && hasReviewBookmark(func.getEntryPoint())) {
-                escalateKnown++;
-                continue;
+    // Script thread only: all DB writes and bookkeeping.
+    private void applyResult(ProtoResult r) {
+        if (r.kind == ProtoResult.DECOMP_FAILED) {
+            decompFailed++;
+            return;
+        }
+        if (r.kind == ProtoResult.ALREADY_CORRECT) {
+            alreadyCorrect++;
+            return;
+        }
+        if (r.kind == ProtoResult.CLEAN) {
+            boolean committed = dryRun || applyPrototype(r.hf);
+            r.hf = null;
+            if (committed) {
+                fixed++;
+                if (fixedDetail < FIXED_DETAIL_CAP) {
+                    appendObj(fixedJson,
+                        "{\"addr\":\"" + js(r.addrS) + "\",\"name\":\"" + js(r.nameS)
+                        + "\",\"old\":\"" + js(r.comS) + "\",\"new\":\"" + js(r.recS)
+                        + "\"}");
+                    fixedDetail++;
+                }
+                return;
             }
-            if (!dryRun) {
-                setReviewBookmark(func.getEntryPoint(), reason);
+            escalateResult(r, "decompiler recovery could not be committed");
+            return;
+        }
+        escalateResult(r, r.reason);
+    }
+
+    private void escalateResult(ProtoResult r, String reason) {
+        if (!dryRun && hasReviewBookmark(r.func.getEntryPoint())) {
+            escalateKnown++;
+            return;
+        }
+        if (!dryRun) {
+            setReviewBookmark(r.func.getEntryPoint(), reason);
+        }
+        escalate++;
+        appendObj(escJson,
+            "{\"addr\":\"" + js(r.addrS) + "\",\"name\":\"" + js(r.nameS)
+            + "\",\"committed\":\"" + js(r.comS) + "\",\"recovered\":\"" + js(r.recS)
+            + "\",\"reason\":\"" + js(reason) + "\"}");
+    }
+
+    @Override
+    public void run() throws Exception {
+        for (String a : getScriptArgs()) {
+            if (a != null && a.equalsIgnoreCase("dry_run")) {
+                dryRun = true;
             }
-            escalate++;
-            appendObj(escJson,
-                "{\"addr\":\"" + js(addrS) + "\",\"name\":\"" + js(nameS)
-                + "\",\"committed\":\"" + js(comS) + "\",\"recovered\":\"" + js(recS)
-                + "\",\"reason\":\"" + js(reason) + "\"}");
         }
 
-        di.dispose();
+        // Cheap pre-filter on the script thread so only real work reaches the
+        // decompiler pool. Only ever fill in functions with NO committed
+        // signature (DEFAULT source). Anything a human, function-analyst, or
+        // Ghidra's analyzer has already committed (USER_DEFINED / IMPORTED /
+        // ANALYSIS) is left untouched — so we never clobber someone's types,
+        // and re-runs are a true no-op: our own commits use ANALYSIS source and
+        // drop out next pass. (A deliberately-set `void f(void)` is
+        // USER_DEFINED, so it is safe here even though it has zero parameters.)
+        List<Function> candidates = new ArrayList<>();
+        for (Function func : currentProgram.getFunctionManager().getFunctions(true)) {
+            if (func.isThunk() || func.isExternal()) {
+                continue;
+            }
+            scanned++;
+            if (func.getSignatureSource() != SourceType.DEFAULT) {
+                alreadyCorrect++;
+                continue;
+            }
+            candidates.add(func);
+        }
+
+        // One DecompInterface (and native decompiler process) per worker
+        // thread, pooled by DecompilerCallback; a DecompInterface is not
+        // thread-safe and must never be shared.
+        DecompilerCallback<ProtoResult> callback = new DecompilerCallback<ProtoResult>(
+                currentProgram, d -> d.setOptions(new DecompileOptions())) {
+            @Override
+            public ProtoResult process(DecompileResults results, TaskMonitor m) {
+                return classify(results);
+            }
+        };
+        callback.setTimeout(DECOMP_TIMEOUT);
+
+        ChunkingParallelDecompiler<ProtoResult> pd =
+            ParallelDecompiler.createChunkingParallelDecompiler(callback, monitor);
+        try {
+            monitor.initialize(candidates.size());
+            for (int i = 0; i < candidates.size() && !monitor.isCancelled();
+                    i += CHUNK_SIZE) {
+                List<Function> chunk =
+                    candidates.subList(i, Math.min(i + CHUNK_SIZE, candidates.size()));
+                List<ProtoResult> results = pd.decompileFunctions(chunk);
+                // Results arrive in completion order; sort by address so the
+                // JSON arrays and the FIXED_DETAIL_CAP cutoff stay deterministic.
+                results.sort(Comparator.comparing(r -> r.func.getEntryPoint()));
+                for (ProtoResult r : results) {
+                    applyResult(r);
+                    monitor.incrementProgress(1);
+                }
+            }
+        } catch (CancelledException e) {
+            // Cancelled mid-run: still emit the partial manifest below.
+        } finally {
+            pd.dispose();
+            callback.dispose();
+        }
 
         StringBuilder out = new StringBuilder();
         out.append("{\"dry_run\":").append(dryRun ? "true" : "false")
