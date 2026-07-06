@@ -61,15 +61,32 @@ def handle_event(
         if name == "get_task_status":
             app._hidden_tool_runs.add(run_id)
             return
+        # A tool call whose ancestry contains a plain tool run was made from
+        # inside that tool's body (e.g. recover_prototypes invoking `scripts`
+        # directly) — an implementation detail, so hide it. Sub-agent (`task`)
+        # runs are deliberately not tracked as parents: their inner tool calls
+        # are the sub-agent's real work and stay visible, nested via checkpoint
+        # namespaces. Hidden runs count as parents too, so a hidden call's own
+        # nested calls stay hidden.
+        parent_ids = event.get("parent_ids") or []
+        if any(
+            pid in app._active_tool_runs or pid in app._hidden_tool_runs
+            for pid in parent_ids
+        ):
+            app._hidden_tool_runs.add(run_id)
+            return
         raw_input = event.get("data", {}).get("input", {})
         preview = extract_preview(raw_input)
         is_subagent = name == "task"
+        if not is_subagent:
+            app._active_tool_runs.add(run_id)
         activity.post_message(
             ToolStarted(run_id, name, preview, is_subagent, checkpoint_ns)
         )
         app.post_message(ToolCountChanged(1))
 
     elif kind == "on_tool_end":
+        app._active_tool_runs.discard(run_id)
         if run_id in app._hidden_tool_runs:
             app._hidden_tool_runs.discard(run_id)
             return
