@@ -77,6 +77,7 @@ def _scripts_run(dry_run: bool) -> dict[str, Any]:
 def _format_summary(payload: dict[str, Any]) -> str:
     counts = payload.get("counts", {})
     escalate = payload.get("escalate", []) or []
+    failed = payload.get("failed", []) or []
     header = (
         "Prototype recovery DRY RUN (no changes applied) — 'auto_fixed' is what "
         "WOULD be fixed."
@@ -102,8 +103,8 @@ def _format_summary(payload: dict[str, Any]) -> str:
     if escalate:
         lines.append("")
         lines.append(
-            "Needs manual review — delegate these to the `prototype-fixer` "
-            "sub-agent (committed vs decompiler-recovered, plus why):"
+            "Needs manual review (committed vs decompiler-recovered, plus why) "
+            "— resolve each from the assembly:"
         )
         for e in escalate:
             lines.append(
@@ -118,6 +119,24 @@ def _format_summary(payload: dict[str, Any]) -> str:
             )
     else:
         lines.append("No new functions need manual review.")
+    if failed:
+        lines.append("")
+        lines.append(
+            "Failed to decompile — no recovered prototype exists; determine "
+            "their signatures from the disassembly:"
+        )
+        for f in failed:
+            lines.append(
+                "- {addr} {name}: {error}".format(
+                    addr=f.get("addr", "?"),
+                    name=f.get("name", "?"),
+                    error=f.get("error", "?"),
+                )
+            )
+        if payload.get("failed_truncated"):
+            lines.append(
+                "  (list truncated; the decompile_failed count above is the true total)"
+            )
     return "\n".join(lines)
 
 
@@ -160,13 +179,16 @@ def build_prototype_tools(mcp_tools: list[BaseTool]) -> list[BaseTool]:
         prototype against the one Ghidra's decompiler already recovered,
         AUTO-APPLIES the clear-cut fixes (a clean register/stack argument list,
         not variadic), and flags only the genuinely ambiguous cases (variadics,
-        non-standard storage, failed commits) for review.
+        non-standard storage, failed commits) for review. Functions the
+        decompiler could not process at all (timeouts, varnode hash errors, ...)
+        are listed with their error; their prototypes must be recovered from the
+        disassembly.
 
         Use this INSTEAD of searching for ``param_count=0`` functions and tracing
         prologues and call sites by hand — the decompiler has already done that
-        deterministic work. Returns a compact summary and the list of functions
-        that still need judgement; hand those to the ``prototype-fixer``
-        sub-agent. Safe to re-run: already-correct and previously-flagged
+        deterministic work. Returns a compact summary plus the functions that
+        still need judgement and any that failed to decompile; resolve those from
+        the assembly. Safe to re-run: already-correct and previously-flagged
         functions are skipped.
 
         Cost: this is ONE whole-program pass and is fast — a few seconds on a

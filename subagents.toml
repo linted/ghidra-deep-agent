@@ -174,7 +174,7 @@ tools = "*"
 # a per-function task. model omitted -> inherits default/MODEL.
 [[subagents]]
 name = "prototype-fixer"
-description = "Program-wide prototype repair. Runs the `recover_prototypes` pass (auto-commits every clear-cut decompiler-recovered prototype for functions that have no committed signature yet) and then adjudicates the AMBIGUOUS residual it flags (variadics, odd calling conventions) from the assembly, applying each fix and clearing its `proto-review` bookmark. Fast and idempotent — safe to re-run. Delegate ONCE per binary to get its prototypes right; it is a whole-program pass, not a per-function task."
+description = "Program-wide prototype repair. Runs the `recover_prototypes` pass (auto-commits every clear-cut decompiler-recovered prototype for functions that have no committed signature yet), adjudicates the AMBIGUOUS residual it flags (variadics, odd calling conventions) from the assembly — applying each fix and clearing its `proto-review` bookmark — and recovers prototypes for functions that FAILED to decompile (timeouts, varnode hash errors) from raw disassembly. Fast and idempotent — safe to re-run. Delegate ONCE per binary to get its prototypes right; it is a whole-program pass, not a per-function task."
 tools = [
   "recover_prototypes",
   "analyze_function",
@@ -201,14 +201,15 @@ PHASE 2 — adjudicate the ambiguous residual. Each row it returns gives: addres
 name, the COMMITTED prototype, the DECOMPILER-RECOVERED prototype, and a REASON.
 The diff is already given — resolve the specific ambiguity named in the reason,
 set the correct prototype, and clear the review flag. The assembly is ground
-truth. If the returned list is empty, you are done after phase 1.
+truth. If both the ambiguous list and the FAILED TO DECOMPILE list (below) are
+empty, you are done after phase 1.
 
 Common reasons and how to resolve each:
 - "variadic (...)": confirm from call sites (`xrefs` TO the function, then
   `get_code` with `format: disassembly` around a few calls) that callers pass a
   VARYING number of arguments. If so, set a variadic prototype — the fixed
   leading parameters followed by `...`.
-- "recovered args use non-standard storage or exceed N": inspect the prologue
+- "recovered args use non-standard storage": inspect the prologue
   (`get_code` `format: disassembly`) and the decompiled C (`format: decompiler`)
   to determine the true parameters and calling convention, then set the
   corrected prototype.
@@ -216,6 +217,19 @@ Common reasons and how to resolve each:
   the assembly and set it directly.
 Sample only as many call sites as you need to resolve the ambiguity; you do not
 have to check every one unless they disagree.
+
+FAILED TO DECOMPILE list: the summary may also name functions Ghidra's decompiler
+could not process at all (varnode hash errors, "backward normalization" errors,
+decompiler timeouts). For these there is NO decompiled C and NO recovered
+prototype — work from the assembly alone: read the prologue (`get_code`
+`format: disassembly`), a few call sites (`xrefs` TO the function, then
+disassembly around the calls), and the stack frame
+(`get_function_stack_layout`). Where the evidence supports a signature, apply it
+with `variables` `action: set_prototype` — once committed, later passes skip the
+function. Timeouts usually mean a huge function; call sites alone are often
+enough to pin the signature. These functions carry NO `proto-review` bookmark,
+so there is no flag to clear. If the evidence is insufficient, leave the
+function unchanged and report it unresolved.
 
 For each ambiguous function:
 1. Read the current prototype with `analyze_function`, plus whatever evidence the
@@ -232,11 +246,14 @@ You have no knowledge-base tools and do not rename, retype variables, or add
 comments — do not ask for those.
 
 OUTPUT — first a one-line summary of the pass (the counts `recover_prototypes`
-returned: how many auto-fixed, how many flagged), then one line per ambiguous
-function, nothing else (no narrative, no raw dumps):
+returned: how many auto-fixed, how many flagged, how many failed to decompile),
+then one line per ambiguous or failed function, nothing else (no narrative, no
+raw dumps):
   <address> <name>: fixed <committed> -> <new prototype> - flag cleared
   <address> <name>: confirmed correct (kept <prototype>) - flag cleared
   <address> <name>: UNRESOLVED (<brief reason>) - flag kept
+  <address> <name>: decompile-failed, set <prototype> from assembly
+  <address> <name>: decompile-failed, UNRESOLVED (<brief reason>)
 '''
 
 # Type / struct-recovery fix-up agent. Sibling of prototype-fixer but for DATA

@@ -24,15 +24,20 @@ What the script does, program-wide and deterministically (no LLM):
   the pass a true no-op on re-run and guarantees it never clobbers types someone
   else set.
 * When the recovered prototype is clean (a normal register/stack argument
-  sequence, not variadic, within the ABI argument budget) it **applies it to that
+  sequence, not variadic) it **applies it to that
   one function** via ``HighFunctionDBUtil.commitParamsToDatabase`` — the same
   program-DB write ``variables action:set_prototype`` performs, one function at a
   time. It never saves the program to disk.
-* Ambiguous cases (variadic, non-standard storage, too many args, or a failed
-  commit) are **not** changed; they get a ``proto-review`` bookmark and are
+* Ambiguous cases (variadic, non-standard storage, or a failed commit) are
+  **not** changed; they get a ``proto-review`` bookmark and are
   reported for the LLM ``prototype-fixer`` to adjudicate. A function already
   carrying that bookmark is counted but not re-reported, so re-runs don't re-flood
   the same ambiguities.
+* Functions the decompiler could not process at all (timeouts, varnode hash
+  errors, ...) are reported per-function with the decompiler's error message so
+  ``prototype-fixer`` can recover their signatures from the disassembly. They get
+  no bookmark: committing a prototype moves the signature source off ``DEFAULT``
+  so re-runs skip the function, while unresolved ones legitimately reappear.
 
 Decompilation — the expensive step — runs in parallel via Ghidra's
 ``ParallelDecompiler``/``DecompilerCallback`` (one ``DecompInterface`` and native
@@ -84,8 +89,8 @@ public class gda_recover_prototypes extends GhidraScript {
     static final String MARK_END = "<<<END_RECOVER_PROTOTYPES_JSON>>>";
     static final String REVIEW_CATEGORY = "proto-review";
     static final int DECOMP_TIMEOUT = 60;   // seconds per function
-    static final int MAX_ARGS = 8;          // ABI argument-register budget
     static final int FIXED_DETAIL_CAP = 200;
+    static final int FAILED_DETAIL_CAP = 200;
     static final int CHUNK_SIZE = 64;       // bounds live HighFunctions per chunk
 
     // Worker threads only decompile and classify (read-only); every program-DB
@@ -107,9 +112,10 @@ public class gda_recover_prototypes extends GhidraScript {
     private boolean dryRun = false;
     private int scanned = 0, alreadyCorrect = 0, fixed = 0;
     private int escalate = 0, escalateKnown = 0, decompFailed = 0;
-    private int fixedDetail = 0;
+    private int fixedDetail = 0, failedDetail = 0;
     private StringBuilder fixedJson = new StringBuilder();
     private StringBuilder escJson = new StringBuilder();
+    private StringBuilder failJson = new StringBuilder();
 
     private String typeName(DataType dt) {
         return dt != null ? dt.getName() : "undefined";
@@ -154,6 +160,22 @@ public class gda_recover_prototypes extends GhidraScript {
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    // Decompiler error text can be long multi-line console noise; keep the gist.
+    private String firstLine(String msg, String fallback) {
+        if (msg == null) {
+            return fallback;
+        }
+        String s = msg.trim();
+        int nl = s.indexOf('\n');
+        if (nl >= 0) {
+            s = s.substring(0, nl).trim();
+        }
+        if (s.isEmpty()) {
+            return fallback;
+        }
+        return s.length() > 200 ? s.substring(0, 200) : s;
     }
 
     private String addrString(Address entry) {
@@ -215,16 +237,22 @@ public class gda_recover_prototypes extends GhidraScript {
         ProtoResult r = new ProtoResult();
         r.func = res.getFunction();
         r.kind = ProtoResult.DECOMP_FAILED;
+        r.addrS = addrString(r.func.getEntryPoint());
+        r.nameS = r.func.getName();
         try {
             if (!res.decompileCompleted()) {
+                r.reason = firstLine(res.getErrorMessage(),
+                    "decompilation did not complete");
                 return r;
             }
             HighFunction hf = res.getHighFunction();
             if (hf == null) {
+                r.reason = "decompiler produced no high function";
                 return r;
             }
             FunctionPrototype proto = hf.getFunctionPrototype();
             if (proto == null) {
+                r.reason = "decompiler recovered no prototype";
                 return r;
             }
 
@@ -261,10 +289,8 @@ public class gda_recover_prototypes extends GhidraScript {
             } catch (Throwable t) {
                 isVarargs = false;
             }
-            boolean clean = !isVarargs && recCount <= MAX_ARGS && cleanStorage(proto);
+            boolean clean = !isVarargs && cleanStorage(proto);
 
-            r.addrS = addrString(func.getEntryPoint());
-            r.nameS = func.getName();
             r.recS = protoString(recRet, recParamTypes(proto));
             r.comS = protoString(comRet, comParamTypes(comParams));
 
@@ -276,12 +302,13 @@ public class gda_recover_prototypes extends GhidraScript {
                 r.kind = ProtoResult.ESCALATE;
                 r.reason = isVarargs
                     ? "variadic (...) - needs a manual prototype"
-                    : "recovered args use non-standard storage or exceed " + MAX_ARGS;
+                    : "recovered args use non-standard storage";
             }
         } catch (Throwable t) {
             // One bad function must not kill the whole queue.
             r.kind = ProtoResult.DECOMP_FAILED;
             r.hf = null;
+            r.reason = firstLine(t.getMessage(), t.getClass().getSimpleName());
         }
         return r;
     }
@@ -290,6 +317,13 @@ public class gda_recover_prototypes extends GhidraScript {
     private void applyResult(ProtoResult r) {
         if (r.kind == ProtoResult.DECOMP_FAILED) {
             decompFailed++;
+            if (failedDetail < FAILED_DETAIL_CAP) {
+                String err = r.reason != null ? r.reason : "unknown decompiler failure";
+                appendObj(failJson,
+                    "{\"addr\":\"" + js(r.addrS) + "\",\"name\":\"" + js(r.nameS)
+                    + "\",\"error\":\"" + js(err) + "\"}");
+                failedDetail++;
+            }
             return;
         }
         if (r.kind == ProtoResult.ALREADY_CORRECT) {
@@ -407,7 +441,11 @@ public class gda_recover_prototypes extends GhidraScript {
            .append(",\"decompile_failed\":").append(decompFailed)
            .append("},\"fixed\":[").append(fixedJson).append("]")
            .append(",\"fixed_truncated\":").append(fixed > fixedDetail ? "true" : "false")
-           .append(",\"escalate\":[").append(escJson).append("]}");
+           .append(",\"escalate\":[").append(escJson).append("]")
+           .append(",\"failed\":[").append(failJson).append("]")
+           .append(",\"failed_truncated\":")
+           .append(decompFailed > failedDetail ? "true" : "false")
+           .append("}");
 
         println(MARK_START);
         println(out.toString());
