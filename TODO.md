@@ -28,6 +28,13 @@
   unreachable. Cross-binary resume is a documented soft footgun (tools stay bound
   to the open binary).
 - [x] **OpenRouter support**
+- [ ] **Dynamic subagents: split `research` into planner → parallel workers → synthesizer** —
+  see the "Dynamic subagents — split `research`" section below for the full write-up.
+  Evidence (`agent_topology`): 80 LLM calls / 5.92M tokens across 2 invocations (~40 calls /
+  ~2.96M tokens each, 84:1 prompt:completion). Expected: 40–60% token reduction and latency
+  541s → ~120–180s per invocation. Effort: Med. *Caveat:* dynamic subagents were evaluated
+  2026-06-29 and parked because the QuickJS interpreter runtime is beta — prior design work in
+  `~/.claude/plans/langchain-came-out-with-ticklish-scone.md`; start there.
 
 ### From optimization report (2026-06-28, 7d window)
 
@@ -250,6 +257,40 @@ Design thoughts:
   (src/ghidra_deep_agent/tui/app.py); session-record writes wired alongside the
   `MongoDBSaver`/`binary_name` setup in main.py; reuse the existing `session_id`
   / `thread_id` plumbing to actually re-attach to the chosen checkpoint thread.
+
+## Dynamic subagents — split `research` into planner → workers → synthesizer
+
+Look into adding LangChain deepagents **dynamic subagents** (docs:
+https://docs.langchain.com/oss/python/deepagents/subagents — attach `langchain-quickjs`
+`CodeInterpreterMiddleware` so the coordinator writes a small orchestration script that fans
+out subagents in parallel via a `task()` global, instead of one native `task` call per turn)
+and use them to restructure the `research` sub-agent:
+
+- **Evidence** (`agent_topology`): 80 LLM calls, 5.92M tokens, 84:1 prompt:completion ratio,
+  2 invocations at ~40 calls / ~2.96M tokens each. The agent is accumulating enormous context
+  across 40 iterations without effective compaction.
+- **Proposed structure:**
+  - **research-planner** (lightweight step in main agent): decompose the research question
+    into 4–6 sub-queries.
+  - **research-worker** (spawned N× in parallel, `_ChatDeepSeekFixed`): each handles one
+    sub-query with focused tools (`search_strings`, `search_bytes`,
+    `search_functions_by_name`, `query_by_address`, `get_code`, `xrefs`, `grep`) and returns
+    a compact summary.
+  - **research-synthesizer** (single call, stronger model optional): aggregate sub-summaries
+    into the final report.
+- **Expected impact:** per-invocation tokens drop from ~2.96M to ~500–800K; per-invocation
+  LLM calls from ~40 to ~10–15. **40–60% token reduction** and latency cut from 541s to
+  ~120–180s.
+- **Effort:** Med.
+- **Prior art / caveat:** dynamic subagents were already evaluated (2026-06-29) as a strong
+  fit for this project but **parked because the QuickJS interpreter runtime is beta** (runs
+  in-process, and interpreter-dispatched runs break the TUI's `is_subagent = name == "task"`
+  tracking). The full flag-gated design, TUI observability work, and open questions (5s eval
+  timeout, dispatched-run event shape) are written up in
+  `~/.claude/plans/langchain-came-out-with-ticklish-scone.md` — start there rather than
+  re-deriving. If QuickJS is still a blocker, the planner→workers→synthesizer shape can be
+  approximated with the existing static `task` tool (batched same-turn parallel `task` calls),
+  at the cost of code-driven orchestration.
 
 ## OpenRouter support
 Add support for using OpenRouter as a model provider. LangChain should have a

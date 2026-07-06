@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Always make changes in a new worktree unless explicitly asked to do it outside of a worktree. Never add yourself as a co-author of a commit.
+Always make changes in a new worktree unless explicitly asked to do it outside of a worktree. Never add yourself as a co-author of a commit. Don't overwrite the default `user.name` when making a commit.
 
 ## Python Development
 
