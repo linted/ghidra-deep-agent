@@ -86,6 +86,17 @@ Sub-agent design — implemented in `src/ghidra_deep_agent/subagents.py` (`build
 - [ ] **Spill large tool outputs to a file instead of re-injecting** — *already implemented in deepagents:* `FilesystemMiddleware` offloads tool results over `tool_token_limit_before_evict` (default 20k tokens / ~80 KB) to `large_tool_results/`, leaving a preview + pointer. The hard part is lowering that threshold: `create_deep_agent` doesn't expose it, hardcodes `FilesystemMiddleware` in 3 places (graph.py:645/720/779), and the clean overrides are blocked — duplicate-instance assertion (factory.py:1080) and `_REQUIRED_MIDDLEWARE` blocks `excluded_middleware` (graph.py:230). Lowering it needs a monkeypatch (subclass + swap `deepagents.graph.FilesystemMiddleware`) or a custom offload middleware (~80 lines). Not worth it now for a non-urgent latency/cost win; revisit if deepagents exposes the knob or context bloat becomes a measured problem.
 - [ ] **Add graph-level timeout & error boundary** to top-level LangGraph — wall-clock timeout (~20 min) / recursion limit with graceful early-exit returning partial findings
 - [ ] **Bound `task` sub-agents** — max tool-call rounds + wall-clock timeout, return partial results on expiry
+- [ ] **Give `prototype-fixer` a clear/undefine-function tool** — when `recover_prototypes`
+  surfaces a decompile failure whose disassembly is plainly *not a real function*
+  (data/padding/misaligned, no coherent prologue), the fixer can currently only
+  bookmark it `not-a-function` and report it for a human/analyzer to remove — its
+  tool set (`variables`, `bookmarks`, read-only nav) has no way to undefine/clear
+  the bogus function. Add a Ghidra clear-function capability (e.g. an MCP
+  `clear_function`/`remove_function` tool, or a small local tool wrapping
+  `Listing.removeFunction` / `ClearFlowAndRepairCmd`) and grant it to
+  `prototype-fixer` so it can delete these itself. Destructive, so gate it behind
+  the same plan-mode/mutation controls as other write tools. Deferred out of the
+  "surface decompile failures" change on purpose.
 
 ### From optimization report (2026-06-29, 6h window)
 

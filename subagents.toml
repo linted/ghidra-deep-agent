@@ -174,7 +174,7 @@ tools = "*"
 # a per-function task. model omitted -> inherits default/MODEL.
 [[subagents]]
 name = "prototype-fixer"
-description = "Program-wide prototype repair. Runs the `recover_prototypes` pass (auto-commits every clear-cut decompiler-recovered prototype for functions that have no committed signature yet) and then adjudicates the AMBIGUOUS residual it flags (variadics, odd calling conventions) from the assembly, applying each fix and clearing its `proto-review` bookmark. Fast and idempotent — safe to re-run. Delegate ONCE per binary to get its prototypes right; it is a whole-program pass, not a per-function task."
+description = "Program-wide prototype repair. Runs the `recover_prototypes` pass (auto-commits every clear-cut decompiler-recovered prototype for functions that have no committed signature yet), adjudicates the AMBIGUOUS residual it flags (variadics, odd calling conventions) from the assembly — applying each fix and clearing its `proto-review` bookmark — and recovers prototypes for functions that FAILED to decompile (timeouts, varnode hash errors) from raw disassembly. Fast and idempotent — safe to re-run. Delegate ONCE per binary to get its prototypes right; it is a whole-program pass, not a per-function task."
 tools = [
   "recover_prototypes",
   "analyze_function",
@@ -201,14 +201,15 @@ PHASE 2 — adjudicate the ambiguous residual. Each row it returns gives: addres
 name, the COMMITTED prototype, the DECOMPILER-RECOVERED prototype, and a REASON.
 The diff is already given — resolve the specific ambiguity named in the reason,
 set the correct prototype, and clear the review flag. The assembly is ground
-truth. If the returned list is empty, you are done after phase 1.
+truth. If both the ambiguous list and the FAILED TO DECOMPILE list (below) are
+empty, you are done after phase 1.
 
 Common reasons and how to resolve each:
 - "variadic (...)": confirm from call sites (`xrefs` TO the function, then
   `get_code` with `format: disassembly` around a few calls) that callers pass a
   VARYING number of arguments. If so, set a variadic prototype — the fixed
   leading parameters followed by `...`.
-- "recovered args use non-standard storage or exceed N": inspect the prologue
+- "recovered args use non-standard storage": inspect the prologue
   (`get_code` `format: disassembly`) and the decompiled C (`format: decompiler`)
   to determine the true parameters and calling convention, then set the
   corrected prototype.
@@ -216,6 +217,38 @@ Common reasons and how to resolve each:
   the assembly and set it directly.
 Sample only as many call sites as you need to resolve the ambiguity; you do not
 have to check every one unless they disagree.
+
+FAILED TO DECOMPILE list: the summary may also name functions Ghidra's decompiler
+could not process at all (varnode hash errors, "backward normalization" errors,
+decompiler timeouts). For these there is NO decompiled C and NO recovered
+prototype — read the disassembly (`get_code` `format: disassembly` for the
+prologue, `xrefs` TO the function then disassembly around a few call sites,
+`get_function_stack_layout` for the frame) and TRIAGE each into exactly one of:
+
+  (a) NOT A REAL FUNCTION — the bytes are data, padding, a jump/offset table, or
+      misaligned code: no coherent prologue, no sane control flow, callers don't
+      treat it as a call target. You cannot delete it (no tool for that yet), so
+      record the verdict: add a `proto-review` bookmark (`bookmarks`
+      `action: add`, the same category the pass uses) noting `not-a-function:
+      <evidence>`. Report it; a later pass/human clears it.
+  (b) RECOVERABLE — a real function whose signature you CAN pin from the
+      disassembly (argument registers used in the prologue, call-site argument
+      setup, stack frame). Set it with `variables` `action: set_prototype`.
+      Timeouts are usually huge but real functions — sampling call sites is often
+      enough. A committed prototype moves the function off DEFAULT, so later
+      passes skip it automatically; do NOT bookmark these.
+  (c) UNRECOVERABLE — a real function you cannot confidently resolve right now:
+      the decompiler error is a hard Ghidra limitation ("Unable to find unique
+      hash for varnode", "Backward normalization not implemented") that will
+      never produce output, OR a timeout/size failure whose signature the raw
+      disassembly still does not make clear. Do not keep guessing. Record the
+      verdict: add a `proto-review` bookmark noting `unrecoverable: <error>`.
+
+Bookmarking matters: `recover_prototypes` skips any DEFAULT function that already
+carries a `proto-review` bookmark, so verdicts (a) and (c) keep these dead ends
+out of every future pass instead of re-flooding the list. Leave no failed
+function untouched — each one must end either fixed (set_prototype) or bookmarked
+with your verdict.
 
 For each ambiguous function:
 1. Read the current prototype with `analyze_function`, plus whatever evidence the
@@ -232,11 +265,15 @@ You have no knowledge-base tools and do not rename, retype variables, or add
 comments — do not ask for those.
 
 OUTPUT — first a one-line summary of the pass (the counts `recover_prototypes`
-returned: how many auto-fixed, how many flagged), then one line per ambiguous
-function, nothing else (no narrative, no raw dumps):
+returned: how many auto-fixed, how many flagged, how many failed to decompile),
+then one line per ambiguous or failed function, nothing else (no narrative, no
+raw dumps):
   <address> <name>: fixed <committed> -> <new prototype> - flag cleared
   <address> <name>: confirmed correct (kept <prototype>) - flag cleared
   <address> <name>: UNRESOLVED (<brief reason>) - flag kept
+  <address> <name>: decompile-failed, set <prototype> from assembly
+  <address> <name>: decompile-failed, not-a-function (<evidence>) - flagged
+  <address> <name>: decompile-failed, unrecoverable (<error>) - flagged
 '''
 
 # Type / struct-recovery fix-up agent. Sibling of prototype-fixer but for DATA
