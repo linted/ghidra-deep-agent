@@ -7,13 +7,14 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from ghidra_deep_agent.tui import GhidraAgentApp
-from ghidra_deep_agent.tui.events import parse_checkpoint_ns
+from ghidra_deep_agent.tui.events import handle_event, parse_checkpoint_ns
 from ghidra_deep_agent.tui.help_screen import HelpScreen
 from ghidra_deep_agent.tui.widgets import (
     ActivityTree,
     CommandInput,
     ResponseLog,
     StatusBar,
+    ThinkingPanel,
 )
 
 
@@ -128,6 +129,116 @@ def test_run_streams_response_into_transcript() -> None:
             assert log.transcript[1] == "hello from stub"
             assert log.last_response == "hello from stub"
             assert not app._agent_running
+
+    asyncio.run(run())
+
+
+def test_nested_tool_calls_are_hidden() -> None:
+    """A tool invoked from inside another tool's body (recover_prototypes →
+    scripts) is suppressed entirely — no tree row, no deferred-async leak."""
+
+    async def run() -> None:
+        app = _make_app()
+        async with app.run_test() as pilot:
+            activity = app.query_one(ActivityTree)
+            response = app.query_one(ResponseLog)
+            thinking = app.query_one(ThinkingPanel)
+
+            def emit(event: dict[str, Any]) -> None:
+                handle_event(app, event, activity, response, thinking)
+
+            emit(
+                {
+                    "event": "on_tool_start",
+                    "run_id": "outer",
+                    "name": "recover_prototypes",
+                    "metadata": {},
+                    "parent_ids": [],
+                    "data": {"input": {"dry_run": False}},
+                }
+            )
+            emit(
+                {
+                    "event": "on_tool_start",
+                    "run_id": "inner",
+                    "name": "scripts",
+                    "metadata": {},
+                    "parent_ids": ["chain", "outer"],
+                    "data": {"input": {"action": "run"}},
+                }
+            )
+            await pilot.pause()
+            assert "outer" in activity._run_map
+            assert "inner" not in activity._run_map
+            assert "inner" in app._hidden_tool_runs
+            assert len(activity.root.children) == 1
+
+            # The hidden run ends with an async submission stub; it must not
+            # register a deferred completion (there is no middleware to
+            # dispatch ASYNC_DONE_EVENT for direct-invoke calls).
+            emit(
+                {
+                    "event": "on_tool_end",
+                    "run_id": "inner",
+                    "metadata": {},
+                    "data": {"output": "Script task submitted: abc123"},
+                }
+            )
+            assert app._pending_async == {}
+            assert "inner" not in app._hidden_tool_runs
+
+            emit(
+                {
+                    "event": "on_tool_end",
+                    "run_id": "outer",
+                    "metadata": {},
+                    "data": {"output": "Prototype recovery pass complete."},
+                }
+            )
+            await pilot.pause()
+            assert app._active_tool_runs == set()
+            assert "✓" in str(activity._run_map["outer"][0].label)
+
+    asyncio.run(run())
+
+
+def test_subagent_inner_tools_stay_visible() -> None:
+    """Tool calls made by a sub-agent have the `task` run in their ancestry
+    but must not be hidden — they are the sub-agent's real work."""
+
+    async def run() -> None:
+        app = _make_app()
+        async with app.run_test() as pilot:
+            activity = app.query_one(ActivityTree)
+            response = app.query_one(ResponseLog)
+            thinking = app.query_one(ThinkingPanel)
+
+            def emit(event: dict[str, Any]) -> None:
+                handle_event(app, event, activity, response, thinking)
+
+            emit(
+                {
+                    "event": "on_tool_start",
+                    "run_id": "task1",
+                    "name": "task",
+                    "metadata": {"langgraph_checkpoint_ns": "tools:a"},
+                    "parent_ids": [],
+                    "data": {"input": {"description": "research"}},
+                }
+            )
+            emit(
+                {
+                    "event": "on_tool_start",
+                    "run_id": "sub_tool",
+                    "name": "get_code",
+                    "metadata": {"langgraph_checkpoint_ns": "tools:a|tools:b"},
+                    "parent_ids": ["task1"],
+                    "data": {"input": {"address": "0x1000"}},
+                }
+            )
+            await pilot.pause()
+            assert "sub_tool" not in app._hidden_tool_runs
+            assert "sub_tool" in activity._run_map
 
     asyncio.run(run())
 

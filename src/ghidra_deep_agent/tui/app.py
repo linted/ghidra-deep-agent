@@ -149,6 +149,12 @@ class GhidraAgentApp(App[None]):
         # "completed" marker is deferred until ASYNC_DONE_EVENT arrives.
         self._hidden_tool_runs: set[str] = set()
         self._pending_async: dict[str, str] = {}
+        # Plain (non-subagent) tool runs currently in flight. A tool call whose
+        # parent_ids chain contains one of these was made from *inside* another
+        # tool (e.g. recover_prototypes invoking `scripts` directly) and is
+        # hidden — it's the composite tool's implementation detail, not the
+        # agent's work.
+        self._active_tool_runs: set[str] = set()
         self._output_dir = os.environ.get("AGENT_OUTPUT_DIR", "")
         self._config = config
         self._model = model
