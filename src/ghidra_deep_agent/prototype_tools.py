@@ -122,8 +122,10 @@ def _format_summary(payload: dict[str, Any]) -> str:
     if failed:
         lines.append("")
         lines.append(
-            "Failed to decompile — no recovered prototype exists; determine "
-            "their signatures from the disassembly:"
+            "Failed to decompile — no recovered prototype exists. Triage each "
+            "from the disassembly: recover the prototype if it is a real "
+            "function, else flag it (not-a-function / unrecoverable) so later "
+            "passes skip it:"
         )
         for f in failed:
             lines.append(
@@ -187,8 +189,9 @@ def build_prototype_tools(mcp_tools: list[BaseTool]) -> list[BaseTool]:
         Use this INSTEAD of searching for ``param_count=0`` functions and tracing
         prologues and call sites by hand — the decompiler has already done that
         deterministic work. Returns a compact summary plus the functions that
-        still need judgement and any that failed to decompile; resolve those from
-        the assembly. Safe to re-run: already-correct and previously-flagged
+        still need judgement and any that failed to decompile; triage those from
+        the assembly (recover the prototype, or flag not-a-function /
+        unrecoverable). Safe to re-run: already-correct and previously-flagged
         functions are skipped.
 
         Cost: this is ONE whole-program pass and is fast — a few seconds on a

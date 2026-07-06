@@ -30,14 +30,17 @@ What the script does, program-wide and deterministically (no LLM):
   time. It never saves the program to disk.
 * Ambiguous cases (variadic, non-standard storage, or a failed commit) are
   **not** changed; they get a ``proto-review`` bookmark and are
-  reported for the LLM ``prototype-fixer`` to adjudicate. A function already
-  carrying that bookmark is counted but not re-reported, so re-runs don't re-flood
-  the same ambiguities.
+  reported for the LLM ``prototype-fixer`` to adjudicate. Any DEFAULT function
+  already carrying that bookmark is skipped up front on re-run (counted, not
+  re-decompiled and not re-reported), so re-runs don't re-flood the same
+  ambiguities.
 * Functions the decompiler could not process at all (timeouts, varnode hash
   errors, ...) are reported per-function with the decompiler's error message so
-  ``prototype-fixer`` can recover their signatures from the disassembly. They get
-  no bookmark: committing a prototype moves the signature source off ``DEFAULT``
-  so re-runs skip the function, while unresolved ones legitimately reappear.
+  ``prototype-fixer`` can triage them from the disassembly. The script itself
+  writes no bookmark for these; the fixer resolves each by either committing a
+  prototype (which moves the signature off ``DEFAULT``) or, for a dead end,
+  writing a ``proto-review`` bookmark recording the verdict (not-a-function /
+  unrecoverable) — which the skip above then keeps out of every later pass.
 
 Decompilation — the expensive step — runs in parallel via Ghidra's
 ``ParallelDecompiler``/``DecompilerCallback`` (one ``DecompInterface`` and native
@@ -351,10 +354,8 @@ public class gda_recover_prototypes extends GhidraScript {
     }
 
     private void escalateResult(ProtoResult r, String reason) {
-        if (!dryRun && hasReviewBookmark(r.func.getEntryPoint())) {
-            escalateKnown++;
-            return;
-        }
+        // Candidates carrying a prior proto-review bookmark are filtered out in
+        // run(), so anything reaching here is a genuinely NEW escalation.
         if (!dryRun) {
             setReviewBookmark(r.func.getEntryPoint(), reason);
         }
@@ -389,6 +390,16 @@ public class gda_recover_prototypes extends GhidraScript {
             scanned++;
             if (func.getSignatureSource() != SourceType.DEFAULT) {
                 alreadyCorrect++;
+                continue;
+            }
+            // A DEFAULT function already carrying a proto-review bookmark was
+            // triaged by prototype-fixer on a prior pass (an unresolved
+            // escalation, or a decompile failure it judged not-a-function /
+            // unrecoverable). Skip it up front: don't re-decompile and don't
+            // re-report. This is what stops re-runs re-flooding the same
+            // dead-ends, and it also spares the expensive decompile.
+            if (hasReviewBookmark(func.getEntryPoint())) {
+                escalateKnown++;
                 continue;
             }
             candidates.add(func);

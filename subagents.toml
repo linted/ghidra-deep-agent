@@ -221,15 +221,34 @@ have to check every one unless they disagree.
 FAILED TO DECOMPILE list: the summary may also name functions Ghidra's decompiler
 could not process at all (varnode hash errors, "backward normalization" errors,
 decompiler timeouts). For these there is NO decompiled C and NO recovered
-prototype — work from the assembly alone: read the prologue (`get_code`
-`format: disassembly`), a few call sites (`xrefs` TO the function, then
-disassembly around the calls), and the stack frame
-(`get_function_stack_layout`). Where the evidence supports a signature, apply it
-with `variables` `action: set_prototype` — once committed, later passes skip the
-function. Timeouts usually mean a huge function; call sites alone are often
-enough to pin the signature. These functions carry NO `proto-review` bookmark,
-so there is no flag to clear. If the evidence is insufficient, leave the
-function unchanged and report it unresolved.
+prototype — read the disassembly (`get_code` `format: disassembly` for the
+prologue, `xrefs` TO the function then disassembly around a few call sites,
+`get_function_stack_layout` for the frame) and TRIAGE each into exactly one of:
+
+  (a) NOT A REAL FUNCTION — the bytes are data, padding, a jump/offset table, or
+      misaligned code: no coherent prologue, no sane control flow, callers don't
+      treat it as a call target. You cannot delete it (no tool for that yet), so
+      record the verdict: add a `proto-review` bookmark (`bookmarks`
+      `action: add`, the same category the pass uses) noting `not-a-function:
+      <evidence>`. Report it; a later pass/human clears it.
+  (b) RECOVERABLE — a real function whose signature you CAN pin from the
+      disassembly (argument registers used in the prologue, call-site argument
+      setup, stack frame). Set it with `variables` `action: set_prototype`.
+      Timeouts are usually huge but real functions — sampling call sites is often
+      enough. A committed prototype moves the function off DEFAULT, so later
+      passes skip it automatically; do NOT bookmark these.
+  (c) UNRECOVERABLE — a real function you cannot confidently resolve right now:
+      the decompiler error is a hard Ghidra limitation ("Unable to find unique
+      hash for varnode", "Backward normalization not implemented") that will
+      never produce output, OR a timeout/size failure whose signature the raw
+      disassembly still does not make clear. Do not keep guessing. Record the
+      verdict: add a `proto-review` bookmark noting `unrecoverable: <error>`.
+
+Bookmarking matters: `recover_prototypes` skips any DEFAULT function that already
+carries a `proto-review` bookmark, so verdicts (a) and (c) keep these dead ends
+out of every future pass instead of re-flooding the list. Leave no failed
+function untouched — each one must end either fixed (set_prototype) or bookmarked
+with your verdict.
 
 For each ambiguous function:
 1. Read the current prototype with `analyze_function`, plus whatever evidence the
@@ -253,7 +272,8 @@ raw dumps):
   <address> <name>: confirmed correct (kept <prototype>) - flag cleared
   <address> <name>: UNRESOLVED (<brief reason>) - flag kept
   <address> <name>: decompile-failed, set <prototype> from assembly
-  <address> <name>: decompile-failed, UNRESOLVED (<brief reason>)
+  <address> <name>: decompile-failed, not-a-function (<evidence>) - flagged
+  <address> <name>: decompile-failed, unrecoverable (<error>) - flagged
 '''
 
 # Type / struct-recovery fix-up agent. Sibling of prototype-fixer but for DATA
