@@ -46,6 +46,37 @@ def extract_output_snippet(output: object) -> str:
     return str(content)[:80]
 
 
+def _flatten_content(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and "text" in block:
+                parts.append(str(block["text"]))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(parts)
+    return str(content)
+
+
+def extract_subagent_report(output: object) -> str:
+    """Full text a `task` tool returned to the main agent (the sub-agent report).
+
+    The normal shape is Command(update={"messages": [ToolMessage(text)]});
+    fall back to a bare ToolMessage's content, or the stringified output.
+    """
+    if output is None:
+        return ""
+    update = getattr(output, "update", None)
+    if isinstance(update, dict):
+        for msg in reversed(update.get("messages") or []):
+            content = getattr(msg, "content", None)
+            if content is not None:
+                return _flatten_content(content)
+    return _flatten_content(getattr(output, "content", output))
+
+
 class Usage(NamedTuple):
     input_tokens: int
     output_tokens: int

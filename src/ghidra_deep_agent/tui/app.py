@@ -32,9 +32,12 @@ from ghidra_deep_agent.tui.messages import (
     AgentDone,
     ContextUpdate,
     StatusFlash,
+    SubagentReport,
+    SubagentReportCaptured,
     TokenUpdate,
     ToolCountChanged,
 )
+from ghidra_deep_agent.tui.report_screen import SubagentReportScreen
 from ghidra_deep_agent.tui.session_select import SessionSelectScreen
 from ghidra_deep_agent.tui.widgets import (
     PLACEHOLDER_BUSY,
@@ -101,6 +104,7 @@ class GhidraAgentApp(App[None]):
         Binding("ctrl+shift+y", "yank_all", "Copy transcript", show=False),
         Binding("ctrl+l", "clear_log", "Clear log"),
         Binding("ctrl+t", "toggle_tree", "Tree"),
+        Binding("ctrl+o", "reports", "Reports"),
         Binding("f1", "help", "Help", show=False),
     ]
 
@@ -149,6 +153,11 @@ class GhidraAgentApp(App[None]):
         # "completed" marker is deferred until ASYNC_DONE_EVENT arrives.
         self._hidden_tool_runs: set[str] = set()
         self._pending_async: dict[str, str] = {}
+        # Sub-agent (`task`) run bookkeeping: run_id -> (description, start time)
+        # while in flight, and the completed runs' final reports for the ctrl+o
+        # viewer (what each sub-agent returned to the main agent).
+        self._subagent_meta: dict[str, tuple[str, float]] = {}
+        self._subagent_reports: list[SubagentReport] = []
         # Plain (non-subagent) tool runs currently in flight. A tool call whose
         # parent_ids chain contains one of these was made from *inside* another
         # tool (e.g. recover_prototypes invoking `scripts` directly) and is
@@ -358,6 +367,8 @@ class GhidraAgentApp(App[None]):
             self._exit_ask_mode()
         self._session_id = session_id
         self._config["configurable"]["thread_id"] = session_id
+        self._subagent_meta.clear()
+        self._subagent_reports.clear()
         self.action_clear_log()
         self.sub_title = f"{self._model}  ·  session: {session_id}"
         if self._session_store is not None:
@@ -555,6 +566,20 @@ class GhidraAgentApp(App[None]):
 
     def action_toggle_tree(self) -> None:
         self.query_one("#panes").toggle_class("hide-tree")
+
+    def on_subagent_report_captured(self, msg: SubagentReportCaptured) -> None:
+        self._subagent_reports.append(msg.report)
+
+    def action_reports(self) -> None:
+        """Open the sub-agent report viewer.
+
+        Reports survive `/clear` (they're the session's audit trail) and are
+        dropped only on a session switch.
+        """
+        if not self._subagent_reports:
+            self.notify("No sub-agent reports yet.", severity="warning")
+            return
+        self.push_screen(SubagentReportScreen(list(reversed(self._subagent_reports))))
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())

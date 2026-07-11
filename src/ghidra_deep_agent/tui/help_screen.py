@@ -24,6 +24,7 @@ _HELP_TEXT = """\
   ↑ / ↓          walk input history
   Escape         cancel a running agent · close this help
   Ctrl+T         toggle the activity pane
+  Ctrl+O         view sub-agent reports (Esc close · Ctrl+Y copy)
   Ctrl+Y         copy last response
   Ctrl+Shift+Y   copy full transcript
   Ctrl+L         clear log

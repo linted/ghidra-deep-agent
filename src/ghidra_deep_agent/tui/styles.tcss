@@ -81,3 +81,31 @@ HelpScreen {
     text-style: bold;
     margin-bottom: 1;
 }
+
+SubagentReportScreen {
+    align: center middle;
+}
+
+#report-box {
+    width: 90%;
+    height: 85%;
+    border: round $accent;
+    padding: 1 2;
+    background: $surface;
+}
+
+#report-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#report-list {
+    height: auto;
+    max-height: 10;
+    margin-bottom: 1;
+}
+
+#report-body {
+    height: 1fr;
+    scrollbar-size: 1 1;
+}

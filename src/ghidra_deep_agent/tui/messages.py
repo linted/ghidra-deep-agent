@@ -2,7 +2,26 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from textual.message import Message
+
+
+@dataclass(frozen=True)
+class SubagentReport:
+    """What one `task` run returned to the main agent."""
+
+    run_id: str
+    description: str
+    text: str
+    error: bool
+    elapsed: float
+
+
+class SubagentReportCaptured(Message):
+    def __init__(self, report: SubagentReport) -> None:
+        super().__init__()
+        self.report = report
 
 
 class ToolStarted(Message):
