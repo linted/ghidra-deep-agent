@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any
 
 from ghidra_deep_agent.async_tasks import ASYNC_DONE_EVENT, async_task_id
 from ghidra_deep_agent.tui.formatting import (
     extract_output_snippet,
     extract_preview,
+    extract_subagent_report,
     extract_text,
     extract_usage,
 )
@@ -17,6 +19,8 @@ from ghidra_deep_agent.tui.messages import (
     LLMThinking,
     ResponseFinal,
     StatusFlash,
+    SubagentReport,
+    SubagentReportCaptured,
     TextToken,
     TokenUpdate,
     ToolCountChanged,
@@ -80,6 +84,11 @@ def handle_event(
         is_subagent = name == "task"
         if not is_subagent:
             app._active_tool_runs.add(run_id)
+        else:
+            description = (
+                raw_input.get("description") if isinstance(raw_input, dict) else None
+            )
+            app._subagent_meta[run_id] = (description or preview, time.monotonic())
         activity.post_message(
             ToolStarted(run_id, name, preview, is_subagent, checkpoint_ns)
         )
@@ -92,6 +101,28 @@ def handle_event(
             return
         output = event.get("data", {}).get("output")
         error = bool(event.get("data", {}).get("error"))
+        meta = app._subagent_meta.pop(run_id, None)
+        if meta is not None:
+            # `task` is a local tool that can never return an async submission
+            # stub, so skip stub detection: its Command's str() contains the
+            # report text, and a report merely quoting a stub would otherwise
+            # defer this node forever. Keep the full report for ctrl+o.
+            description, started = meta
+            app.post_message(
+                SubagentReportCaptured(
+                    SubagentReport(
+                        run_id,
+                        description,
+                        extract_subagent_report(output),
+                        error,
+                        time.monotonic() - started,
+                    )
+                )
+            )
+            snippet = extract_output_snippet(output) if error else ""
+            activity.post_message(ToolEnded(run_id, error, snippet))
+            app.post_message(ToolCountChanged(-1))
+            return
         # An async tool's own on_tool_end fires immediately with a submission
         # stub, before the real result is polled. Defer its "completed" marker:
         # remember the node by task_id and complete it on ASYNC_DONE_EVENT.
