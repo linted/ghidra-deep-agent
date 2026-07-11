@@ -208,6 +208,9 @@ async def main() -> None:
         )
 
     recursion_limit = int(os.environ.get("RECURSION_LIMIT", "10000"))
+    # Name each top-level graph so LangSmith traces show the app instead of the
+    # langgraph library default ("LangGraph").
+    app_name = os.environ.get("APP_NAME", "ghidra-deep-agent")
     config = {
         "configurable": {"thread_id": session_id},
         "recursion_limit": recursion_limit,
@@ -263,6 +266,7 @@ async def main() -> None:
                 middleware=shared_middleware,
                 subagents=subagents,
                 backend=backend,
+                name=app_name,
             )
 
             agent = create_deep_agent(**agent_kwargs)
@@ -279,6 +283,7 @@ async def main() -> None:
                 middleware=shared_middleware,
                 subagents=plan_mode_subagents,
                 backend=backend,
+                name=app_name,
             )
 
             # Ask-mode graph: read-only question-answering coordinator. Keeps the
@@ -310,6 +315,7 @@ async def main() -> None:
                 middleware=shared_middleware,
                 subagents=ask_mode_subagents,
                 backend=backend,
+                name=app_name,
             )
 
             profile = getattr(built_model, "profile", None) or {}
