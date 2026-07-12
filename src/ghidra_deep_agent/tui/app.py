@@ -23,6 +23,7 @@ from ghidra_deep_agent.prompt import (
     MARKED_BACKGROUND,
     PLAN_CONTEXT_SUMMARY_PROMPT,
 )
+from ghidra_deep_agent.resilience import UsageLimitError
 from ghidra_deep_agent.sessions import SessionStore
 from ghidra_deep_agent.toasts import ToastRequest, register_toast_sink
 from ghidra_deep_agent.tui.events import handle_event
@@ -265,6 +266,21 @@ class GhidraAgentApp(App[None]):
         self._touch_session(display)
         self._agent_worker = self._run_agent(agent_input)
 
+    def _resume_run(self) -> None:
+        """Continue an interrupted turn on the current (main) thread.
+
+        Re-invokes the graph with a ``None`` input so LangGraph replays from the
+        last checkpoint: only the failed task re-runs, while completed sub-agents
+        are restored from pending writes. Used after a run pauses on a usage
+        limit (see ``UsageLimitError`` handling in ``_run_agent``).
+        """
+        self._set_busy(True)
+        response = self.query_one(ResponseLog)
+        response.write("[dim]↻ Continuing from the last checkpoint…[/dim]")
+        self.query_one(ActivityTree).reset()
+        self._touch_session("/continue")
+        self._agent_worker = self._run_agent(None)
+
     @work(exclusive=False)
     async def _touch_session(self, prompt: str) -> None:
         """Bump the session's activity time (fire-and-forget, best-effort)."""
@@ -300,6 +316,17 @@ class GhidraAgentApp(App[None]):
                 bar.flash("[yellow]Agent still running — please wait.[/yellow]")
                 return
             self._open_resume_picker()
+        elif cmd == "/continue":
+            if self._agent_running:
+                bar.flash("[yellow]Agent still running — please wait.[/yellow]")
+                return
+            if self._plan_mode or self._ask_mode:
+                bar.flash(
+                    "[yellow]/continue resumes the main session — "
+                    "exit plan/ask mode first.[/yellow]"
+                )
+                return
+            self._resume_run()
         elif cmd == "/plan":
             if self._agent_running:
                 bar.flash("[yellow]Agent still running — please wait.[/yellow]")
@@ -628,7 +655,7 @@ class GhidraAgentApp(App[None]):
         )
 
     @work(exclusive=True)
-    async def _run_agent(self, query: str) -> None:
+    async def _run_agent(self, query: str | None) -> None:
         # Pick the graph AND its thread config together, captured for the lifetime
         # of this turn so a later mode flip can't change which thread we stream to.
         # `/plan` and `/ask` are mutually exclusive side-modes, each on its own
@@ -654,28 +681,37 @@ class GhidraAgentApp(App[None]):
             self.query_one("#query", Input).focus()
             return
 
-        messages: list[dict[str, str]] = []
-        # On the first turn of a side-mode, seed its fresh thread with a marked
-        # summary of the main session so far (background, not the mode's work).
-        if (plan_run and self._plan_needs_seed) or (ask_run and self._ask_needs_seed):
-            self._plan_needs_seed = False
-            self._ask_needs_seed = False
-            background = await self._build_marked_prior_context()
-            if background:
-                messages.append({"role": "user", "content": background})
-        if plan_run and plan_path:
-            query = (
-                f"[Plan mode — write/maintain the complete plan at `{plan_path}`]"
-                f"\n\n{query}"
-            )
-        elif ask_run:
-            query = (
-                "[Ask mode — decompose the question(s), delegate investigation to "
-                "the research sub-agent, and synthesize a grounded, cited answer]"
-                f"\n\n{query}"
-            )
-        messages.append({"role": "user", "content": query})
-        input_data = {"messages": messages}
+        input_data: dict[str, Any] | None
+        if query is None:
+            # Resume (`/continue`): re-invoke with no input so LangGraph replays
+            # from the last checkpoint on this thread — only the failed task
+            # re-runs, completed sub-agents are restored from pending writes.
+            input_data = None
+        else:
+            messages: list[dict[str, str]] = []
+            # On the first turn of a side-mode, seed its fresh thread with a
+            # marked summary of the main session so far (background, not work).
+            if (plan_run and self._plan_needs_seed) or (
+                ask_run and self._ask_needs_seed
+            ):
+                self._plan_needs_seed = False
+                self._ask_needs_seed = False
+                background = await self._build_marked_prior_context()
+                if background:
+                    messages.append({"role": "user", "content": background})
+            if plan_run and plan_path:
+                query = (
+                    f"[Plan mode — write/maintain the complete plan at "
+                    f"`{plan_path}`]\n\n{query}"
+                )
+            elif ask_run:
+                query = (
+                    "[Ask mode — decompose the question(s), delegate investigation "
+                    "to the research sub-agent, and synthesize a grounded, cited "
+                    f"answer]\n\n{query}"
+                )
+            messages.append({"role": "user", "content": query})
+            input_data = {"messages": messages}
 
         activity = self.query_one(ActivityTree)
         thinking = self.query_one(ThinkingPanel)
@@ -697,6 +733,25 @@ class GhidraAgentApp(App[None]):
                 self._last_plan_text = plan_text
                 if plan_text:
                     response.log_plan(plan_text)
+        except UsageLimitError:
+            # Not a crash: the provider usage/rate limit outlasted our retries.
+            # Everything committed so far (history + finished sub-agents) is
+            # durable in the checkpointer, so tell the user how to resume rather
+            # than showing a scary error.
+            sid = self._session_id
+            response.write(Rule(style="yellow"))
+            response.write(
+                "[bold yellow]⏸ Usage limit reached — run paused and safely "
+                "checkpointed.[/bold yellow]"
+            )
+            response.write(
+                f"Completed work is saved to session [b]{sid}[/b]. When your "
+                "limit resets, type [b]/continue[/b] to pick up where this turn "
+                "left off (finished sub-agents won't re-run). If you've since "
+                f"closed the app, relaunch with [b]--session-id {sid}[/b] and "
+                "then run [b]/continue[/b]."
+            )
+            response.write(Rule(style="yellow"))
         except Exception as exc:
             response.write(Rule(style="red"))
             response.write(f"[bold red]✗ Error: {exc}[/bold red]")

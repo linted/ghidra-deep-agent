@@ -29,6 +29,26 @@ from langchain_core.language_models import BaseChatModel
 
 ModelResolver = Callable[[str | None], str | BaseChatModel]
 
+
+class UsageLimitError(Exception):
+    """Raised when a provider usage/rate limit outlasts the retry budget.
+
+    A rate/quota limit that our short backoff retries can't clear (e.g. the
+    multi-hour Anthropic "5-hour" limit) is not something we want to swallow into
+    a synthetic error turn — that would poison the conversation and, inside a
+    sub-agent, feed garbage back to the coordinator. Instead we raise this so the
+    in-flight turn halts at a clean checkpoint boundary. The MongoDB checkpointer
+    has already persisted every completed super-step (including finished
+    sub-agent ``task`` results via pending writes), so the run can be resumed
+    later on the same ``thread_id`` with a ``None`` input — see the TUI's
+    ``/continue`` command.
+    """
+
+    def __init__(self, original: BaseException) -> None:
+        self.original = original
+        super().__init__(str(original))
+
+
 # deepagents filesystem built-ins whose failures are transient I/O (and whose
 # retries are safe — idempotent reads/writes of agent artifacts). We do NOT
 # retry Ghidra MCP tools here: their transport already surfaces server errors as
@@ -57,6 +77,21 @@ _TRANSIENT_MARKERS = (
     "gateway timeout",
 )
 
+# Subset of transient errors that mean "we've hit a usage/rate/quota limit" — the
+# kind our short retries can't wait out. A 429 status, or any of these markers,
+# routes the exhausted call to a clean halt (UsageLimitError) instead of a
+# swallowed error turn, so the run stays cleanly resumable. Distinct from a plain
+# network blip (timeout / connection reset / 5xx), which keeps the old behavior.
+_USAGE_LIMIT_MARKERS = (
+    "rate limit",
+    "ratelimit",
+    "too many requests",
+    "overloaded",
+    "quota",
+    "usage limit",
+    "insufficient_quota",
+)
+
 
 def _is_transient(exc: BaseException) -> bool:
     """Heuristic: would retrying this error plausibly succeed?
@@ -70,6 +105,35 @@ def _is_transient(exc: BaseException) -> bool:
         return True
     text = f"{type(exc).__name__}: {exc}".lower()
     return any(marker in text for marker in _TRANSIENT_MARKERS)
+
+
+def _is_usage_limit(exc: BaseException) -> bool:
+    """Would waiting hours (not seconds) be the only thing that clears this?
+
+    True for provider rate/usage/quota limits (429, or a limit marker in the
+    text). Provider-agnostic: relies on status code + text, never on a
+    provider-specific ``retry-after`` header (inconsistent across
+    Anthropic/OpenRouter/DeepSeek, absent on Ollama).
+    """
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status == 429:
+        return True
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _USAGE_LIMIT_MARKERS)
+
+
+def _on_model_retries_exhausted(exc: BaseException) -> str:
+    """`on_failure` for ``ModelRetryMiddleware``: halt on a limit, else continue.
+
+    A usage/rate limit that survived every retry is raised as
+    :class:`UsageLimitError` so the turn stops at a clean, resumable checkpoint
+    instead of committing a synthetic error message. Any other exhausted error
+    keeps the stock ``"continue"`` behavior — return a string that becomes the
+    ``AIMessage`` content — so an unrelated blip still doesn't hard-crash a turn.
+    """
+    if _is_usage_limit(exc):
+        raise UsageLimitError(exc)
+    return f"Model call failed after retries: {exc}"
 
 
 def _fallback_specs() -> list[str]:
@@ -100,7 +164,7 @@ def build_model_resilience_middleware(
         ModelRetryMiddleware(
             max_retries=max_retries,
             retry_on=_is_transient,
-            on_failure="continue",
+            on_failure=_on_model_retries_exhausted,
         )
     )
     return middleware
