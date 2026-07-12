@@ -15,6 +15,7 @@ SLASH_COMMANDS = [
     "/ask-cancel",
     "/clear",
     "/compact",
+    "/continue",
     "/help",
     "/plan",
     "/plan-cancel",

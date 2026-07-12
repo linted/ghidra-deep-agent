@@ -213,3 +213,23 @@ The agent connects to the Ghidra MCP server, loads its tools, and opens an inter
 ```
 
 Each run starts a new session with a random UUID unless `--session-id` is supplied. The session ID is printed when you exit — use it to resume later. Press `Ctrl+C` or type `quit` to exit.
+
+### Recovering after an API / usage limit
+
+Long runs that fan out to several sub-agents can hit a provider usage limit (for example Anthropic's multi-hour "5-hour" limit) mid-turn. When that happens the run is **not** lost:
+
+- Every completed step is durable in the MongoDB checkpointer (thread = session ID). That includes the conversation history, any files the agent wrote, knowledge-base entries, and the results of sub-agents that already finished — LangGraph restores those from *pending writes* and does **not** re-run them.
+- Only the single in-flight model call is discarded. The middleware retries a limit a few times ([`MODEL_MAX_RETRIES`](#configuration)); if it can't clear, the turn stops cleanly and the TUI shows a **paused** banner with your session ID instead of a generic error.
+
+To continue once your limit resets:
+
+- If the app is still open, type `/continue`. It resumes the interrupted turn from the last checkpoint (finished sub-agents won't re-run).
+- If you closed the app, relaunch on the same session and continue:
+
+  ```bash
+  uv run python main.py --session-id <your-session-id>
+  ```
+
+  then type `/continue`.
+
+`/continue` targets the main session. Plan mode (`/plan`) and ask mode (`/ask`) run on throwaway threads, so continue those by re-issuing the request. Recovery is provider-agnostic — it works the same whether the primary model is Anthropic, OpenRouter, DeepSeek, or Ollama, and across any configured `MODEL_FALLBACK`.
