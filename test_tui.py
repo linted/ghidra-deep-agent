@@ -26,7 +26,12 @@ class _Chunk:
 
 
 class _LLMOutput:
-    def __init__(self) -> None:
+    # Mirrors a real on_chat_model_end output: an AIMessage-like object carrying
+    # both the final text (`content`, which the response pane renders) and token
+    # usage. Streamed chunks feed the thinking panel; the final response text is
+    # taken from this end-event output.
+    def __init__(self, content: str = "") -> None:
+        self.content = content
         self.usage_metadata = {"input_tokens": 10, "output_tokens": 5}
 
 
@@ -50,7 +55,7 @@ class StubAgent:
             "event": "on_chat_model_end",
             "run_id": "1",
             "metadata": {},
-            "data": {"output": _LLMOutput()},
+            "data": {"output": _LLMOutput("hello from stub")},
         }
 
 
