@@ -38,12 +38,18 @@ class ResponseLog(RichLog):
     def on_response_final(self, msg: ResponseFinal) -> None:
         self._response_buf = msg.text
 
+    def log_assistant(self, text: str) -> None:
+        """Render an assistant reply (live turn or replayed from a checkpoint)."""
+        if not text:
+            return
+        self.last_response = text
+        self.transcript.append(text)
+        self.write(Rule(style="dim green"))
+        self.write("[bold green]✦ assistant[/bold green]")
+        self.write(Rule(style="dim green"))
+        self.write(Markdown(text))
+
     def on_agent_done(self, _msg: AgentDone) -> None:
         if self._response_buf:
-            self.last_response = self._response_buf
-            self.transcript.append(self._response_buf)
-            self.write(Rule(style="dim green"))
-            self.write("[bold green]✦ assistant[/bold green]")
-            self.write(Rule(style="dim green"))
-            self.write(Markdown(self._response_buf))
+            self.log_assistant(self._response_buf)
             self._response_buf = ""
