@@ -267,12 +267,14 @@ class GhidraAgentApp(App[None]):
         self._agent_worker = self._run_agent(agent_input)
 
     def _resume_run(self) -> None:
-        """Continue an interrupted turn on the current (main) thread.
+        """Continue an interrupted turn on whichever thread is active.
 
         Re-invokes the graph with a ``None`` input so LangGraph replays from the
         last checkpoint: only the failed task re-runs, while completed sub-agents
         are restored from pending writes. Used after a run pauses on a usage
-        limit (see ``UsageLimitError`` handling in ``_run_agent``).
+        limit (see ``UsageLimitError`` handling in ``_run_agent``). ``_run_agent``
+        resolves the agent+config from the current mode flags, so this resumes
+        the main, plan, or ask thread transparently.
         """
         self._set_busy(True)
         response = self.query_one(ResponseLog)
@@ -320,11 +322,13 @@ class GhidraAgentApp(App[None]):
             if self._agent_running:
                 bar.flash("[yellow]Agent still running — please wait.[/yellow]")
                 return
-            if self._plan_mode or self._ask_mode:
-                bar.flash(
-                    "[yellow]/continue resumes the main session — "
-                    "exit plan/ask mode first.[/yellow]"
-                )
+            # In a side-mode, resume that mode's ephemeral thread. Guard against
+            # a mode flag set with no thread minted (nothing to replay).
+            if self._plan_mode and self._plan_config is None:
+                bar.flash("[yellow]Nothing to resume in plan mode.[/yellow]")
+                return
+            if self._ask_mode and self._ask_config is None:
+                bar.flash("[yellow]Nothing to resume in ask mode.[/yellow]")
                 return
             self._resume_run()
         elif cmd == "/plan":
@@ -744,13 +748,24 @@ class GhidraAgentApp(App[None]):
                 "[bold yellow]⏸ Usage limit reached — run paused and safely "
                 "checkpointed.[/bold yellow]"
             )
-            response.write(
-                f"Completed work is saved to session [b]{sid}[/b]. When your "
-                "limit resets, type [b]/continue[/b] to pick up where this turn "
-                "left off (finished sub-agents won't re-run). If you've since "
-                f"closed the app, relaunch with [b]--session-id {sid}[/b] and "
-                "then run [b]/continue[/b]."
-            )
+            if plan_run or ask_run:
+                # A side-mode run lives on an ephemeral thread that is not
+                # restorable across launches, so resume must happen in-session.
+                mode = "plan" if plan_run else "ask"
+                response.write(
+                    f"This {mode}-mode run is checkpointed. When your limit "
+                    "resets, type [b]/continue[/b] to pick up where it left off "
+                    "(finished sub-agents won't re-run). Leaving "
+                    f"{mode} mode or closing the app abandons the paused run."
+                )
+            else:
+                response.write(
+                    f"Completed work is saved to session [b]{sid}[/b]. When your "
+                    "limit resets, type [b]/continue[/b] to pick up where this "
+                    "turn left off (finished sub-agents won't re-run). If you've "
+                    f"since closed the app, relaunch with [b]--session-id {sid}[/b] "
+                    "and then run [b]/continue[/b]."
+                )
             response.write(Rule(style="yellow"))
         except Exception as exc:
             response.write(Rule(style="red"))

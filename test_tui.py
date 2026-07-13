@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
+from ghidra_deep_agent.resilience import UsageLimitError
 from ghidra_deep_agent.tui import GhidraAgentApp
 from ghidra_deep_agent.tui.events import handle_event, parse_checkpoint_ns
 from ghidra_deep_agent.tui.help_screen import HelpScreen
@@ -434,5 +435,86 @@ def test_escape_cancels_running_agent() -> None:
             await pilot.press("escape")
             await pilot.pause(0.3)
             assert not app._agent_running
+
+    asyncio.run(run())
+
+
+class _LimitAgent:
+    """A stub whose stream halts on a usage limit before yielding anything."""
+
+    async def astream_events(
+        self, _input: Any, config: Any, version: str
+    ) -> AsyncIterator[dict[str, Any]]:
+        raise UsageLimitError(RuntimeError("429 rate limit"))
+        yield  # pragma: no cover - marks this an async generator
+
+
+def test_continue_resumes_active_side_mode() -> None:
+    """`/continue` resumes the active plan/ask thread, not just the main one."""
+
+    async def run() -> None:
+        for flag, cfg_attr in (
+            ("_plan_mode", "_plan_config"),
+            ("_ask_mode", "_ask_config"),
+        ):
+            app = _make_app()
+            async with app.run_test() as pilot:
+                called: list[bool] = []
+                app._resume_run = lambda: called.append(True)  # type: ignore[method-assign]
+                setattr(app, flag, True)
+                setattr(app, cfg_attr, {"configurable": {"thread_id": "abc::x"}})
+                app._dispatch_slash("/continue")
+                await pilot.pause()
+                assert called == [True], flag
+
+    asyncio.run(run())
+
+
+def test_continue_in_side_mode_without_thread_is_a_noop() -> None:
+    """A side-mode flag set with no minted thread flashes instead of resuming."""
+
+    async def run() -> None:
+        for flag, cfg_attr in (
+            ("_plan_mode", "_plan_config"),
+            ("_ask_mode", "_ask_config"),
+        ):
+            app = _make_app()
+            async with app.run_test() as pilot:
+                called: list[bool] = []
+                app._resume_run = lambda: called.append(True)  # type: ignore[method-assign]
+                setattr(app, flag, True)
+                setattr(app, cfg_attr, None)
+                app._dispatch_slash("/continue")
+                await pilot.pause()
+                assert called == [], flag
+
+    asyncio.run(run())
+
+
+def test_usage_limit_banner_in_plan_mode_omits_relaunch() -> None:
+    """The pause banner for a side-mode run must not advise `--session-id`
+    relaunch — the ephemeral thread isn't restorable across launches."""
+
+    async def run() -> None:
+        app = _make_app()
+        app._plan_agent = _LimitAgent()
+        async with app.run_test() as pilot:
+            log = app.query_one(ResponseLog)
+            writes: list[str] = []
+            orig_write = log.write
+
+            def capture(content: Any, *args: Any, **kwargs: Any) -> Any:
+                if isinstance(content, str):
+                    writes.append(content)
+                return orig_write(content, *args, **kwargs)
+
+            log.write = capture  # type: ignore[method-assign]
+            app._plan_mode = True
+            app._plan_config = {"configurable": {"thread_id": "abc::plan::x"}}
+            app._start_run("plan turn", "hi")
+            await pilot.pause(0.3)
+            joined = "\n".join(writes)
+            assert "plan-mode" in joined
+            assert "--session-id" not in joined
 
     asyncio.run(run())
