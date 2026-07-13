@@ -39,9 +39,9 @@ from ghidra_deep_agent.resilience import (
 )
 from ghidra_deep_agent.sessions import build_session_store
 from ghidra_deep_agent.subagents import (
+    RESEARCH_SUBAGENT_NAME,
     build_main_tools,
     build_plan_mode_main_tools,
-    build_research_subagent,
     build_subagents,
     filter_withheld_tools,
     load_agent_config,
@@ -179,18 +179,6 @@ async def main() -> None:
     async_mw = build_async_task_middleware(tools)
     if async_mw is not None:
         print("Async task resolution enabled (polling get_task_status).")
-    # The read-only `research` sub-agent is shared by both graphs: the normal
-    # coordinator gets it (read-only deep investigation without applying
-    # changes) and the plan-mode graph uses it as its only delegate — the
-    # config sub-agents all mutate Ghidra (prototype-fixer included), so none
-    # are safe for plan mode.
-    research_sub = build_research_subagent(
-        all_tools,
-        agent_config,
-        resolve_model,
-        cache_middleware=cache_mw,
-        async_middleware=async_mw,
-    )
     subagents = build_subagents(
         all_tools,
         agent_config,
@@ -198,7 +186,20 @@ async def main() -> None:
         cache_middleware=cache_mw,
         async_middleware=async_mw,
     )
-    subagents.append(research_sub)
+    # The read-only `research` sub-agent is a config `[[subagents]]` entry
+    # (`read_only = true`) shared by both graphs: the normal coordinator gets it
+    # via `subagents` above, and the plan-mode graph uses it as its ONLY delegate
+    # — the other config sub-agents all mutate Ghidra (prototype-fixer included),
+    # so none are safe for plan mode. Pull it out by name, mirroring `vuln-hunter`.
+    research_sub = next(
+        (s for s in subagents if s.get("name") == RESEARCH_SUBAGENT_NAME), None
+    )
+    if research_sub is None:
+        raise ValueError(
+            f"A read-only '{RESEARCH_SUBAGENT_NAME}' sub-agent is required "
+            "(plan mode and ask mode depend on it); add it to the agent config "
+            "with read_only = true."
+        )
     plan_mode_subagents = [research_sub]
     print(f"Main agent: {main_model_spec}  [{len(main_tools)} tool(s)]")
     for sub_cfg in agent_config.subagents:
