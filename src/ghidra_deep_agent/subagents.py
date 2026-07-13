@@ -33,7 +33,6 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
 
 from ghidra_deep_agent.models import build_model
-from ghidra_deep_agent.prompt import RESEARCH_SUBAGENT_PROMPT
 from ghidra_deep_agent.resilience import (
     build_model_resilience_middleware,
     build_tool_retry_middleware,
@@ -48,8 +47,9 @@ _ALL_TOOLS = "*"
 # GhidrAssistMCP write tools that must be dropped entirely from a read-only
 # context: each one mutates the program/project (or the knowledge base) with no
 # read mode to preserve. Read-only is then "everything else", so newly added
-# *read* tools are auto-covered. Shared by ``build_research_subagent`` and
-# ``build_plan_mode_main_tools``. Dual read/write tools (``variables``,
+# *read* tools are auto-covered. Applied to any ``read_only`` sub-agent (see
+# ``build_subagents``) and to ``build_plan_mode_main_tools``. Dual read/write
+# tools (``variables``,
 # ``comments``, ``types``, ``struct``, ``bookmarks``) are NOT dropped here — they
 # keep their read actions and have their write actions blocked via
 # ``READ_ONLY_WRITE_ACTIONS`` (see ``validation.py``).
@@ -135,6 +135,7 @@ class SubAgentConfig:
     all_tools: bool
     exclude: tuple[str, ...]
     model: str | None
+    read_only: bool
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,16 @@ def _opt_str(table: Mapping[str, Any], key: str, where: str) -> str | None:
         return None
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{where}: '{key}' must be a non-empty string if set")
+    return value
+
+
+def _opt_bool(table: Mapping[str, Any], key: str, where: str) -> bool:
+    """A boolean field that defaults to False when absent."""
+    value = table.get(key)
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"{where}: '{key}' must be a boolean if set")
     return value
 
 
@@ -219,6 +230,7 @@ def _parse_subagent(raw: Any, path: Path) -> SubAgentConfig:
         all_tools=all_tools,
         exclude=_opt_str_list(raw, "exclude", where),
         model=_opt_str(raw, "model", where),
+        read_only=_opt_bool(raw, "read_only", where),
     )
 
 
@@ -356,6 +368,17 @@ def build_subagents(
         if sub.exclude:
             excluded = set(sub.exclude)
             tools = [tool for tool in tools if tool.name not in excluded]
+        if sub.read_only:
+            # Drop the write-only tools and reject write `action`s on the dual
+            # read/write tools, so a `read_only` sub-agent can never mutate the
+            # program or the knowledge base (see PLAN_MODE_BLOCKED_TOOLS /
+            # READ_ONLY_WRITE_ACTIONS).
+            tools = _read_only_tools(tools)
+            validation_mw = create_argument_validation_middleware(
+                READ_ONLY_WRITE_ACTIONS
+            )
+        else:
+            validation_mw = create_argument_validation_middleware()
         spec: SubAgent = {
             "name": sub.name,
             "description": sub.description,
@@ -364,7 +387,7 @@ def build_subagents(
             "model": resolve_model(sub.model),
             "middleware": [
                 *build_model_resilience_middleware(resolve_model),
-                create_argument_validation_middleware(),
+                validation_mw,
                 *([cache_middleware] if cache_middleware is not None else []),
                 # Inside the cache so resolved (not stub) results are cached.
                 *([async_middleware] if async_middleware is not None else []),
@@ -386,46 +409,6 @@ def _read_only_tools(all_tools: Sequence[BaseTool]) -> list[BaseTool]:
     call time by the read-only argument-validation middleware, not here.
     """
     return [tool for tool in all_tools if tool.name not in PLAN_MODE_BLOCKED_TOOLS]
-
-
-def build_research_subagent(
-    all_tools: Sequence[BaseTool],
-    config: AgentConfig,
-    resolve_model: ModelResolver,
-    *,
-    cache_middleware: AgentMiddleware | None = None,
-    async_middleware: AgentMiddleware | None = None,
-) -> SubAgent:
-    """Build the read-only ``research`` sub-agent shared by both graphs.
-
-    It holds every tool except ``PLAN_MODE_BLOCKED_TOOLS`` (so it cannot mutate
-    the Ghidra DB or write the knowledge base), runs on the default model, and
-    uses the same per-sub-agent middleware stack as ``build_subagents``.
-    """
-    _ = config  # signature parity / future per-config tuning
-    return {
-        "name": RESEARCH_SUBAGENT_NAME,
-        "description": (
-            "Read-only deep-investigation specialist. Decompiles, disassembles, "
-            "traces cross-references, and queries the "
-            "knowledge base to gather evidence, but applies NO changes (cannot "
-            "mutate Ghidra or write the knowledge base). Delegate when you want "
-            "analysis/evidence without applying it."
-        ),
-        "system_prompt": RESEARCH_SUBAGENT_PROMPT,
-        "tools": _read_only_tools(all_tools),
-        "model": resolve_model(None),
-        "middleware": [
-            *build_model_resilience_middleware(resolve_model),
-            # Read-only: also reject write `action`s on consolidated read/write
-            # tools (variables/comments/types/struct/bookmarks).
-            create_argument_validation_middleware(READ_ONLY_WRITE_ACTIONS),
-            *([cache_middleware] if cache_middleware is not None else []),
-            # Inside the cache so resolved (not stub) results are cached.
-            *([async_middleware] if async_middleware is not None else []),
-            build_tool_retry_middleware(),
-        ],
-    }
 
 
 def build_plan_mode_main_tools(
