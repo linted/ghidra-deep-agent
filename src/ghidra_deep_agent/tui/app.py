@@ -401,6 +401,7 @@ class GhidraAgentApp(App[None]):
         self._subagent_meta.clear()
         self._subagent_reports.clear()
         self.action_clear_log()
+        await self._replay_last_reply()
         self.sub_title = f"{self._model}  ·  session: {session_id}"
         if self._session_store is not None:
             await self._session_store.arecord_start(session_id, self._binary_name)
@@ -410,6 +411,21 @@ class GhidraAgentApp(App[None]):
         if ask_was_active:
             msg += " [cyan]Ask mode cancelled.[/cyan]"
         self.query_one(StatusBar).flash(msg)
+
+    async def _replay_last_reply(self) -> None:
+        """After a resume, paint the session's last assistant reply back into
+        the main window so the user sees the session loaded and what happened
+        last."""
+        try:
+            state = await self._agent.aget_state(self._config)
+        except Exception:
+            return
+        for msg in reversed(state.values.get("messages", [])):
+            if getattr(msg, "type", None) == "ai":
+                text = extract_text(msg).strip()
+                if text:
+                    self.query_one(ResponseLog).log_assistant(text)
+                    return
 
     # -- plan mode -----------------------------------------------------------
 
