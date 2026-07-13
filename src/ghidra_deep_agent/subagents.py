@@ -98,16 +98,23 @@ READ_ONLY_WRITE_ACTIONS: dict[str, frozenset[str]] = {
     ),
     "bookmarks": frozenset({"set", "remove"}),
 }
-# Tools withheld from every agent: expensive to run and prone to hanging the
-# session for little benefit. Filtered out of the full tool set once at startup
-# (main.py), before any per-agent selection — the only reliable block, since
-# `tools = "*"` agents and the read-only research sub-agent would otherwise still
-# receive them. ``analyze_program`` runs full Ghidra Auto Analysis over the whole
-# program; the expected workflow is to analyze in the Ghidra GUI first, so the
-# agent triggering (or re-triggering) it is both slow and rarely wanted.
+# Tools withheld from every agent. Filtered out of the full tool set once at
+# startup (main.py), before any per-agent selection — the only reliable block,
+# since `tools = "*"` agents and the read-only research sub-agent would otherwise
+# still receive them.
+#   ``analyze_program`` runs full Ghidra Auto Analysis over the whole program; the
+#     expected workflow is to analyze in the Ghidra GUI first, so the agent
+#     triggering (or re-triggering) it is both slow and rarely wanted.
+#   ``get_task_status`` is polled *internally* by ``AsyncTaskMiddleware`` to
+#     resolve async submission stubs (see async_tasks.py); the model must never
+#     receive it as a callable tool, or it starts manual polling — the very
+#     context-bloating spin-loop the middleware exists to prevent. Withholding is
+#     safe because the middleware and ``recover_prototypes`` look the tool up in
+#     the *raw* MCP tool list (main.py), upstream of this filter.
 WITHHELD_TOOLS = frozenset(
     {
         "analyze_program",
+        "get_task_status",
     }
 )
 

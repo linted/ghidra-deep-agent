@@ -174,9 +174,13 @@ New
 
 Rejected / redundant (recorded so they aren't reconsidered next report)
 - **Cost #2 / Latency #1 / Errors #2 (`get_task_status` "polling spin-loop", cap polls):**
-  misdiagnosis — polling is code-driven inside `AsyncTaskMiddleware` (async_tasks.py) with
-  exponential backoff (0.25s→2s) and a 180s timeout; the LLM never sees `get_task_status` and no
-  LLM round-trip happens per poll (the report's own table shows those spans at 0 tokens).
+  mostly a misdiagnosis — polling is code-driven inside `AsyncTaskMiddleware` (async_tasks.py) with
+  exponential backoff (0.25s→2s) and a 180s timeout, and no LLM round-trip happens per poll (the
+  report's own table shows those spans at 0 tokens). But "the LLM never sees `get_task_status`" was
+  only *aspirational*: two residual leaks were closed (2026-07-12). `get_task_status` is now in
+  `WITHHELD_TOOLS` (was still granted to the `research` and `general-purpose` wildcard agents), and
+  on timeout the middleware returns an explicit "did not complete" message instead of a raw
+  `Status: RUNNING` stub that a wildcard agent could have started manually polling.
 - **Latency #2/#3 (parallelize tool calls / `task` dispatch):** already concurrent — the app runs
   fully async and langgraph's `ToolNode` gathers same-turn tool calls (incl. `atask`) via
   `asyncio.gather`; serial traces mean the *model* emitted one call per turn (prompt guidance for
