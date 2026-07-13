@@ -9,8 +9,14 @@ Making the model do that polling itself would add round-trips and a whole class
 of "forgot to poll" failures. Instead this middleware intercepts every tool
 result, detects the async stub, and polls ``get_task_status`` on the model's
 behalf until the task completes — so agents see a synchronous result exactly as
-they did with the previous MCP server. No prompt or allowlist changes needed, and
-``get_task_status`` does not have to be granted to any agent.
+they did with the previous MCP server.
+
+Because the polling happens here, ``get_task_status`` is actively withheld from
+every agent's tool set (see ``WITHHELD_TOOLS`` in subagents.py): the model never
+receives it as a callable tool, so it can't reintroduce the manual-polling
+spin-loop this middleware exists to prevent. If a task exceeds the poll timeout,
+the model gets an explicit "did not complete" message rather than a dangling
+``Status: RUNNING`` stub it could neither resolve nor poll.
 """
 
 import asyncio
@@ -86,6 +92,20 @@ def _is_in_flight(content: str) -> bool:
     return any(flag in content for flag in _IN_FLIGHT)
 
 
+def _timeout_text(timeout_s: float) -> str:
+    """Terminal message returned when a task outlives the poll deadline.
+
+    Deliberately free of the ``Status: RUNNING`` / ``Task ID:`` markers so it can
+    never be re-classified as an in-flight stub, and phrased as an actionable
+    dead-end since the model has no ``get_task_status`` tool to poll itself.
+    """
+    return (
+        f"The Ghidra operation did not complete within {timeout_s:.0f}s and was "
+        "abandoned. Retry the request; if this recurs the task may be stuck "
+        "server-side."
+    )
+
+
 def to_text(value: Any) -> str:
     """Public alias for flattening an MCP tool result to text.
 
@@ -120,8 +140,10 @@ async def resolve_async_result(
     interval = initial_interval_s
     while True:
         status_text = _to_text(await status_tool.ainvoke({"task_id": task_id}))
-        if not _is_in_flight(status_text) or time.monotonic() >= deadline:
+        if not _is_in_flight(status_text):
             return status_text
+        if time.monotonic() >= deadline:
+            return _timeout_text(timeout_s)
         await asyncio.sleep(interval)
         interval = min(interval * factor, max_interval_s)
 
@@ -189,9 +211,12 @@ class AsyncTaskMiddleware(AgentMiddleware):
         interval = self._initial_interval
         while True:
             text = _to_text(self._status.invoke({"task_id": task_id}))
-            if not _is_in_flight(text) or time.monotonic() >= deadline:
+            if not _is_in_flight(text):
                 self._signal_done(task_id)
                 return self._replace(result, text)
+            if time.monotonic() >= deadline:
+                self._signal_done(task_id)
+                return self._replace(result, _timeout_text(self._timeout))
             time.sleep(interval)
             interval = self._next_interval(interval)
 
@@ -221,9 +246,12 @@ class AsyncTaskMiddleware(AgentMiddleware):
         interval = self._initial_interval
         while True:
             text = _to_text(await self._status.ainvoke({"task_id": task_id}))
-            if not _is_in_flight(text) or time.monotonic() >= deadline:
+            if not _is_in_flight(text):
                 await self._asignal_done(task_id)
                 return self._replace(result, text)
+            if time.monotonic() >= deadline:
+                await self._asignal_done(task_id)
+                return self._replace(result, _timeout_text(self._timeout))
             await asyncio.sleep(interval)
             interval = self._next_interval(interval)
 
