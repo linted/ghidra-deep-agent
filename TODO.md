@@ -63,6 +63,19 @@ Sub-agent design — implemented in `src/ghidra_deep_agent/subagents.py` (`build
 - [x] Keep search primitives, knowledge queries, and filesystem tools on the main agent (no sub-agent) — prompt steers quick searches/KB queries/filesystem reads to the main agent; sub-agent tool allowlists exclude them.
 
 ### Backlog (deferred — not now)
+- [ ] **Run the agent under Docker Sandboxes (`docker sbx`)** — assessed 2026-07-13:
+  **works**. The agent is a pure network client (MCP-over-HTTP to GhidrAssistMCP, TCP
+  to MongoDB, HTTPS to the model API, optional Ollama), so it fits sbx's microVM +
+  egress-allowlist model: Ghidra/Ollama on the host stay reachable via
+  `host.docker.internal` after `sbx policy allow network localhost:<port>`. One
+  caveat: the sbx proxy carries HTTP(S) only — MongoDB's raw-TCP wire protocol likely
+  can't reach host/Atlas Mongo, so local mode runs the existing `mongodb/` compose
+  stack *inside* the sandbox's own Docker daemon (loopback bypasses the proxy);
+  external/Atlas mode is kept but experimental until empirically tested. Zero Python
+  changes needed (`main.py` `load_dotenv()` doesn't override exported env). Full
+  design — three `scripts/sbx-*.sh` scripts, `.env.sandbox.example`, README section,
+  exact policy rules, verification steps — in
+  `~/.claude/plans/are-we-able-to-vectorized-floyd.md`; start there.
 - [~] **Adopt GhidrAssistMCP MCP resources & prompts** — the new server (see the
   GhidrAssistMCP migration) exposes, beyond tools, **6 MCP resources**
   (`ghidra://program/{name}/info` / `functions` / `strings` / `imports` /
