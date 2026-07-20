@@ -105,6 +105,27 @@ Sub-agent design — implemented in `src/ghidra_deep_agent/subagents.py` (`build
   the same plan-mode/mutation controls as other write tools. Deferred out of the
   "surface decompile failures" change on purpose.
 
+#### From dependency review (2026-07-20)
+- [ ] **Adopt `ToolErrorMiddleware` (langchain 1.3.14)** — evaluate folding the new
+  `ToolErrorMiddleware` in alongside our existing `build_tool_retry_middleware`
+  (`resilience.py`) and `ArgumentValidationMiddleware` (`validation.py`) for cleaner
+  tool-error → self-correction handling. Note 1.3.14 also tightened
+  `ToolRetryMiddleware` to only retry *retryable* exceptions — cross-check that our
+  `retry_on=(OSError,)` scoping (`resilience.py`) still behaves as intended after the
+  upgrade. Low urgency — a robustness cleanup, not a fix.
+- [ ] **Evaluate mcp-adapters 0.3.0 MCP error surfacing** — 0.3.0 now surfaces MCP
+  tool execution errors as failed tool output. Assess whether this changes how Ghidra
+  (GhidrAssistMCP) tool failures reach the agent, and whether it lets us thin out any
+  of our own hardening in `resilience.py` / `validation.py` — or, conversely, causes
+  double-reporting of the same failure. Behavioral eval against a live server.
+- [ ] **pymongo `session.bind()` ergonomics (pymongo 4.17+)** — 4.17 adds a
+  context-manager `session.bind()` that scopes all ops to a session without passing it
+  explicitly; could simplify session-scoped Mongo work in `sessions.py` / `knowledge.py`.
+  *Blocked:* `langgraph-checkpoint-mongodb==0.4.0` (latest) caps `pymongo>=4.12,<4.17`,
+  so the resolver holds pymongo at 4.16.0 — 4.17 can't be selected until upstream
+  relaxes that ceiling in a newer `langgraph-checkpoint-mongodb` release. Revisit then.
+  Low-priority.
+
 ### From optimization report (2026-06-29, 6h window)
 
 _Caveats: the report's cost column is broken (all `$0.0000`) and several sub-agents have only 2
