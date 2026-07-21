@@ -49,9 +49,12 @@ All configuration is done via environment variables (`.env` file or shell export
 | `OPENROUTER_API_KEY` | — | API key for OpenRouter *(required for `openrouter:` models)* |
 | `OPENROUTER_CONFIG` | `./openrouter.toml` | Optional TOML of per-model OpenRouter provider-routing presets — see [Pinning providers](#pinning-providers-provider-routing) |
 | `SUMMARY_MODEL` | *(main `MODEL`)* | Optional `provider:model` for the conversation-summarization call (manual `/compact` **and** the auto summarizer) — route it to a smaller/cheaper model |
-| `COMPACT_TRIGGER_FRACTION` | *(deepagents default ~0.85)* | Auto-compact when context usage reaches this fraction (0-1) — lower compacts earlier |
-| `COMPACT_TRIGGER_TOKENS` | *(unset)* | Absolute token trigger for auto-compaction (used if fraction unset) |
-| `COMPACT_KEEP_MESSAGES` | *(deepagents default)* | Recent messages to keep after a compaction |
+| `COMPACT_TRIGGER_TOKENS` | `50000` | **Sub-agents:** auto-compact when the full prompt (system prompt + tool schemas + history) reaches this many tokens |
+| `COMPACT_KEEP_TOKENS` | `10000` | **Sub-agents:** recent history tokens kept verbatim after a compaction (takes precedence over `COMPACT_KEEP_MESSAGES`) |
+| `COMPACT_KEEP_MESSAGES` | *(unset)* | **Sub-agents:** keep the last N messages instead of a token budget — a few large tool dumps can immediately re-trigger, so prefer the token form |
+| `COMPACT_TRIGGER_FRACTION` | *(unset)* | **Sub-agents:** fractional trigger (0-1 of context window); needs a model with a langchain context profile — unusable for most proxied models, prefer the token form |
+| `COMPACT_MAIN_TRIGGER_TOKENS` | *(deepagents default: 170k)* | **Coordinator:** auto-compact trigger. Its baseline prompt alone is ~60k+, so don't set it below that |
+| `COMPACT_MAIN_KEEP_TOKENS` | *(deepagents default: 6 messages)* | **Coordinator:** recent history kept after a compaction (`COMPACT_MAIN_KEEP_MESSAGES` also accepted) |
 | `MODEL_FALLBACK` | *(unset)* | Comma-separated `provider:model` fallbacks tried, in order, after the primary model's retries are exhausted |
 | `MODEL_MAX_RETRIES` | `3` | Retry attempts per model call on transient errors (5xx/429/timeouts) |
 | `TOOL_MAX_RETRIES` | `3` | Retry attempts for transient filesystem-tool I/O errors |

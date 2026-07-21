@@ -17,7 +17,6 @@ from pymongo.errors import ServerSelectionTimeoutError
 
 from ghidra_deep_agent.async_tasks import build_async_task_middleware
 from ghidra_deep_agent.compaction import (
-    auto_summarization_tuning_enabled,
     create_forced_summarization_tool_middleware,
     install_tuned_summarization,
 )
@@ -234,13 +233,16 @@ async def main() -> None:
             summary_spec = os.environ.get("SUMMARY_MODEL")
             summary_model = resolve_model(summary_spec) if summary_spec else built_model
 
-            # Tune the auto-summarizer create_deep_agent wires internally (lower
-            # trigger / cheaper summary model) when any compaction knob is set.
-            # Routes the auto summary to SUMMARY_MODEL too, not just /compact.
-            if auto_summarization_tuning_enabled():
-                install_tuned_summarization(
-                    resolve_model(summary_spec) if summary_spec else None
-                )
+            # Tune the auto-summarizer create_deep_agent wires internally.
+            # Sub-agents compact aggressively by default (they never reached
+            # deepagents' 170k no-profile trigger); the main agent — identified
+            # by its model — keeps stock thresholds. COMPACT_* / COMPACT_MAIN_*
+            # env knobs override either scope, and SUMMARY_MODEL routes the
+            # auto summary too, not just /compact.
+            install_tuned_summarization(
+                resolve_model(summary_spec) if summary_spec else None,
+                main_model=built_model,
+            )
 
             # Shared by both graphs (normal + plan mode). Built once so the two
             # agents carry identical middleware behavior.
