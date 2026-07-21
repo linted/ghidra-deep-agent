@@ -27,6 +27,8 @@ from langchain.agents.middleware import (
 )
 from langchain_core.language_models import BaseChatModel
 
+from ghidra_deep_agent.toasts import notify_toast
+
 ModelResolver = Callable[[str | None], str | BaseChatModel]
 
 
@@ -122,17 +124,53 @@ def _is_usage_limit(exc: BaseException) -> bool:
     return any(marker in text for marker in _USAGE_LIMIT_MARKERS)
 
 
+_CREDITS_MARKERS = ("requires more credits",)
+
+
+def _is_out_of_credits(exc: BaseException) -> bool:
+    """OpenRouter 402: prepaid credits / key daily limit can't cover the request.
+
+    The openai SDK has no dedicated 402 exception class, so this arrives as a
+    generic ``APIStatusError``; match on the status code, with the message text
+    as a fallback for errors proxied through a fallback model.
+    """
+    if getattr(exc, "status_code", None) == 402:
+        return True
+    return any(marker in str(exc).lower() for marker in _CREDITS_MARKERS)
+
+
 def _on_model_retries_exhausted(exc: BaseException) -> str:
     """`on_failure` for ``ModelRetryMiddleware``: halt on a limit, else continue.
 
-    A usage/rate limit that survived every retry is raised as
+    Called both when retries are exhausted and immediately for non-retryable
+    errors (``ModelRetryMiddleware`` skips the retry loop for those, e.g. a 402).
+
+    An out-of-credits error or a usage/rate limit is raised as
     :class:`UsageLimitError` so the turn stops at a clean, resumable checkpoint
-    instead of committing a synthetic error message. Any other exhausted error
-    keeps the stock ``"continue"`` behavior — return a string that becomes the
-    ``AIMessage`` content — so an unrelated blip still doesn't hard-crash a turn.
+    instead of committing a synthetic error message; the credits case also emits
+    an error toast with provider-specific guidance, since the TUI's generic
+    pause banner only mentions usage limits. Any other terminal error keeps the
+    stock ``"continue"`` behavior — return a string that becomes the
+    ``AIMessage`` content — so an unrelated blip still doesn't hard-crash a
+    turn, plus an error toast so the failure isn't buried in the reply text.
     """
+    if _is_out_of_credits(exc):
+        notify_toast(
+            "OpenRouter: not enough credits for this request — add credits or "
+            "raise the key's daily limit, then /continue.",
+            severity="error",
+            title="Out of credits",
+            timeout=10.0,
+        )
+        raise UsageLimitError(exc)
     if _is_usage_limit(exc):
         raise UsageLimitError(exc)
+    notify_toast(
+        f"Model call failed: {type(exc).__name__}. See reply for details.",
+        severity="error",
+        title="Model error",
+        timeout=10.0,
+    )
     return f"Model call failed after retries: {exc}"
 
 
