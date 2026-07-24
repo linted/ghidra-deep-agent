@@ -94,6 +94,8 @@ class SandboxSyncMiddleware(AgentMiddleware):
         self._manifest: dict[str, str] = {}
         # relpaths already warned about for exceeding the size cap (warn once).
         self._warned_oversize: set[str] = set()
+        # relpaths already warned about for a failed per-file upload (warn once).
+        self._warned_upload_failures: set[str] = set()
         # Whether the remote root has been created this session (created lazily).
         self._root_ready = False
         # Whether we already warned that bulk seeding fell back to per-file.
@@ -182,12 +184,40 @@ class SandboxSyncMiddleware(AgentMiddleware):
             uploads, pending
         ):
             return
+        failures: list[tuple[str, str]] = []
         for resp in await self._backend.aupload_files(uploads):
             meta = pending.get(resp.path)
-            if meta is None or resp.error is not None:
-                continue  # leave out of the manifest so it retries next turn
+            if meta is None:
+                continue
             rel, digest = meta
+            if resp.error is not None:
+                # Left out of the manifest so it retries next turn.
+                failures.append((rel, str(resp.error)))
+                continue
             self._manifest[rel] = digest
+        self._warn_upload_failures(failures)
+
+    def _warn_upload_failures(self, failures: list[tuple[str, str]]) -> None:
+        """Warn once per relpath when its per-file upload fails.
+
+        The file stays out of the manifest and is retried every turn, so
+        without a toast a persistently failing upload would be invisible.
+        """
+        fresh = [
+            (rel, err)
+            for rel, err in failures
+            if rel not in self._warned_upload_failures
+        ]
+        if not fresh:
+            return
+        self._warned_upload_failures.update(rel for rel, _ in fresh)
+        rel, err = fresh[0]
+        more = f" (+{len(fresh) - 1} more)" if len(fresh) > 1 else ""
+        notify_toast(
+            f"Sandbox seed could not upload {rel}{more}: {err[:200]}",
+            severity="warning",
+            title="Sandbox",
+        )
 
     async def _seed_via_tar(
         self,

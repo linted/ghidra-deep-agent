@@ -250,6 +250,25 @@ def test_upload_error_keeps_file_out_of_manifest(tmp_path: Path) -> None:
     assert backend.upload_calls[1] == [("/workspace/a.txt", b"alpha")]
 
 
+def test_upload_error_toasts_once_with_detail(tmp_path: Path) -> None:
+    toasts: list[ToastRequest] = []
+    register_toast_sink(toasts.append)
+    _write(tmp_path, "a.txt", b"alpha")
+    backend = FakeSandboxBackend()
+    backend.upload_errors.add("/workspace/a.txt")
+    mw = _mw(backend, tmp_path)
+
+    asyncio.run(mw._seed())
+    # The retry next turn must not re-toast for the same relpath.
+    asyncio.run(mw._seed())
+
+    failure_toasts = [t for t in toasts if "could not upload" in t.message]
+    assert len(failure_toasts) == 1
+    assert "a.txt" in failure_toasts[0].message
+    assert "permission_denied" in failure_toasts[0].message
+    assert failure_toasts[0].severity == "warning"
+
+
 def test_ensure_root_failure_toasts_and_skips_upload(tmp_path: Path) -> None:
     toasts: list[ToastRequest] = []
     register_toast_sink(toasts.append)
