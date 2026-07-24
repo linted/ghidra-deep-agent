@@ -18,10 +18,12 @@ dependencies = [
     "langchain-mongodb",
     "langchain[anthropic]",
     "langchain-deepseek",
+    "langchain-nvidia-openshell",
     "langchain-ollama",
     "langchain-openrouter",
     "langgraph",
     "langgraph-checkpoint-mongodb",
+    "openshell",
     "pymongo",
     "python-dotenv",
     "textual",
@@ -35,6 +37,12 @@ dev = [
     "ruff",
     "mypy",
 ]
+
+[tool.uv]
+# langchain-nvidia-openshell pins deepagents>=0.5,<0.6, but this project uses
+# 0.6.x. Override the pin so uv resolves the shared 0.6.x deepagents; the
+# adapter's use of the sandbox backend API is verified against 0.6.x separately.
+override-dependencies = ["deepagents>=0.6,<0.7"]
 
 [tool.ruff]
 target-version = "py312"

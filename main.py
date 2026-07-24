@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import contextlib
 import os
 import sys
 import uuid
@@ -30,12 +31,22 @@ from ghidra_deep_agent.prompt import (
     PLAN_MODE_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     format_agent_memory,
+    format_sandbox_guidance,
 )
 from ghidra_deep_agent.prototype_tools import build_prototype_tools
 from ghidra_deep_agent.resilience import (
     build_model_resilience_middleware,
     build_tool_retry_middleware,
 )
+from ghidra_deep_agent.sandbox import (
+    OPENSHELL_MODE,
+    SANDBOX_WORKDIR,
+    SUPPORTED_MODES,
+    OpenShellSandboxError,
+    open_sandbox_backend,
+    sandbox_mode,
+)
+from ghidra_deep_agent.sandbox_sync import SandboxSyncMiddleware
 from ghidra_deep_agent.sessions import build_session_store
 from ghidra_deep_agent.subagents import (
     RESEARCH_SUBAGENT_NAME,
@@ -216,14 +227,53 @@ async def main() -> None:
         "recursion_limit": recursion_limit,
     }
 
+    mode = sandbox_mode()
+    if mode and mode not in SUPPORTED_MODES:
+        print(
+            f"Error: unsupported SANDBOX={mode!r}; supported values: "
+            f"{', '.join(SUPPORTED_MODES)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     output_dir = os.environ.get("AGENT_OUTPUT_DIR", "")
-    backend: Any
-    if output_dir:
-        backend = FilesystemBackend(root_dir=output_dir, virtual_mode=True)
-    else:
-        backend = StateBackend()
 
+    # An OpenShell sandbox is created here and torn down by `stack.aclose()` in
+    # the finally below — after the TUI exits or crashes — so it is never leaked.
+    backend: Any
+    sandbox_sync_mw: Any = None
+    # Appended to every agent prompt when sandboxed, so the model knows it has a
+    # shell and where to keep durable files.
+    sandbox_guidance = ""
+    stack = contextlib.AsyncExitStack()
     try:
+        if mode == OPENSHELL_MODE:
+            sandbox_guidance = format_sandbox_guidance(
+                SANDBOX_WORKDIR, synced=bool(output_dir)
+            )
+            try:
+                backend = await stack.enter_async_context(open_sandbox_backend())
+            except OpenShellSandboxError as exc:
+                print(f"Failed to create OpenShell sandbox: {exc}", file=sys.stderr)
+                print(
+                    "Check OPENSHELL_GATEWAY / OPENSHELL_GATEWAY_ENDPOINT and that "
+                    "the 'openshell' CLI is authenticated (see ~/.config/openshell/).",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if output_dir:
+                # Files live in the sandbox; the middleware makes AGENT_OUTPUT_DIR
+                # the durable local mirror, synced in before and out after a turn.
+                sandbox_sync_mw = SandboxSyncMiddleware(backend, Path(output_dir))
+            else:
+                print(
+                    "Sandbox: files live only inside the sandbox this session "
+                    "(set AGENT_OUTPUT_DIR to persist them locally)."
+                )
+        elif output_dir:
+            backend = FilesystemBackend(root_dir=output_dir, virtual_mode=True)
+        else:
+            backend = StateBackend()
+
         with MongoDBSaver.from_conn_string(
             mongodb_uri, db_name=mongodb_db
         ) as checkpointer:
@@ -247,6 +297,11 @@ async def main() -> None:
             # Shared by both graphs (normal + plan mode). Built once so the two
             # agents carry identical middleware behavior.
             shared_middleware: list[Any] = [
+                # Sandbox file sync (first): its before_agent seeds the sandbox
+                # from AGENT_OUTPUT_DIR and its after_agent syncs changed files
+                # back, so these hooks bracket every other middleware. Absent
+                # (None filtered out) when not sandboxed.
+                *([sandbox_sync_mw] if sandbox_sync_mw is not None else []),
                 # Model-call resilience (outermost): provider fallback wraps
                 # transient-error retry of the primary model.
                 *build_model_resilience_middleware(resolve_model),
@@ -264,7 +319,9 @@ async def main() -> None:
             agent_kwargs: dict[str, Any] = dict(
                 model=built_model,
                 tools=main_tools,
-                system_prompt=SYSTEM_PROMPT + format_agent_memory(agents_md),
+                system_prompt=SYSTEM_PROMPT
+                + format_agent_memory(agents_md)
+                + sandbox_guidance,
                 checkpointer=checkpointer,
                 middleware=shared_middleware,
                 subagents=subagents,
@@ -281,7 +338,9 @@ async def main() -> None:
             plan_agent = create_deep_agent(
                 model=built_model,
                 tools=build_plan_mode_main_tools(all_tools, agent_config),
-                system_prompt=PLAN_MODE_SYSTEM_PROMPT + format_agent_memory(agents_md),
+                system_prompt=PLAN_MODE_SYSTEM_PROMPT
+                + format_agent_memory(agents_md)
+                + sandbox_guidance,
                 checkpointer=checkpointer,
                 middleware=shared_middleware,
                 subagents=plan_mode_subagents,
@@ -313,7 +372,9 @@ async def main() -> None:
             ask_agent = create_deep_agent(
                 model=built_model,
                 tools=main_tools,
-                system_prompt=ASK_MODE_SYSTEM_PROMPT + format_agent_memory(agents_md),
+                system_prompt=ASK_MODE_SYSTEM_PROMPT
+                + format_agent_memory(agents_md)
+                + sandbox_guidance,
                 checkpointer=checkpointer,
                 middleware=shared_middleware,
                 subagents=ask_mode_subagents,
@@ -347,6 +408,9 @@ async def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+    finally:
+        # Tears down the OpenShell sandbox if one was created; a no-op otherwise.
+        await stack.aclose()
 
     print(f"Session ID: {session_id}")
 

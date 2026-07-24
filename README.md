@@ -75,6 +75,8 @@ All configuration is done via environment variables (`.env` file or shell export
 | `GHIDRA_ASYNC_POLL_MAX` | `2.0` | Cap (s) on the async-task poll gap |
 | `GHIDRA_ASYNC_TIMEOUT` | `180` | Give up waiting on an async task after this many seconds |
 | `AGENT_OUTPUT_DIR` | *(unset)* | Optional directory the agent can read/write files in |
+| `SANDBOX` | *(unset)* | Set to `openshell` to run the agent's shell in a sandbox — see [Sandboxed shell](#sandboxed-shell-openshell) |
+| `SANDBOX_SYNC_MAX_BYTES` | `52428800` | Per-file size cap (bytes) for sandbox file sync; larger files are skipped |
 | `RECURSION_LIMIT` | `100` | LangGraph recursion limit for deep analysis sessions |
 | `AGENTS_MD` | *(unset)* | Optional path to an `AGENTS.md` memory file |
 | `LANGSMITH_API_KEY` | *(unset)* | *(optional)* LangSmith API key to enable run tracing |
@@ -187,6 +189,38 @@ Format: raw binary, base address 0x08000000
 ```env
 AGENTS_MD=./AGENTS.md
 ```
+
+### Sandboxed shell (OpenShell)
+
+By default the agent has no shell — it works through the Ghidra MCP tools and the
+knowledge base. Set `SANDBOX=openshell` to give it a real `execute` shell tool
+(plus filesystem tools) running inside an isolated [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell)
+sandbox instead of on your host. This requires the `openshell` CLI installed and
+an active gateway configured (`~/.config/openshell/`).
+
+```env
+SANDBOX=openshell
+# Connection is read from the active gateway; override if needed:
+# OPENSHELL_WORKSPACE=default
+```
+
+- **Lifecycle:** a fresh sandbox is created at startup, shared by the normal/plan/ask
+  agents, and destroyed on exit (including on crash).
+- **Files:** with `AGENT_OUTPUT_DIR` set, that directory is synced into the sandbox
+  before each turn and changed files are synced back after, so it remains the durable
+  local copy across runs (a new sandbox is created each launch). The synced directory
+  inside the sandbox is `/sandbox/output`, which is also the agent's **default working
+  directory** — shell commands and relative-path writes (e.g. `report.md`) land there
+  automatically, and the system prompt tells the agent to keep durable files there.
+  Files written to absolute paths elsewhere (e.g. `/tmp`) are still lost on teardown
+  (see `TODO.md` for an optional hard filesystem-policy lock). Per-file transfers are
+  capped by `SANDBOX_SYNC_MAX_BYTES`.
+- **Fail-fast:** if the sandbox can't be created (gateway unreachable, CLI not
+  authenticated), startup exits with an error rather than silently running unsandboxed.
+- **Note:** the Ghidra MCP connection is unaffected — it runs from the host, not the
+  sandbox. The base OpenShell image has no RE tooling and the sample binary is not in
+  the sandbox, so today the shell is a generic scratch environment (see `TODO.md` for
+  the custom-image follow-up).
 
 ## Running
 
