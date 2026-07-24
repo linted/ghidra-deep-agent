@@ -63,6 +63,24 @@ Sub-agent design — implemented in `src/ghidra_deep_agent/subagents.py` (`build
 - [x] Keep search primitives, knowledge queries, and filesystem tools on the main agent (no sub-agent) — prompt steers quick searches/KB queries/filesystem reads to the main agent; sub-agent tool allowlists exclude them.
 
 ### Backlog (deferred — not now)
+- [ ] **Custom OpenShell sandbox image with RE tooling** — the `SANDBOX=openshell`
+  backend (shipped) gives the agent a generic isolated shell, but the base OpenShell
+  image ships only dev tools (git/python/node/networking) — no RE tooling — and the
+  sample binary is not in the sandbox (it lives in the Ghidra project). To make the
+  `execute` tool actually useful for reverse engineering, build a custom sandbox image
+  preloaded with `binwalk`, `radare2`/`r2pipe`, `capa`, `yara`, `objdump`/`nm`/
+  `readelf`/`file`, and unpackers, **and** add a path to get the sample binary into the
+  sandbox (e.g. seed it via the sync dir / `upload_files`). Until then the shell is a
+  generic scratch/scripting environment, not an RE toolbox. See the tradeoff notes in
+  `~/.claude/plans/i-want-to-add-pure-sifakis.md`.
+- [ ] **Hard-lock sandbox writes to `/sandbox/output` (optional)** — the agent is
+  already steered there (it is the default working directory, and the system prompt
+  says durable files go there), but nothing *prevents* a command from writing to an
+  absolute path like `/tmp/x`, which is lost on teardown. For a true guarantee, author
+  an OpenShell filesystem policy (`openshell policy set`) that makes `/sandbox/output`
+  (+ `/tmp`) the only writable paths. Deferred because it is aggressive (can break
+  legitimate writes to caches/home) and the policy engine is alpha — needs tuning and
+  testing. See `~/.claude/plans/i-want-to-add-pure-sifakis.md`.
 - [ ] **Run the agent under Docker Sandboxes (`docker sbx`)** — assessed 2026-07-13:
   **works**. The agent is a pure network client (MCP-over-HTTP to GhidrAssistMCP, TCP
   to MongoDB, HTTPS to the model API, optional Ollama), so it fits sbx's microVM +

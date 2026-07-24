@@ -260,6 +260,31 @@ APPROVED_PLAN_INSTRUCTION = (
 )
 
 
+def format_sandbox_guidance(workdir: str, *, synced: bool) -> str:
+    """System-prompt section describing the sandbox shell and durable dir.
+
+    Appended to every agent prompt when running under ``SANDBOX=openshell`` so
+    the model knows it has a real shell and where to put files that must
+    survive. ``synced`` is False when no local mirror (AGENT_OUTPUT_DIR) is
+    configured, so the warning is honest about durability.
+    """
+    durability = (
+        f"Files you write **under `{workdir}`** are saved back to the host and "
+        "persist across sessions. This is your working directory, so relative "
+        "paths (e.g. `report.md`) already land there."
+        if synced
+        else f"Your working directory is `{workdir}`. Note: no host mirror is "
+        "configured this session, so files are discarded when it ends."
+    )
+    return (
+        "\n\n## Sandbox shell\n\n"
+        "You have an `execute` tool that runs shell commands in an isolated "
+        f"sandbox. {durability} Anything written elsewhere in the sandbox "
+        f"(outside `{workdir}`, e.g. `/tmp` or absolute paths) is **lost** when "
+        "the session ends — keep durable artifacts in the working directory.\n"
+    )
+
+
 def format_agent_memory(content: str) -> str:
     """Wrap AGENTS.md content as a system-prompt section, or '' if empty."""
     content = content.strip()
