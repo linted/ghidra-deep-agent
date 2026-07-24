@@ -57,6 +57,7 @@ select = ["E", "F", "I", "UP"]
 "src/ghidra_deep_agent/recover_prototypes_script.py" = ["E501"]
 "src/ghidra_deep_agent/find_unrecovered_switches_script.py" = ["E501"]
 "src/ghidra_deep_agent/apply_switch_override_script.py" = ["E501"]
+"src/ghidra_deep_agent/ollvm_deobfuscate_script.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"

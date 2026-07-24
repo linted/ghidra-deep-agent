@@ -31,11 +31,19 @@ from ghidra_deep_agent.find_unrecovered_switches_script import (
 from ghidra_deep_agent.find_unrecovered_switches_script import (
     MARK_START as FIND_START,
 )
+from ghidra_deep_agent.ollvm_deobfuscate_script import (
+    MARK_END as OLLVM_END,
+)
+from ghidra_deep_agent.ollvm_deobfuscate_script import (
+    MARK_START as OLLVM_START,
+)
 from ghidra_deep_agent.switch_tools import (
     _APPLY_JSON_RE,
     _FIND_JSON_RE,
+    _OLLVM_JSON_RE,
     _format_apply_summary,
     _format_find_summary,
+    _format_ollvm_summary,
     build_switch_tools,
 )
 
@@ -55,7 +63,11 @@ def test_returns_empty_when_scripts_tool_absent() -> None:
 def test_builds_both_tools_when_scripts_present() -> None:
     tools = build_switch_tools(list(_tools(["scripts", "get_task_status"])))
     names = {t.name for t in tools}
-    assert names == {"find_unrecovered_switches", "apply_switch_override"}
+    assert names == {
+        "find_unrecovered_switches",
+        "apply_switch_override",
+        "deobfuscate_cff",
+    }
 
 
 def test_find_manifest_regex_and_summary_roundtrip() -> None:
@@ -122,6 +134,39 @@ def test_apply_summary_reports_uncleared_warning() -> None:
         }
     )
     assert "still present" in summary
+
+
+def test_ollvm_manifest_regex_and_summary_roundtrip() -> None:
+    manifest = {
+        "status": "ok",
+        "function": "collect_device_info_into_struct",
+        "entry": "0x1e65bc",
+        "mode": "dryrun",
+        "force": False,
+        "dispatch_sites": 2,
+        "transitions": 47,
+        "patched": 39,
+    }
+    report = "=== OllvmDeobfuscator ===\n...phase output...\n"
+    raw = f"{report}{OLLVM_START}\n{json.dumps(manifest)}\n{OLLVM_END}"
+    match = _OLLVM_JSON_RE.search(raw)
+    assert match is not None
+    summary = _format_ollvm_summary(json.loads(match.group(1)), raw)
+    assert "2 dispatch site(s)" in summary
+    assert "47 transition(s)" in summary
+    assert "would patch 39" in summary
+    assert "collect_device_info_into_struct @ 0x1e65bc" in summary
+    # Dry-run tip steers toward apply/force.
+    assert "apply=True" in summary
+
+
+def test_ollvm_summary_no_dispatch_and_no_function() -> None:
+    nd = _format_ollvm_summary(
+        {"status": "no_dispatch", "function": "f", "entry": "0x1000"}, "raw"
+    )
+    assert "no OLLVM CFF dispatch pattern" in nd
+    nf = _format_ollvm_summary({"status": "no_function", "entry": None}, "raw")
+    assert "no target function" in nf
 
 
 def test_apply_summary_reports_failure() -> None:

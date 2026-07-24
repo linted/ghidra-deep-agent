@@ -26,12 +26,14 @@ import pytest
 from ghidra_deep_agent import (
     apply_switch_override_script,
     find_unrecovered_switches_script,
+    ollvm_deobfuscate_script,
     recover_prototypes_script,
 )
 
 _SCRIPT_MODULES = [
     apply_switch_override_script,
     find_unrecovered_switches_script,
+    ollvm_deobfuscate_script,
     recover_prototypes_script,
 ]
 

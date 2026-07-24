@@ -46,12 +46,24 @@ from ghidra_deep_agent.find_unrecovered_switches_script import (
 from ghidra_deep_agent.find_unrecovered_switches_script import (
     SCRIPT_SOURCE as FIND_SCRIPT_SOURCE,
 )
+from ghidra_deep_agent.ollvm_deobfuscate_script import (
+    MARK_END as OLLVM_MARK_END,
+)
+from ghidra_deep_agent.ollvm_deobfuscate_script import (
+    MARK_START as OLLVM_MARK_START,
+)
+from ghidra_deep_agent.ollvm_deobfuscate_script import (
+    SCRIPT_SOURCE as OLLVM_SCRIPT_SOURCE,
+)
 
 # Fixed names the scripts are deployed under inside Ghidra. ``.java`` selects
 # Ghidra's always-present Java provider; each public class name in the source must
 # match this basename.
 _FIND_SCRIPT_NAME = "gda_find_switches.java"
 _APPLY_SCRIPT_NAME = "gda_apply_switch_override.java"
+# The CFF deobfuscator's public class is ``OllvmDeobfuscator``, so its deployed
+# file name must match.
+_OLLVM_SCRIPT_NAME = "OllvmDeobfuscator.java"
 
 # A whole-program decompile pass can run for minutes; poll well past the default
 # async timeout. Shares the prototype pass's env knob for a single control.
@@ -65,6 +77,13 @@ _APPLY_JSON_RE = re.compile(
     re.escape(APPLY_MARK_START) + r"\s*(\{.*\})\s*" + re.escape(APPLY_MARK_END),
     re.DOTALL,
 )
+_OLLVM_JSON_RE = re.compile(
+    re.escape(OLLVM_MARK_START) + r"\s*(\{.*\})\s*" + re.escape(OLLVM_MARK_END),
+    re.DOTALL,
+)
+# The CFF pass rewrites instructions across a whole flattened function; keep the
+# readable phase report the agent sees bounded.
+_OLLVM_REPORT_CAP = 6000
 
 
 # --- GhidrAssistMCP `scripts` argument shapes -----------------------------------
@@ -160,6 +179,53 @@ def _format_apply_summary(payload: dict[str, Any]) -> str:
         trunc = " (truncated)" if payload.get("c_truncated") else ""
         parts.append(f"\nFresh decompilation{trunc}:\n{c}")
     return "\n".join(parts)
+
+
+def _cap(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    head = limit * 2 // 3
+    tail = limit - head
+    return f"{text[:head]}\n... ({len(text) - limit} chars elided) ...\n{text[-tail:]}"
+
+
+def _format_ollvm_summary(payload: dict[str, Any], report: str) -> str:
+    status = payload.get("status", "?")
+    fn = payload.get("function")
+    entry = payload.get("entry")
+    where = f"{fn} @ {entry}" if fn else f"@ {entry or '?'}"
+    if status == "no_function":
+        return (
+            "deobfuscate_cff: no target function resolved from that argument. "
+            "Pass a function name (e.g. FUN_00123456) or an address (e.g. 0x123456)."
+        )
+    if status == "no_dispatch":
+        return (
+            f"deobfuscate_cff: no OLLVM CFF dispatch pattern found in {where}. "
+            "This function is not control-flow-flattened (or uses a shape this "
+            "pass does not recognize) — nothing to do."
+        )
+    mode = payload.get("mode", "?")
+    verb = "would patch" if mode == "dryrun" else "patched"
+    header = (
+        "CFF deobfuscation [{mode}{force}] {where}: {sites} dispatch site(s), "
+        "{trans} transition(s), {verb} {patched}."
+    ).format(
+        mode=mode,
+        force=" +force" if payload.get("force") else "",
+        where=where,
+        sites=payload.get("dispatch_sites", 0),
+        trans=payload.get("transitions", 0),
+        verb=verb,
+        patched=payload.get("patched", 0),
+    )
+    tip = (
+        "\nDry run — nothing was written. Re-run with apply=True to patch, and "
+        "force=True to write patches whose ranges overlap (shared dispatch tails)."
+        if mode == "dryrun"
+        else "\nPatched — re-decompile the function to verify recovered flow."
+    )
+    return f"{header}{tip}\n\n{_cap(report.strip(), _OLLVM_REPORT_CAP)}"
 
 
 def build_switch_tools(mcp_tools: list[BaseTool]) -> list[BaseTool]:
@@ -318,4 +384,63 @@ def build_switch_tools(mcp_tools: list[BaseTool]) -> list[BaseTool]:
             return f"apply_switch_override: could not parse manifest JSON ({exc})."
         return _format_apply_summary(result)
 
-    return [find_unrecovered_switches, apply_switch_override]
+    @tool
+    async def deobfuscate_cff(
+        function: str,
+        apply: bool = False,
+        force: bool = False,
+    ) -> str:
+        """Deobfuscate ONE OLLVM control-flow-flattened (CFF) function by rewriting
+        its dispatcher into direct branches.
+
+        Use this for the *other* kind of unrecovered indirect jump: an OLLVM CFF
+        *dispatcher* (`br` on a state index loaded from a jump table) that
+        `apply_switch_override` cannot fix because the decompiler still times out
+        on the flattened state machine even after the jump-table override is
+        applied (the `switch-review` bookmark reads like
+        "CFF dispatcher ... warning does NOT clear: decompiler TIMES OUT"). This
+        pass instead reads the table, resolves each case block's real successor
+        (seeing through the index range-clamp and folding constant state indices),
+        and patches the indirect branches into direct `b`/`b.cond`, so the
+        decompiler can recover normal control flow.
+
+        ALWAYS dry-run first (the default): it writes nothing and returns the
+        planned per-block transitions and patches so you can sanity-check the
+        recovered flow before committing. Then re-run with `apply=True`.
+
+        Args:
+            function: The flattened function to work on — a name (e.g.
+                "FUN_001e65bc") or an entry/interior address (e.g. "0x1e65bc").
+            apply: False (default) = dry run, analyze and report only, write
+                nothing. True = patch the listing.
+            force: When True, also write patches whose address ranges overlap a
+                previous patch. Overlaps are shared dispatch tails that multiple
+                case blocks reach with different targets; forcing writes one and
+                is generally WRONG for those — leave False unless a dry run shows
+                the overlaps are spurious.
+
+        Cost: ONE function per call (not a whole-program pass). Only rewrites the
+        indirect branches; interleaved real work is preserved. NOT for ordinary
+        switch tables — use `apply_switch_override` for those.
+        """
+        mode = "apply" if apply else "dryrun"
+        args = [function, mode]
+        if force:
+            args.append("force")
+        raw = await _run_script(_OLLVM_SCRIPT_NAME, OLLVM_SCRIPT_SOURCE, args)
+        match = _OLLVM_JSON_RE.search(raw)
+        if match is None:
+            tail = raw[-800:] if raw else "(empty result)"
+            return (
+                "deobfuscate_cff: no JSON manifest found in the script output. The "
+                "`scripts` executor may not return stdout, the `scripts` tool may "
+                "be disabled/misconfigured, or the script errored. Raw output "
+                "tail:\n" + tail
+            )
+        try:
+            result = json.loads(match.group(1))
+        except ValueError as exc:
+            return f"deobfuscate_cff: could not parse manifest JSON ({exc})."
+        return _format_ollvm_summary(result, raw)
+
+    return [find_unrecovered_switches, apply_switch_override, deobfuscate_cff]
