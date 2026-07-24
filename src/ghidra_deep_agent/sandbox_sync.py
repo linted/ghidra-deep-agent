@@ -16,6 +16,7 @@ never kill the turn.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import os
@@ -92,6 +93,9 @@ class SandboxSyncMiddleware(AgentMiddleware):
         )
         # relpath -> sha256 hex of the last content synced in either direction.
         self._manifest: dict[str, str] = {}
+        # relpath -> (size, mtime_ns) at the time its hash was last computed.
+        # Lets the seed skip re-reading files that plainly have not changed.
+        self._stats: dict[str, tuple[int, int]] = {}
         # relpaths already warned about for exceeding the size cap (warn once).
         self._warned_oversize: set[str] = set()
         # relpaths already warned about for a failed per-file upload (warn once).
@@ -157,26 +161,53 @@ class SandboxSyncMiddleware(AgentMiddleware):
             title="Sandbox",
         )
 
-    async def _seed(self) -> None:
-        """Upload new/changed local files into the sandbox."""
-        if not self._local_dir.is_dir():
-            return
+    def _scan_local(
+        self,
+    ) -> tuple[list[tuple[str, bytes]], dict[str, tuple[str, str]], list[str]]:
+        """Find local files needing upload. Blocking — call via ``to_thread``.
+
+        Returns ``(uploads, pending, oversize_relpaths)``. A file whose size and
+        mtime are unchanged since it was last hashed is skipped without being
+        read: hashing every file every turn meant re-reading the whole output
+        directory each turn just to learn nothing changed.
+        """
         uploads: list[tuple[str, bytes]] = []
         pending: dict[str, tuple[str, str]] = {}  # remote path -> (rel, digest)
+        oversize: list[str] = []
         for path in sorted(self._local_dir.rglob("*")):
             if not path.is_file():
                 continue
             rel = path.relative_to(self._local_dir).as_posix()
-            data = path.read_bytes()
-            if len(data) > self._max_bytes:
-                self._warn_oversize(rel)
+            try:
+                stat = path.stat()
+            except OSError:
+                # Vanished mid-walk; it will be picked up next turn if it returns.
                 continue
+            if stat.st_size > self._max_bytes:
+                oversize.append(rel)
+                continue
+            fingerprint = (stat.st_size, stat.st_mtime_ns)
+            if self._stats.get(rel) == fingerprint and rel in self._manifest:
+                continue
+            data = path.read_bytes()
             digest = hashlib.sha256(data).hexdigest()
+            self._stats[rel] = fingerprint
             if self._manifest.get(rel) == digest:
                 continue
             remote = self._remote_path(rel)
             uploads.append((remote, data))
             pending[remote] = (rel, digest)
+        return uploads, pending, oversize
+
+    async def _seed(self) -> None:
+        """Upload new/changed local files into the sandbox."""
+        if not self._local_dir.is_dir():
+            return
+        # Off the event loop: the walk, the reads, and the hashing are all
+        # blocking, and this runs before every turn.
+        uploads, pending, oversize = await asyncio.to_thread(self._scan_local)
+        for rel in oversize:
+            self._warn_oversize(rel)
         if not uploads:
             return
         await self._ensure_root()
@@ -232,18 +263,11 @@ class SandboxSyncMiddleware(AgentMiddleware):
         updated); False to make the caller fall back to per-file uploads —
         e.g. when the sandbox image lacks ``tar``.
         """
-        buf = io.BytesIO()
-        # compresslevel=1: the payload is uploaded base64-encoded, so light
-        # compression already pays for itself; level 9 would just burn CPU.
-        with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=1) as tar:
-            for remote, data in uploads:
-                rel, _digest = pending[remote]
-                info = tarfile.TarInfo(name=rel)
-                info.size = len(data)
-                tar.addfile(info, io.BytesIO(data))
+        # gzip is CPU-bound; keep it off the event loop.
+        payload = await asyncio.to_thread(self._build_tar, uploads, pending)
         seed_tar = f"{self._remote_root}/{_SEED_TAR_NAME}"
         try:
-            responses = await self._backend.aupload_files([(seed_tar, buf.getvalue())])
+            responses = await self._backend.aupload_files([(seed_tar, payload)])
             if not responses or responses[0].error is not None:
                 error = responses[0].error if responses else "no response"
                 self._warn_tar_fallback(f"tarball upload failed: {error}")
@@ -266,6 +290,23 @@ class SandboxSyncMiddleware(AgentMiddleware):
         for rel, digest in pending.values():
             self._manifest[rel] = digest
         return True
+
+    @staticmethod
+    def _build_tar(
+        uploads: list[tuple[str, bytes]],
+        pending: dict[str, tuple[str, str]],
+    ) -> bytes:
+        """Build the gzipped seed tarball. Blocking — call via ``to_thread``."""
+        buf = io.BytesIO()
+        # compresslevel=1: the payload is uploaded base64-encoded, so light
+        # compression already pays for itself; level 9 would just burn CPU.
+        with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=1) as tar:
+            for remote, data in uploads:
+                rel, _digest = pending[remote]
+                info = tarfile.TarInfo(name=rel)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        return buf.getvalue()
 
     def _warn_tar_fallback(self, detail: str) -> None:
         if self._warned_tar_fallback:
@@ -309,7 +350,17 @@ class SandboxSyncMiddleware(AgentMiddleware):
             meta[remote] = (rel, remote_hash)
         if not downloads:
             return
-        for resp in await self._backend.adownload_files(downloads):
+        responses = await self._backend.adownload_files(downloads)
+        # Writing the files is blocking; do it in one thread hop, not per file.
+        await asyncio.to_thread(self._write_downloads, responses, meta)
+
+    def _write_downloads(
+        self,
+        responses: list[Any],
+        meta: dict[str, tuple[str, str]],
+    ) -> None:
+        """Write downloaded files locally. Blocking — call via ``to_thread``."""
+        for resp in responses:
             entry = meta.get(resp.path)
             if entry is None or resp.error is not None or resp.content is None:
                 continue
@@ -318,6 +369,14 @@ class SandboxSyncMiddleware(AgentMiddleware):
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(resp.content)
             self._manifest[rel] = remote_hash
+            # Record the stat of what we just wrote so the next seed doesn't
+            # re-hash a file it already knows the content of.
+            try:
+                stat = dest.stat()
+            except OSError:
+                self._stats.pop(rel, None)
+            else:
+                self._stats[rel] = (stat.st_size, stat.st_mtime_ns)
 
     @staticmethod
     def _parse_find_line(line: str) -> tuple[int, str, str] | None:

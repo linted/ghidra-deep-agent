@@ -101,17 +101,14 @@ class ActivityTree(Tree[None]):
         sub-agent it spawned have ns "tools:<uuid>|tools:<inner_uuid>…".
         The longest matching prefix wins, which handles nested sub-agents
         correctly.
+
+        Probes candidate prefixes longest-first rather than scanning every
+        registered namespace: this runs on every tool-start and every thinking
+        event, while ``_ns_to_node`` grows for the whole turn.
         """
         segments = parse_checkpoint_ns(checkpoint_ns)
-        best_node = self.root
-        best_len = 0
-        for ns_segments, node in self._ns_to_node.items():
-            depth = len(ns_segments)
-            if (
-                depth < len(segments)
-                and segments[:depth] == ns_segments
-                and depth > best_len
-            ):
-                best_len = depth
-                best_node = node
-        return best_node
+        for depth in range(len(segments) - 1, 0, -1):
+            node = self._ns_to_node.get(segments[:depth])
+            if node is not None:
+                return node
+        return self.root

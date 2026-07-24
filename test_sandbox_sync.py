@@ -174,6 +174,69 @@ def test_first_seed_uploads_all_then_noop(tmp_path: Path) -> None:
     assert len(backend.upload_calls) == 1
 
 
+def test_unchanged_files_are_not_reread(tmp_path: Path, monkeypatch: Any) -> None:
+    """The seed runs before every turn; it must not re-read the whole dir.
+
+    Change detection short-circuits on (size, mtime) so an untouched file is
+    never opened again after its first hash.
+    """
+    _write(tmp_path, "a.txt", b"alpha")
+    _write(tmp_path, "sub/b.txt", b"bravo")
+    backend = FakeSandboxBackend()
+    mw = _mw(backend, tmp_path)
+    asyncio.run(mw._seed())
+
+    reads: list[str] = []
+    real_read_bytes = Path.read_bytes
+
+    def counting_read_bytes(self: Path) -> bytes:
+        reads.append(self.name)
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", counting_read_bytes)
+
+    asyncio.run(mw._seed())
+    assert reads == []
+
+    # A real edit is still picked up (mtime and size both move).
+    _write(tmp_path, "a.txt", b"alpha-v2-longer")
+    asyncio.run(mw._seed())
+    assert reads == ["a.txt"]
+
+
+def test_same_size_edit_is_still_detected(tmp_path: Path) -> None:
+    """A same-length rewrite changes mtime, so it must not be missed."""
+    _write(tmp_path, "a.txt", b"alpha")
+    backend = FakeSandboxBackend()
+    mw = _mw(backend, tmp_path)
+    asyncio.run(mw._seed())
+
+    _write(tmp_path, "a.txt", b"ALPHA")
+    asyncio.run(mw._seed())
+
+    assert backend.upload_calls[-1] == [("/workspace/a.txt", b"ALPHA")]
+
+
+def test_oversize_file_is_never_read(tmp_path: Path, monkeypatch: Any) -> None:
+    """Size comes from stat(), so an oversize file isn't pulled into memory."""
+    _write(tmp_path, "big.bin", b"x" * 200)
+    backend = FakeSandboxBackend()
+    mw = _mw(backend, tmp_path, max_bytes=100)
+
+    reads: list[str] = []
+    real_read_bytes = Path.read_bytes
+
+    def counting_read_bytes(self: Path) -> bytes:
+        reads.append(self.name)
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", counting_read_bytes)
+    asyncio.run(mw._seed())
+
+    assert reads == []
+    assert backend.upload_calls == []
+
+
 def test_locally_changed_file_reuploads(tmp_path: Path) -> None:
     _write(tmp_path, "a.txt", b"alpha")
     backend = FakeSandboxBackend()
