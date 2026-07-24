@@ -54,20 +54,29 @@ class FakeSandboxBackend(BaseSandbox):
         self.remote_root = remote_root
         self.fs: dict[str, bytes] = {}
         self.upload_calls: list[list[tuple[str, bytes]]] = []
+        self.commands: list[str] = []
         # Paths for which upload should report a failure (retry contract test).
         self.upload_errors: set[str] = set()
         # When set, execute() raises to exercise hook error handling.
         self.raise_on_execute = False
+        # Tunable exit codes for the mkdir / listing commands.
+        self.mkdir_exit = 0
+        self.listing_exit = 0
 
     @property
     def id(self) -> str:
         return "fake-sandbox"
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+        self.commands.append(command)
         if self.raise_on_execute:
             raise RuntimeError("sandbox gone")
+        if command.startswith("mkdir "):
+            return ExecuteResponse(output="", exit_code=self.mkdir_exit)
         if "sha256sum" not in command:
             return ExecuteResponse(output="", exit_code=0)
+        if self.listing_exit not in (0, None):
+            return ExecuteResponse(output="find: error", exit_code=self.listing_exit)
         prefix = f"{self.remote_root}/"
         lines = []
         for path, data in sorted(self.fs.items()):
@@ -211,3 +220,37 @@ def test_upload_error_keeps_file_out_of_manifest(tmp_path: Path) -> None:
 
     assert len(backend.upload_calls) == 2
     assert backend.upload_calls[1] == [("/workspace/a.txt", b"alpha")]
+
+
+def test_ensure_root_failure_toasts_and_skips_upload(tmp_path: Path) -> None:
+    toasts: list[ToastRequest] = []
+    register_toast_sink(toasts.append)
+    _write(tmp_path, "a.txt", b"alpha")
+    backend = FakeSandboxBackend()
+    backend.mkdir_exit = 1  # mkdir -p fails
+    mw = _mw(backend, tmp_path)
+
+    result = asyncio.run(mw.abefore_agent(cast(Any, {}), cast(Any, None)))
+    assert result is None
+    assert any("seed failed" in t.message.lower() for t in toasts)
+    # A failed root create must not upload, and must not mark the root ready.
+    assert backend.upload_calls == []
+
+
+def test_listing_failure_toasts(tmp_path: Path) -> None:
+    toasts: list[ToastRequest] = []
+    register_toast_sink(toasts.append)
+    backend = FakeSandboxBackend()
+    backend.listing_exit = 2  # find/sha256sum listing fails
+    mw = _mw(backend, tmp_path)
+
+    result = asyncio.run(mw.aafter_agent(cast(Any, {}), cast(Any, None)))
+    assert result is None
+    assert any("sync-back failed" in t.message.lower() for t in toasts)
+
+
+def test_listing_command_uses_double_dash(tmp_path: Path) -> None:
+    backend = FakeSandboxBackend()
+    mw = _mw(backend, tmp_path)
+    asyncio.run(mw._sync_back())
+    assert any("sha256sum -- {}" in c for c in backend.commands)

@@ -99,10 +99,22 @@ class SandboxSyncMiddleware(AgentMiddleware):
         return f"{self._remote_root}/{rel}"
 
     async def _ensure_root(self) -> None:
-        """Create the remote sync root once (uploads need its parent to exist)."""
+        """Create the remote sync root once (uploads need its parent to exist).
+
+        Raises on failure so the calling hook surfaces a warning toast; only
+        marks the root ready on success, so a failed create is retried next turn
+        rather than silently skipped.
+        """
         if self._root_ready:
             return
-        await self._backend.aexecute(f"mkdir -p {shlex.quote(self._remote_root)}")
+        result = await self._backend.aexecute(
+            f"mkdir -p {shlex.quote(self._remote_root)}"
+        )
+        if result.exit_code not in (0, None):
+            raise RuntimeError(
+                f"could not create sandbox dir {self._remote_root}: "
+                f"{result.output.strip()[:200]}"
+            )
         self._root_ready = True
 
     def _warn_oversize(self, rel: str) -> None:
@@ -147,10 +159,18 @@ class SandboxSyncMiddleware(AgentMiddleware):
 
     async def _sync_back(self) -> None:
         """Download files changed inside the sandbox back to the local dir."""
+        # Ensure the root exists first, so a missing directory can't masquerade
+        # as an empty listing; then a `cd` failure is a genuine error to raise.
+        await self._ensure_root()
         listing = await self._backend.aexecute(
-            f"cd {shlex.quote(self._remote_root)} 2>/dev/null && "
-            "find . -type f -printf '%s ' -exec sha256sum {} \\;"
+            f"cd {shlex.quote(self._remote_root)} && "
+            "find . -type f -printf '%s ' -exec sha256sum -- {} \\;"
         )
+        if listing.exit_code not in (0, None):
+            raise RuntimeError(
+                f"sandbox listing failed (exit {listing.exit_code}): "
+                f"{listing.output.strip()[:200]}"
+            )
         downloads: list[str] = []
         meta: dict[str, tuple[str, str]] = {}  # remote path -> (rel, remote hash)
         for line in listing.output.splitlines():

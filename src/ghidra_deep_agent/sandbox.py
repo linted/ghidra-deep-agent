@@ -57,9 +57,16 @@ async def open_sandbox_backend() -> AsyncIterator[SandboxBackendProtocol]:
     original error.
     """
     # Imported lazily so the sandbox packages are only required when the
-    # feature is actually enabled.
-    import openshell
-    from langchain_nvidia_openshell import OpenShellSandbox
+    # feature is actually enabled. A missing package is turned into the same
+    # fatal error as any other creation failure, per this factory's contract.
+    try:
+        import openshell
+        from langchain_nvidia_openshell import OpenShellSandbox
+    except ImportError as exc:
+        raise OpenShellSandboxError(
+            f"OpenShell sandbox packages are not installed ({exc}); "
+            "install with `uv sync` or unset SANDBOX."
+        ) from exc
 
     class _RootedOpenShellSandbox(OpenShellSandbox):  # type: ignore[misc]
         """OpenShellSandbox that runs every command in ``SANDBOX_WORKDIR``.
