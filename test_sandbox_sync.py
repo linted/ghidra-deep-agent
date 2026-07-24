@@ -31,7 +31,7 @@ from deepagents.backends.protocol import (
 )
 from deepagents.backends.sandbox import BaseSandbox
 
-from ghidra_deep_agent.sandbox_sync import _SEED_TAR_REMOTE, SandboxSyncMiddleware
+from ghidra_deep_agent.sandbox_sync import _SEED_TAR_NAME, SandboxSyncMiddleware
 from ghidra_deep_agent.toasts import ToastRequest, register_toast_sink
 
 
@@ -94,11 +94,13 @@ class FakeSandboxBackend(BaseSandbox):
         return ExecuteResponse(output="\n".join(lines), exit_code=0)
 
     def _extract_tar(self, command: str) -> ExecuteResponse:
-        """Emulate ``tar -xzf <tarball> -C <root> && rm -f <tarball>``."""
-        if self.tar_exit not in (0, None):
-            return ExecuteResponse(output="tar: error", exit_code=self.tar_exit)
-        argv = shlex.split(command.split("&&")[0])
+        """Emulate ``tar -xzf <tar> -C <root>; rc=$?; rm -f <tar>; exit $rc``."""
+        argv = shlex.split(command.split(";")[0])
         tar_path, root = argv[2], argv[4]
+        if self.tar_exit not in (0, None):
+            # The unconditional ``rm -f`` removes the tarball even on failure.
+            self.fs.pop(tar_path, None)
+            return ExecuteResponse(output="tar: error", exit_code=self.tar_exit)
         blob = self.fs.get(tar_path)
         if blob is None:
             return ExecuteResponse(output=f"tar: {tar_path}: not found", exit_code=2)
@@ -282,6 +284,15 @@ def test_listing_command_uses_double_dash(tmp_path: Path) -> None:
     assert any("sha256sum -- {}" in c for c in backend.commands)
 
 
+def test_listing_command_excludes_seed_tarball(tmp_path: Path) -> None:
+    """A tarball orphaned by an interrupted extract must never sync back."""
+    backend = FakeSandboxBackend()
+    mw = _mw(backend, tmp_path)
+    asyncio.run(mw._sync_back())
+    listing = next(c for c in backend.commands if "sha256sum" in c)
+    assert f"! -name {_SEED_TAR_NAME}" in listing
+
+
 def _write_many(root: Path, count: int) -> dict[str, bytes]:
     files = {f"sub{i % 2}/f{i}.txt": f"content-{i}".encode() for i in range(count)}
     for rel, data in files.items():
@@ -298,11 +309,12 @@ def test_bulk_seed_uses_single_tarball(tmp_path: Path) -> None:
 
     # One upload (the tarball), one extract exec; every file lands in place.
     assert len(backend.upload_calls) == 1
-    assert [p for p, _ in backend.upload_calls[0]] == [_SEED_TAR_REMOTE]
+    seed_tar = f"{backend.remote_root}/{_SEED_TAR_NAME}"
+    assert [p for p, _ in backend.upload_calls[0]] == [seed_tar]
     assert any(c.startswith("tar -xzf ") for c in backend.commands)
     for rel, data in files.items():
         assert backend.fs[f"/workspace/{rel}"] == data
-    assert _SEED_TAR_REMOTE not in backend.fs  # cleaned up after extract
+    assert seed_tar not in backend.fs  # cleaned up after extract
 
     # Manifest primed by the tar path: a second seed transfers nothing.
     asyncio.run(mw._seed())
@@ -346,7 +358,7 @@ def test_bulk_seed_extract_failure_falls_back_to_per_file(tmp_path: Path) -> Non
 def test_bulk_seed_tarball_upload_error_falls_back(tmp_path: Path) -> None:
     files = _write_many(tmp_path, 4)
     backend = FakeSandboxBackend()
-    backend.upload_errors.add(_SEED_TAR_REMOTE)
+    backend.upload_errors.add(f"{backend.remote_root}/{_SEED_TAR_NAME}")
     mw = _mw(backend, tmp_path)
 
     asyncio.run(mw._seed())
