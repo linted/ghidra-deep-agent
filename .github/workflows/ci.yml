@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is the floor declared in pyproject; 3.14 is what .python-version
+        # pins locally. Both are exercised so the floor can't silently rot.
+        python-version: ["3.12", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Lint
+        run: ./scripts/lint.sh --check
+
+      - name: Typecheck
+        run: ./scripts/typecheck.sh
+
+      # Integration tests (test_knowledge.py) need a live MongoDB with vector
+      # search plus an embedding model, so they are deselected here.
+      - name: Test
+        run: ./scripts/test.sh

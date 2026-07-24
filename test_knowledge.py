@@ -11,6 +11,10 @@ Checks each layer independently so it's clear exactly where things break:
   - update_knowledge: rename, confidence/tags update, no-op, unknown address
   - list_analyzed_binaries
 
+These are integration tests: they need a reachable MongoDB (with vector search)
+and a working embedding model. They are marked ``integration`` and skip cleanly
+when either is unavailable, so CI runs ``pytest -m "not integration"``.
+
 Run:  uv run pytest test_knowledge.py -v
 """
 
@@ -19,53 +23,96 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Generator
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
-load_dotenv()
+pytestmark = pytest.mark.integration
 
 # ── config ────────────────────────────────────────────────────────────────────
 
-MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
-MONGODB_DB = os.environ.get("MONGODB_DB", "checkpointing_db")
 COLLECTION = "re_knowledge_test"
-os.environ["MONGODB_VECTOR_COLLECTION"] = COLLECTION
-_ollama_fallback = f"ollama:{os.environ.get('OLLAMA_EMBED_MODEL', 'nomic-embed-text')}"
-EMBED_MODEL = os.environ.get("EMBED_MODEL", _ollama_fallback)
-BINARY_NAME = os.environ.get("BINARY_NAME", "test_binary")
 
 TEST_MARKER = "__test_knowledge_pytest__"
 TEST_ADDRESS = "0xDEADBEEF"
 UPDATE_ADDRESS = "0xBEEFBEEF"
 
 
+@dataclass(frozen=True)
+class Config:
+    mongodb_uri: str
+    mongodb_db: str
+    embed_model: str
+    binary_name: str
+
+
 # ── fixtures ──────────────────────────────────────────────────────────────────
 
 
 @pytest.fixture(scope="session")
-def mongo_client() -> Generator[Any, None, None]:
-    from pymongo import MongoClient
+def _dotenv_applied() -> Generator[None, None, None]:
+    """Apply ``.env`` for the duration of this module's run only.
 
-    client: Any = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    client.admin.command("ping")
+    Calling ``load_dotenv()`` at import time leaked the developer's ``.env``
+    into every *other* test module — pytest imports all of them at collection
+    time — which broke the tests that assert deepagents' built-in compaction
+    defaults. Reading the file into a dict and applying it through monkeypatch
+    keeps the values available here and reverts them afterwards, so the suite
+    no longer depends on collection order.
+    """
+    mp = pytest.MonkeyPatch()
+    for key, value in dotenv_values().items():
+        # Mirrors load_dotenv()'s default: a real environment wins over .env.
+        if value is not None and key not in os.environ:
+            mp.setenv(key, value)
+    # The collection name the code under test reads; kept off the real one.
+    mp.setenv("MONGODB_VECTOR_COLLECTION", COLLECTION)
+    yield
+    mp.undo()
+
+
+@pytest.fixture(scope="session")
+def config(_dotenv_applied: None) -> Config:
+    ollama_fallback = (
+        f"ollama:{os.environ.get('OLLAMA_EMBED_MODEL', 'nomic-embed-text')}"
+    )
+    return Config(
+        mongodb_uri=os.environ.get("MONGODB_URI", "mongodb://localhost:27017"),
+        mongodb_db=os.environ.get("MONGODB_DB", "checkpointing_db"),
+        embed_model=os.environ.get("EMBED_MODEL", ollama_fallback),
+        binary_name=os.environ.get("BINARY_NAME", "test_binary"),
+    )
+
+
+@pytest.fixture(scope="session")
+def mongo_client(config: Config) -> Generator[Any, None, None]:
+    from pymongo import MongoClient
+    from pymongo.errors import PyMongoError
+
+    client: Any = MongoClient(config.mongodb_uri, serverSelectionTimeoutMS=5000)
+    try:
+        client.admin.command("ping")
+    except PyMongoError as exc:
+        client.close()
+        pytest.skip(f"MongoDB unavailable at {config.mongodb_uri}: {exc}")
     yield client
-    client[MONGODB_DB][COLLECTION].drop()
+    client[config.mongodb_db][COLLECTION].drop()
     client.close()
 
 
 @pytest.fixture(scope="session")
-def mongo_collection(mongo_client: Any) -> Any:
-    return mongo_client[MONGODB_DB][COLLECTION]
+def mongo_collection(config: Config, mongo_client: Any) -> Any:
+    return mongo_client[config.mongodb_db][COLLECTION]
 
 
 @pytest.fixture(scope="session")
-def embeddings_model() -> Any:
+def embeddings_model(config: Config) -> Any:
     from ghidra_deep_agent.models import build_embeddings
 
     try:
-        emb = build_embeddings(EMBED_MODEL)
+        emb = build_embeddings(config.embed_model)
         emb.embed_query("test")
         return emb
     except Exception as exc:
@@ -73,13 +120,16 @@ def embeddings_model() -> Any:
 
 
 @pytest.fixture(scope="session")
-def tools_map(embeddings_model: Any) -> Any:
+def tools_map(config: Config, mongo_client: Any, embeddings_model: Any) -> Any:
     from ghidra_deep_agent.knowledge import build_knowledge_tools
 
     tm = {
         t.name: t
         for t in build_knowledge_tools(
-            MONGODB_URI, MONGODB_DB, embeddings_model, BINARY_NAME
+            config.mongodb_uri,
+            config.mongodb_db,
+            embeddings_model,
+            config.binary_name,
         )
     }
 
@@ -124,11 +174,11 @@ class TestMongoConnectivity:
 
 
 class TestDirectWriteRead:
-    def test_insert_and_read_back(self, mongo_collection: Any) -> None:
+    def test_insert_and_read_back(self, config: Config, mongo_collection: Any) -> None:
         doc_id = mongo_collection.insert_one(
             {
                 "text": "Direct insert by test_knowledge.py",
-                "binary_name": BINARY_NAME,
+                "binary_name": config.binary_name,
                 "category": "test",
                 "address": "0x00000000",
                 "function_name": TEST_MARKER,
@@ -279,9 +329,9 @@ class TestUpdateKnowledge:
 
 
 class TestListAnalyzedBinaries:
-    def test_binary_listed(self, tools_map: Any) -> None:
+    def test_binary_listed(self, config: Config, tools_map: Any) -> None:
         r = tools_map["list_analyzed_binaries"].invoke({})
-        assert BINARY_NAME in r
+        assert config.binary_name in r
 
     def test_current_binary_marked(self, tools_map: Any) -> None:
         r = tools_map["list_analyzed_binaries"].invoke({})
@@ -292,15 +342,19 @@ class TestListAnalyzedBinaries:
 
 
 class TestGetKnowledgeSummary:
-    def test_summary_contains_seeded_data(self, tools_map: Any) -> None:
+    def test_summary_contains_seeded_data(self, config: Config, tools_map: Any) -> None:
         # tools_map fixture has already seeded two findings via save_knowledge.
         summary = tools_map["get_knowledge_summary"].invoke({})
-        assert BINARY_NAME in summary
+        assert config.binary_name in summary
         assert "Totals:" in summary
         assert TEST_MARKER in summary  # function name appears in analyzed list
 
     def test_summary_respects_function_cap(
-        self, tools_map: Any, mongo_collection: Any, embeddings_model: Any
+        self,
+        config: Config,
+        tools_map: Any,
+        mongo_collection: Any,
+        embeddings_model: Any,
     ) -> None:
         from ghidra_deep_agent.knowledge import (
             SUMMARY_FUNCTION_CAP,
@@ -326,7 +380,10 @@ class TestGetKnowledgeSummary:
             cap_tools = {
                 t.name: t
                 for t in build_knowledge_tools(
-                    MONGODB_URI, MONGODB_DB, embeddings_model, cap_binary
+                    config.mongodb_uri,
+                    config.mongodb_db,
+                    embeddings_model,
+                    cap_binary,
                 )
             }
             summary = cap_tools["get_knowledge_summary"].invoke({})
