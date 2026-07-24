@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
+import shlex
+import tarfile
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any, cast
@@ -28,7 +31,7 @@ from deepagents.backends.protocol import (
 )
 from deepagents.backends.sandbox import BaseSandbox
 
-from ghidra_deep_agent.sandbox_sync import SandboxSyncMiddleware
+from ghidra_deep_agent.sandbox_sync import _SEED_TAR_REMOTE, SandboxSyncMiddleware
 from ghidra_deep_agent.toasts import ToastRequest, register_toast_sink
 
 
@@ -59,9 +62,10 @@ class FakeSandboxBackend(BaseSandbox):
         self.upload_errors: set[str] = set()
         # When set, execute() raises to exercise hook error handling.
         self.raise_on_execute = False
-        # Tunable exit codes for the mkdir / listing commands.
+        # Tunable exit codes for the mkdir / listing / tar-extract commands.
         self.mkdir_exit = 0
         self.listing_exit = 0
+        self.tar_exit = 0
 
     @property
     def id(self) -> str:
@@ -73,6 +77,8 @@ class FakeSandboxBackend(BaseSandbox):
             raise RuntimeError("sandbox gone")
         if command.startswith("mkdir "):
             return ExecuteResponse(output="", exit_code=self.mkdir_exit)
+        if command.startswith("tar -xzf "):
+            return self._extract_tar(command)
         if "sha256sum" not in command:
             return ExecuteResponse(output="", exit_code=0)
         if self.listing_exit not in (0, None):
@@ -86,6 +92,26 @@ class FakeSandboxBackend(BaseSandbox):
             digest = hashlib.sha256(data).hexdigest()
             lines.append(f"{len(data)} {digest}  ./{rel}")
         return ExecuteResponse(output="\n".join(lines), exit_code=0)
+
+    def _extract_tar(self, command: str) -> ExecuteResponse:
+        """Emulate ``tar -xzf <tarball> -C <root> && rm -f <tarball>``."""
+        if self.tar_exit not in (0, None):
+            return ExecuteResponse(output="tar: error", exit_code=self.tar_exit)
+        argv = shlex.split(command.split("&&")[0])
+        tar_path, root = argv[2], argv[4]
+        blob = self.fs.get(tar_path)
+        if blob is None:
+            return ExecuteResponse(output=f"tar: {tar_path}: not found", exit_code=2)
+        with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue
+                extracted = tf.extractfile(member)
+                self.fs[f"{root}/{member.name}"] = (
+                    extracted.read() if extracted else b""
+                )
+        del self.fs[tar_path]
+        return ExecuteResponse(output="", exit_code=0)
 
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         self.upload_calls.append(list(files))
@@ -254,3 +280,77 @@ def test_listing_command_uses_double_dash(tmp_path: Path) -> None:
     mw = _mw(backend, tmp_path)
     asyncio.run(mw._sync_back())
     assert any("sha256sum -- {}" in c for c in backend.commands)
+
+
+def _write_many(root: Path, count: int) -> dict[str, bytes]:
+    files = {f"sub{i % 2}/f{i}.txt": f"content-{i}".encode() for i in range(count)}
+    for rel, data in files.items():
+        _write(root, rel, data)
+    return files
+
+
+def test_bulk_seed_uses_single_tarball(tmp_path: Path) -> None:
+    files = _write_many(tmp_path, 5)
+    backend = FakeSandboxBackend()
+    mw = _mw(backend, tmp_path)  # default threshold: 4 files
+
+    asyncio.run(mw._seed())
+
+    # One upload (the tarball), one extract exec; every file lands in place.
+    assert len(backend.upload_calls) == 1
+    assert [p for p, _ in backend.upload_calls[0]] == [_SEED_TAR_REMOTE]
+    assert any(c.startswith("tar -xzf ") for c in backend.commands)
+    for rel, data in files.items():
+        assert backend.fs[f"/workspace/{rel}"] == data
+    assert _SEED_TAR_REMOTE not in backend.fs  # cleaned up after extract
+
+    # Manifest primed by the tar path: a second seed transfers nothing.
+    asyncio.run(mw._seed())
+    assert len(backend.upload_calls) == 1
+
+
+def test_bulk_seed_below_threshold_stays_per_file(tmp_path: Path) -> None:
+    _write_many(tmp_path, 3)
+    backend = FakeSandboxBackend()
+    mw = _mw(backend, tmp_path)
+
+    asyncio.run(mw._seed())
+
+    assert len(backend.upload_calls) == 1
+    assert len(backend.upload_calls[0]) == 3  # individual files, no tarball
+    assert not any(c.startswith("tar ") for c in backend.commands)
+
+
+def test_bulk_seed_extract_failure_falls_back_to_per_file(tmp_path: Path) -> None:
+    toasts: list[ToastRequest] = []
+    register_toast_sink(toasts.append)
+    files = _write_many(tmp_path, 5)
+    backend = FakeSandboxBackend()
+    backend.tar_exit = 127  # e.g. image without tar
+    mw = _mw(backend, tmp_path)
+
+    asyncio.run(mw._seed())
+
+    # Tarball upload, then the per-file fallback batch.
+    assert len(backend.upload_calls) == 2
+    assert len(backend.upload_calls[1]) == 5
+    for rel, data in files.items():
+        assert backend.fs[f"/workspace/{rel}"] == data
+    assert any("bulk seed" in t.message.lower() for t in toasts)
+
+    # Fallback still primes the manifest: a second seed transfers nothing.
+    asyncio.run(mw._seed())
+    assert len(backend.upload_calls) == 2
+
+
+def test_bulk_seed_tarball_upload_error_falls_back(tmp_path: Path) -> None:
+    files = _write_many(tmp_path, 4)
+    backend = FakeSandboxBackend()
+    backend.upload_errors.add(_SEED_TAR_REMOTE)
+    mw = _mw(backend, tmp_path)
+
+    asyncio.run(mw._seed())
+
+    assert len(backend.upload_calls) == 2  # failed tarball, then per-file batch
+    for rel, data in files.items():
+        assert backend.fs[f"/workspace/{rel}"] == data

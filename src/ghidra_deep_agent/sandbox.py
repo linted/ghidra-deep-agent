@@ -125,7 +125,12 @@ async def open_sandbox_backend() -> AsyncIterator[SandboxBackendProtocol]:
             file=sys.stderr,
         )
 
-    backend = _RootedOpenShellSandbox(sandbox=sandbox)
+    # 2 MiB upload chunks (default 512 KiB) cut large-upload round trips 4x
+    # while the base64-inflated payload (~1.33x -> ~2.8 MB) stays under
+    # gRPC's 4 MB message cap.
+    backend = _RootedOpenShellSandbox(
+        sandbox=sandbox, max_upload_chunk_bytes=2 * 1024 * 1024
+    )
     try:
         yield backend
     finally:
