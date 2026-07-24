@@ -22,7 +22,9 @@ For that jump it then, in order:
   1. clears a stale ``CALL`` / ``CALL_RETURN`` flow override on the jump
      instruction (the "Treating indirect jump as call" cause),
   2. writes the decompiler jump-table override
-     (``JumpTable(switchAddr, dests, true).writeOverride(func)``),
+     (``JumpTable(switchAddr, dests, true, 0).writeOverride(func)`` — the final
+     ``0`` is ``EquateSymbol.FORMAT_DEFAULT``, i.e. no case-label display-format
+     override; Ghidra 12.x only has the 4-arg constructor),
   3. adds a ``COMPUTED_JUMP`` reference to every destination and disassembles any
      that are still undefined bytes,
   4. optionally marks the table's memory block read-only (``set_rodata_constant``)
@@ -299,7 +301,9 @@ public class gda_apply_switch_override extends GhidraScript {
 
         // 2. Decompiler jump-table override.
         try {
-            JumpTable jt = new JumpTable(jumpAddr, dests, true);
+            // Final arg is the case-label display format; 0 == EquateSymbol.FORMAT_DEFAULT
+            // (no format override). Ghidra 12.x only has the 4-arg constructor.
+            JumpTable jt = new JumpTable(jumpAddr, dests, true, 0);
             jt.writeOverride(func);
         } catch (Exception ex) {
             emitError("writeOverride failed: " + ex.getMessage());
