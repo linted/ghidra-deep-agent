@@ -37,8 +37,10 @@ _MAX_BYTES_ENV = "SANDBOX_SYNC_MAX_BYTES"
 _DEFAULT_TAR_MIN_FILES = 4
 _TAR_MIN_FILES_ENV = "SANDBOX_SYNC_TAR_MIN_FILES"
 
-# Outside the sync root so the sync-back ``find`` can never pick it up.
-_SEED_TAR_REMOTE = "/tmp/.ghidra_seed.tar.gz"
+# Staged inside the sync root — the only path guaranteed writable under the
+# sandbox's Landlock policy (/tmp is not). The sync-back ``find`` excludes it
+# by name, and the extract command removes it even when extraction fails.
+_SEED_TAR_NAME = ".ghidra_seed.tar.gz"
 
 
 def _default_max_bytes() -> int:
@@ -209,18 +211,19 @@ class SandboxSyncMiddleware(AgentMiddleware):
                 info = tarfile.TarInfo(name=rel)
                 info.size = len(data)
                 tar.addfile(info, io.BytesIO(data))
+        seed_tar = f"{self._remote_root}/{_SEED_TAR_NAME}"
         try:
-            responses = await self._backend.aupload_files(
-                [(_SEED_TAR_REMOTE, buf.getvalue())]
-            )
+            responses = await self._backend.aupload_files([(seed_tar, buf.getvalue())])
             if not responses or responses[0].error is not None:
                 error = responses[0].error if responses else "no response"
                 self._warn_tar_fallback(f"tarball upload failed: {error}")
                 return False
+            # `;` not `&&`: the tarball must be removed even when extraction
+            # fails, or the per-file fallback would leave it for the sync-back.
             result = await self._backend.aexecute(
-                f"tar -xzf {shlex.quote(_SEED_TAR_REMOTE)} "
-                f"-C {shlex.quote(self._remote_root)} "
-                f"&& rm -f {shlex.quote(_SEED_TAR_REMOTE)}"
+                f"tar -xzf {shlex.quote(seed_tar)} "
+                f"-C {shlex.quote(self._remote_root)}; "
+                f"rc=$?; rm -f {shlex.quote(seed_tar)}; exit $rc"
             )
         except Exception as exc:  # noqa: BLE001 - fall back to per-file uploads
             self._warn_tar_fallback(str(exc))
@@ -251,7 +254,8 @@ class SandboxSyncMiddleware(AgentMiddleware):
         await self._ensure_root()
         listing = await self._backend.aexecute(
             f"cd {shlex.quote(self._remote_root)} && "
-            "find . -type f -printf '%s ' -exec sha256sum -- {} \\;"
+            f"find . -type f ! -name {shlex.quote(_SEED_TAR_NAME)} "
+            "-printf '%s ' -exec sha256sum -- {} \\;"
         )
         if listing.exit_code not in (0, None):
             raise RuntimeError(
