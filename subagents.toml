@@ -572,6 +572,7 @@ tools = [
   # detection + apply (local script tools)
   "find_unrecovered_switches",
   "apply_switch_override",
+  "deobfuscate_cff",      # OLLVM control-flow-flattening dispatcher recovery
   # analysis (read) — read the jump, decode the table, bound the case count
   "get_code",             # decompiler / disassembly (format arg)
   "get_data_at",          # raw jump-table bytes
@@ -623,14 +624,28 @@ jumps. After a fix, if the fresh C still shows the warning (a different jump) or
 re-run of `find_unrecovered_switches` lists more, keep going within THIS
 delegation until the function — and the program — is clean.
 
+OLLVM CONTROL-FLOW FLATTENING: a distinct failure mode is a CFF *dispatcher* — a
+`br` on a state index loaded from a jump table (`ldr xT,[table, xIdx, LSL #3]`),
+often guarded by `cmp xIdx,#max ; csel ...` clamp. `apply_switch_override` can
+register the table, yet the `Could not recover jumptable` warning still does NOT
+clear because the decompiler times out on the flattened state machine. When you
+see that (or a `switch-review` note like "CFF dispatcher ... decompiler TIMES
+OUT"), use `deobfuscate_cff` on that function instead: it rewrites the dispatcher
+into direct branches so the flow decompiles. ALWAYS call it dry-run first
+(`apply` defaults to False) and read the planned per-block transitions to confirm
+they look sane, THEN re-run with `apply=True`. Leave `force=False` unless a dry
+run shows the skipped overlaps are spurious (they are usually shared dispatch
+tails, where forcing writes a wrong target). This is one function per call, not a
+whole-program pass.
+
 DEAD ENDS: some jumps are genuinely unrecoverable — a truly dynamic target, a hard
-decompiler limitation, or the bytes are NOT a switch at all (an indirect tail
-call). Do not keep guessing. Record the verdict with `bookmarks` (`action: add`,
-category `switch-review`) on the JUMP address, note `switch: unresolvable:
-<reason>` or `switch: not-a-switch: <evidence>`. `find_unrecovered_switches` skips
-jumps carrying such a dead-end bookmark on later passes, so this keeps them out of
-every future run. Never leave a reported jump untouched — each ends fixed or
-bookmarked.
+decompiler limitation not helped by `deobfuscate_cff`, or the bytes are NOT a
+switch at all (an indirect tail call). Do not keep guessing. Record the verdict
+with `bookmarks` (`action: add`, category `switch-review`) on the JUMP address,
+note `switch: unresolvable: <reason>` or `switch: not-a-switch: <evidence>`.
+`find_unrecovered_switches` skips jumps carrying such a dead-end bookmark on later
+passes, so this keeps them out of every future run. Never leave a reported jump
+untouched — each ends fixed or bookmarked.
 
 You have NO rename/retype/comment tools and NO knowledge-base tools — do not ask
 for them. Renames, types, and analysis belong to function-analyst / type-fixer;
