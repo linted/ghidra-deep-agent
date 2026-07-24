@@ -20,9 +20,6 @@ exactly as before, just without programmatic jump-table recovery.
 """
 
 import json
-import os
-import re
-import sys
 from typing import Any
 
 from langchain_core.tools import BaseTool, tool
@@ -36,7 +33,6 @@ from ghidra_deep_agent.apply_switch_override_script import (
 from ghidra_deep_agent.apply_switch_override_script import (
     SCRIPT_SOURCE as APPLY_SCRIPT_SOURCE,
 )
-from ghidra_deep_agent.async_tasks import resolve_async_result, to_text
 from ghidra_deep_agent.find_unrecovered_switches_script import (
     MARK_END as FIND_MARK_END,
 )
@@ -45,6 +41,11 @@ from ghidra_deep_agent.find_unrecovered_switches_script import (
 )
 from ghidra_deep_agent.find_unrecovered_switches_script import (
     SCRIPT_SOURCE as FIND_SCRIPT_SOURCE,
+)
+from ghidra_deep_agent.ghidra_script_tools import (
+    GhidraScriptRunner,
+    find_scripts_tools,
+    manifest_pattern,
 )
 from ghidra_deep_agent.ollvm_deobfuscate_script import (
     MARK_END as OLLVM_MARK_END,
@@ -65,39 +66,12 @@ _APPLY_SCRIPT_NAME = "gda_apply_switch_override.java"
 # file name must match.
 _OLLVM_SCRIPT_NAME = "OllvmDeobfuscator.java"
 
-# A whole-program decompile pass can run for minutes; poll well past the default
-# async timeout. Shares the prototype pass's env knob for a single control.
-_SWITCH_TIMEOUT_S = float(os.environ.get("GHIDRA_RECOVER_TIMEOUT", "1800"))
-
-_FIND_JSON_RE = re.compile(
-    re.escape(FIND_MARK_START) + r"\s*(\{.*\})\s*" + re.escape(FIND_MARK_END),
-    re.DOTALL,
-)
-_APPLY_JSON_RE = re.compile(
-    re.escape(APPLY_MARK_START) + r"\s*(\{.*\})\s*" + re.escape(APPLY_MARK_END),
-    re.DOTALL,
-)
-_OLLVM_JSON_RE = re.compile(
-    re.escape(OLLVM_MARK_START) + r"\s*(\{.*\})\s*" + re.escape(OLLVM_MARK_END),
-    re.DOTALL,
-)
+_FIND_JSON_RE = manifest_pattern(FIND_MARK_START, FIND_MARK_END)
+_APPLY_JSON_RE = manifest_pattern(APPLY_MARK_START, APPLY_MARK_END)
+_OLLVM_JSON_RE = manifest_pattern(OLLVM_MARK_START, OLLVM_MARK_END)
 # The CFF pass rewrites instructions across a whole flattened function; keep the
 # readable phase report the agent sees bounded.
 _OLLVM_REPORT_CAP = 6000
-
-
-# --- GhidrAssistMCP `scripts` argument shapes -----------------------------------
-def _scripts_create(name: str, source: str) -> dict[str, Any]:
-    # overwrite=True redeploys the current script each run, so a stale older
-    # version can't be executed and no separate delete step is needed.
-    return {"action": "create", "name": name, "source": source, "overwrite": True}
-
-
-def _scripts_run(name: str, run_args: list[str] | None = None) -> dict[str, Any]:
-    args: dict[str, Any] = {"action": "run", "name": name}
-    if run_args:
-        args["args"] = run_args
-    return args
 
 
 def _format_find_summary(payload: dict[str, Any]) -> str:
@@ -235,28 +209,10 @@ def build_switch_tools(mcp_tools: list[BaseTool]) -> list[BaseTool]:
     without it the tools are omitted with a warning. ``get_task_status`` is used to
     resolve each script's async task when present.
     """
-    by_name = {t.name: t for t in mcp_tools}
-    scripts_tool = by_name.get("scripts")
-    status_tool = by_name.get("get_task_status")
-    if scripts_tool is None:
-        print(
-            "Warning: GhidrAssistMCP 'scripts' tool not available "
-            "(enable it server-side); jump-table tools disabled.",
-            file=sys.stderr,
-        )
+    found = find_scripts_tools(mcp_tools, "jump-table tools disabled.")
+    if found is None:
         return []
-
-    async def _run_script(
-        name: str, source: str, run_args: list[str] | None = None
-    ) -> str:
-        # Redeploy the current script (overwrite), then run it. Resolve the async
-        # task on both calls — a whole-program pass can take minutes.
-        create_out = to_text(await scripts_tool.ainvoke(_scripts_create(name, source)))
-        await resolve_async_result(create_out, status_tool, timeout_s=_SWITCH_TIMEOUT_S)
-        run_out = to_text(await scripts_tool.ainvoke(_scripts_run(name, run_args)))
-        return await resolve_async_result(
-            run_out, status_tool, timeout_s=_SWITCH_TIMEOUT_S
-        )
+    runner = GhidraScriptRunner(*found)
 
     @tool
     async def find_unrecovered_switches() -> str:
@@ -279,20 +235,14 @@ def build_switch_tools(mcp_tools: list[BaseTool]) -> list[BaseTool]:
         functions containing an unresolved indirect jump are decompiled). Call it
         ONCE, not per-function.
         """
-        raw = await _run_script(_FIND_SCRIPT_NAME, FIND_SCRIPT_SOURCE)
-        match = _FIND_JSON_RE.search(raw)
-        if match is None:
-            tail = raw[-800:] if raw else "(empty result)"
-            return (
-                "find_unrecovered_switches: no JSON manifest found in the script "
-                "output. The `scripts` executor may not return stdout, the "
-                "`scripts` tool may be disabled/misconfigured, or the script "
-                "errored. Raw output tail:\n" + tail
-            )
-        try:
-            payload = json.loads(match.group(1))
-        except ValueError as exc:
-            return f"find_unrecovered_switches: could not parse manifest JSON ({exc})."
+        payload, _raw, error = await runner.run_manifest(
+            _FIND_SCRIPT_NAME,
+            FIND_SCRIPT_SOURCE,
+            _FIND_JSON_RE,
+            "find_unrecovered_switches",
+        )
+        if payload is None:
+            return error
         return _format_find_summary(payload)
 
     @tool
@@ -368,20 +318,15 @@ def build_switch_tools(mcp_tools: list[BaseTool]) -> list[BaseTool]:
         if set_rodata_constant:
             payload["set_rodata_constant"] = True
 
-        raw = await _run_script(
-            _APPLY_SCRIPT_NAME, APPLY_SCRIPT_SOURCE, [json.dumps(payload)]
+        result, _raw, error = await runner.run_manifest(
+            _APPLY_SCRIPT_NAME,
+            APPLY_SCRIPT_SOURCE,
+            _APPLY_JSON_RE,
+            "apply_switch_override",
+            [json.dumps(payload)],
         )
-        match = _APPLY_JSON_RE.search(raw)
-        if match is None:
-            tail = raw[-800:] if raw else "(empty result)"
-            return (
-                "apply_switch_override: no JSON manifest found in the script "
-                "output. Raw output tail:\n" + tail
-            )
-        try:
-            result = json.loads(match.group(1))
-        except ValueError as exc:
-            return f"apply_switch_override: could not parse manifest JSON ({exc})."
+        if result is None:
+            return error
         return _format_apply_summary(result)
 
     @tool
@@ -427,20 +372,15 @@ def build_switch_tools(mcp_tools: list[BaseTool]) -> list[BaseTool]:
         args = [function, mode]
         if force:
             args.append("force")
-        raw = await _run_script(_OLLVM_SCRIPT_NAME, OLLVM_SCRIPT_SOURCE, args)
-        match = _OLLVM_JSON_RE.search(raw)
-        if match is None:
-            tail = raw[-800:] if raw else "(empty result)"
-            return (
-                "deobfuscate_cff: no JSON manifest found in the script output. The "
-                "`scripts` executor may not return stdout, the `scripts` tool may "
-                "be disabled/misconfigured, or the script errored. Raw output "
-                "tail:\n" + tail
-            )
-        try:
-            result = json.loads(match.group(1))
-        except ValueError as exc:
-            return f"deobfuscate_cff: could not parse manifest JSON ({exc})."
+        result, raw, error = await runner.run_manifest(
+            _OLLVM_SCRIPT_NAME,
+            OLLVM_SCRIPT_SOURCE,
+            _OLLVM_JSON_RE,
+            "deobfuscate_cff",
+            args,
+        )
+        if result is None:
+            return error
         return _format_ollvm_summary(result, raw)
 
     return [find_unrecovered_switches, apply_switch_override, deobfuscate_cff]

@@ -25,15 +25,15 @@ plainly (there is no file fallback: the server may be remote, so no shared
 filesystem is assumed).
 """
 
-import json
-import os
-import re
-import sys
 from typing import Any
 
 from langchain_core.tools import BaseTool, tool
 
-from ghidra_deep_agent.async_tasks import resolve_async_result, to_text
+from ghidra_deep_agent.ghidra_script_tools import (
+    GhidraScriptRunner,
+    find_scripts_tools,
+    manifest_pattern,
+)
 from ghidra_deep_agent.recover_prototypes_script import (
     MARK_END,
     MARK_START,
@@ -45,33 +45,7 @@ from ghidra_deep_agent.recover_prototypes_script import (
 # must match this basename (``gda_recover_prototypes``).
 _SCRIPT_NAME = "gda_recover_prototypes.java"
 
-# A program-wide decompile pass can run for minutes; poll well past the default
-# async timeout. Overridable for large binaries.
-_RECOVER_TIMEOUT_S = float(os.environ.get("GHIDRA_RECOVER_TIMEOUT", "1800"))
-
-_JSON_RE = re.compile(
-    re.escape(MARK_START) + r"\s*(\{.*\})\s*" + re.escape(MARK_END),
-    re.DOTALL,
-)
-
-
-# --- GhidrAssistMCP `scripts` argument shapes -----------------------------------
-def _scripts_create(source: str) -> dict[str, Any]:
-    # overwrite=True redeploys the current script each run, so a stale older
-    # version can't be executed and no separate delete step is needed.
-    return {
-        "action": "create",
-        "name": _SCRIPT_NAME,
-        "source": source,
-        "overwrite": True,
-    }
-
-
-def _scripts_run(dry_run: bool) -> dict[str, Any]:
-    args: dict[str, Any] = {"action": "run", "name": _SCRIPT_NAME}
-    if dry_run:
-        args["args"] = ["dry_run"]
-    return args
+_JSON_RE = manifest_pattern(MARK_START, MARK_END)
 
 
 def _format_summary(payload: dict[str, Any]) -> str:
@@ -149,28 +123,10 @@ def build_prototype_tools(mcp_tools: list[BaseTool]) -> list[BaseTool]:
     without it the tool is omitted with a warning. ``get_task_status`` is used to
     resolve the script's async task when present.
     """
-    by_name = {t.name: t for t in mcp_tools}
-    scripts_tool = by_name.get("scripts")
-    status_tool = by_name.get("get_task_status")
-    if scripts_tool is None:
-        print(
-            "Warning: GhidrAssistMCP 'scripts' tool not available "
-            "(enable it server-side); 'recover_prototypes' disabled.",
-            file=sys.stderr,
-        )
+    found = find_scripts_tools(mcp_tools, "'recover_prototypes' disabled.")
+    if found is None:
         return []
-
-    async def _run_script(dry_run: bool) -> str:
-        # Redeploy the current script (overwrite), then run it. Resolve the async
-        # task on the run result — a program-wide pass can take minutes.
-        create_out = to_text(await scripts_tool.ainvoke(_scripts_create(SCRIPT_SOURCE)))
-        create_out = await resolve_async_result(
-            create_out, status_tool, timeout_s=_RECOVER_TIMEOUT_S
-        )
-        run_out = to_text(await scripts_tool.ainvoke(_scripts_run(dry_run)))
-        return await resolve_async_result(
-            run_out, status_tool, timeout_s=_RECOVER_TIMEOUT_S
-        )
+    runner = GhidraScriptRunner(*found)
 
     @tool
     async def recover_prototypes(dry_run: bool = False) -> str:
@@ -203,20 +159,15 @@ def build_prototype_tools(mcp_tools: list[BaseTool]) -> list[BaseTool]:
             dry_run: When true, preview only — report what WOULD be auto-fixed and
                 flagged without committing any prototype or writing any bookmark.
         """
-        raw = await _run_script(dry_run)
-        match = _JSON_RE.search(raw)
-        if match is None:
-            tail = raw[-800:] if raw else "(empty result)"
-            return (
-                "recover_prototypes: no JSON manifest found in the script output. "
-                "The `scripts` executor may not return stdout, the `scripts` tool "
-                "may be disabled/misconfigured, or the script errored. "
-                "Raw output tail:\n" + tail
-            )
-        try:
-            payload = json.loads(match.group(1))
-        except ValueError as exc:
-            return f"recover_prototypes: could not parse manifest JSON ({exc})."
+        payload, _raw, error = await runner.run_manifest(
+            _SCRIPT_NAME,
+            SCRIPT_SOURCE,
+            _JSON_RE,
+            "recover_prototypes",
+            ["dry_run"] if dry_run else None,
+        )
+        if payload is None:
+            return error
         return _format_summary(payload)
 
     return [recover_prototypes]
