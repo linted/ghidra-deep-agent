@@ -15,6 +15,7 @@ gateway is resolved from the active OpenShell cluster config
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import shlex
 import sys
@@ -22,7 +23,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any, cast
 
-from deepagents.backends.protocol import ExecuteResponse, SandboxBackendProtocol
+from deepagents.backends.protocol import (
+    ExecuteResponse,
+    FileUploadResponse,
+    SandboxBackendProtocol,
+)
 
 SANDBOX_ENV = "SANDBOX"
 OPENSHELL_MODE = "openshell"
@@ -62,6 +67,10 @@ async def open_sandbox_backend() -> AsyncIterator[SandboxBackendProtocol]:
     try:
         import openshell
         from langchain_nvidia_openshell import OpenShellSandbox
+        from langchain_nvidia_openshell.sandbox import (
+            _UPLOAD_BOOTSTRAP,
+            _classify_fs_error,
+        )
     except ImportError as exc:
         raise OpenShellSandboxError(
             f"OpenShell sandbox packages are not installed ({exc}); "
@@ -92,6 +101,40 @@ async def open_sandbox_backend() -> AsyncIterator[SandboxBackendProtocol]:
                 ExecuteResponse,
                 await super().aexecute(_rooted(command), timeout=timeout),
             )
+
+        def _upload_chunk(
+            self, path: str, content: bytes, *, append: bool
+        ) -> FileUploadResponse:
+            """Base-adapter override that keeps the raw failure detail.
+
+            The adapter collapses every unrecognized failure to the bare
+            ``permission_denied`` literal, which twice misattributed the
+            gateway's 1 MiB message cap to Landlock. The protocol allows
+            free-form error strings, so append the flattened raw
+            stderr/exception text to the classified label.
+            """
+            stdin = base64.b64encode(content)
+            mode = "ab" if append else "wb"
+            try:
+                result = self._sandbox.exec(
+                    ["python3", "-c", _UPLOAD_BOOTSTRAP, path, mode],
+                    stdin=stdin,
+                    timeout_seconds=self._resolve_timeout(None),
+                )
+            except Exception as exc:  # noqa: BLE001 - mirrors the base adapter
+                return FileUploadResponse(
+                    path=path, error=_detailed(f"{type(exc).__name__}: {exc}")
+                )
+            if getattr(result, "exit_code", None) == 0:
+                return FileUploadResponse(path=path, error=None)
+            return FileUploadResponse(
+                path=path, error=_detailed(getattr(result, "stderr", "") or "")
+            )
+
+    def _detailed(raw: str) -> str:
+        detail = " ".join(raw.split())[:200]
+        label = str(_classify_fs_error(raw))
+        return f"{label}: {detail}" if detail else label
 
     def _rooted(command: str) -> str:
         # `|| true` keeps a missing dir from aborting the command; the dir is
@@ -125,12 +168,12 @@ async def open_sandbox_backend() -> AsyncIterator[SandboxBackendProtocol]:
             file=sys.stderr,
         )
 
-    # 2 MiB upload chunks (default 512 KiB) cut large-upload round trips 4x
-    # while the base64-inflated payload (~1.33x -> ~2.8 MB) stays under
-    # gRPC's 4 MB message cap.
-    backend = _RootedOpenShellSandbox(
-        sandbox=sandbox, max_upload_chunk_bytes=2 * 1024 * 1024
-    )
+    # Keep the adapter's 512 KiB upload chunk default. The gateway rejects any
+    # exec gRPC message over 1 MiB ("decoded message length too large"), and
+    # chunk stdin rides in that message base64-encoded (~4/3x): 512 KiB raw ->
+    # ~700 KiB message, safely under; a former 2 MiB override made every chunk
+    # (so every file over ~768 KiB) fail, misreported as permission_denied.
+    backend = _RootedOpenShellSandbox(sandbox=sandbox)
     try:
         yield backend
     finally:
