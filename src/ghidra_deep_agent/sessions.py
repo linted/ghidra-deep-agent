@@ -19,51 +19,16 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
 from pymongo import MongoClient
 from pymongo.collection import Collection
-from pymongo.errors import (
-    AutoReconnect,
-    ConnectionFailure,
-    ExecutionTimeout,
-    NetworkTimeout,
-    ServerSelectionTimeoutError,
-    WaitQueueTimeoutError,
-)
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
-# Transient MongoDB failures worth retrying — network blips, server-selection
-# timeouts, primary step-downs. Mirrors knowledge.py's classification.
-_TRANSIENT_MONGO_ERRORS = (
-    AutoReconnect,
-    ConnectionFailure,
-    NetworkTimeout,
-    ServerSelectionTimeoutError,
-    WaitQueueTimeoutError,
-    ExecutionTimeout,
-)
+from ghidra_deep_agent.mongo_util import mongo_write_with_retry
 
 _RECENCY_INDEX_NAME = "last_active_at_desc"
 _TITLE_MAX_CHARS = 80
-
-
-@retry(
-    reraise=True,
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=0.5, max=4),
-    retry=retry_if_exception_type(_TRANSIENT_MONGO_ERRORS),
-)
-def _mongo_write_with_retry[T](fn: Callable[[], T]) -> T:
-    """Run a MongoDB write, retrying transient failures with backoff."""
-    return fn()
 
 
 def _ensure_recency_index(collection: Collection[dict[str, Any]]) -> None:
@@ -110,7 +75,7 @@ class SessionStore:
                 upsert=True,
             )
 
-        _mongo_write_with_retry(_write)
+        mongo_write_with_retry(_write)
 
     def touch(self, session_id: str, first_prompt: str | None = None) -> None:
         """Update ``last_active_at``; set ``title`` from the first prompt once."""
@@ -127,7 +92,7 @@ class SessionStore:
                     {"$set": {"title": _truncate_title(first_prompt)}},
                 )
 
-        _mongo_write_with_retry(_write)
+        mongo_write_with_retry(_write)
 
     def list_sessions(
         self, binary_name: str | None = None, limit: int = 50

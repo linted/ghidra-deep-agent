@@ -1,6 +1,6 @@
 import os
+import re
 from collections import Counter
-from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -11,45 +11,9 @@ from langchain_core.tools.retriever import create_retriever_tool
 from langchain_mongodb import MongoDBAtlasVectorSearch
 from langchain_mongodb.embeddings import AutoEmbeddings
 from pymongo import MongoClient
-from pymongo.errors import (
-    AutoReconnect,
-    ConnectionFailure,
-    ExecutionTimeout,
-    NetworkTimeout,
-    PyMongoError,
-    ServerSelectionTimeoutError,
-    WaitQueueTimeoutError,
-)
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
+from pymongo.errors import PyMongoError
 
-# Transient MongoDB failures worth retrying — network blips, server-selection
-# timeouts, primary step-downs. Persistent errors (bad query, auth) fall through
-# to the caller's PyMongoError handler immediately.
-_TRANSIENT_MONGO_ERRORS = (
-    AutoReconnect,
-    ConnectionFailure,
-    NetworkTimeout,
-    ServerSelectionTimeoutError,
-    WaitQueueTimeoutError,
-    ExecutionTimeout,
-)
-
-
-@retry(
-    reraise=True,
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=0.5, max=4),
-    retry=retry_if_exception_type(_TRANSIENT_MONGO_ERRORS),
-)
-def _mongo_write_with_retry[T](fn: Callable[[], T]) -> T:
-    """Run a MongoDB write, retrying transient failures with backoff."""
-    return fn()
-
+from ghidra_deep_agent.mongo_util import mongo_write_with_retry
 
 # Caps applied when rendering the session-start summary so the result
 # stays predictable as the knowledge base grows.
@@ -57,6 +21,35 @@ SUMMARY_HYPOTHESIS_CAP = 10
 SUMMARY_FUNCTION_CAP = 40
 SUMMARY_TAG_CAP = 15
 SUMMARY_SNIPPET_CHARS = 240
+# Per-entry snippet length in the flat `list_all_knowledge` listing, which shows
+# many more rows than the summary does.
+LISTING_SNIPPET_CHARS = 100
+
+# Cap on documents any single query tool returns. Results go straight into the
+# model's context, so an uncapped `find()` grows without bound as the knowledge
+# base fills up. Callers report when the cap was hit so the model knows the
+# listing is partial.
+QUERY_RESULT_CAP = 100
+
+
+def _address_prefix_filter(address: str) -> dict[str, Any]:
+    """Case-insensitive prefix match for a model-supplied address.
+
+    The address is escaped before it becomes a pattern: unescaped, a '(' or '['
+    is a Mongo regex error surfaced to the agent as a tool failure, and '*'/'+'
+    silently match the wrong documents.
+    """
+    return {"$regex": f"^{re.escape(address)}", "$options": "i"}
+
+
+def _cap_note(docs: list[dict[str, Any]]) -> str:
+    """Suffix telling the model a listing was truncated, or '' when it wasn't."""
+    if len(docs) < QUERY_RESULT_CAP:
+        return ""
+    return (
+        f"\n\n(showing the first {QUERY_RESULT_CAP}; narrow the query — "
+        "by address, category, or tags — to see the rest)"
+    )
 
 
 def _render_knowledge_summary(docs: list[dict[str, Any]], binary_name: str) -> str:
@@ -250,7 +243,7 @@ def build_knowledge_tools(
         )
         label = function_name or address or category
         try:
-            _mongo_write_with_retry(lambda: vector_store.add_documents([doc]))
+            mongo_write_with_retry(lambda: vector_store.add_documents([doc]))
         except PyMongoError as exc:
             return (
                 f"Warning: could not save finding ({label}) — {exc}. "
@@ -290,7 +283,7 @@ def build_knowledge_tools(
             return "Nothing to update — no fields provided."
 
         try:
-            result = _mongo_write_with_retry(
+            result = mongo_write_with_retry(
                 lambda: collection.update_many(
                     {"binary_name": binary_name, "address": address},
                     {"$set": updates},
@@ -322,7 +315,7 @@ def build_knowledge_tools(
         """
         query: dict[str, Any] = {
             "binary_name": binary_name,
-            "address": {"$regex": f"^{address}", "$options": "i"},
+            "address": _address_prefix_filter(address),
         }
         if tags:
             query["tags"] = {"$in": tags}
@@ -338,7 +331,7 @@ def build_knowledge_tools(
                     "tags": 1,
                     "_id": 0,
                 },
-            )
+            ).limit(QUERY_RESULT_CAP)
         )
         if not docs:
             return f"No findings for address '{address}'."
@@ -347,7 +340,7 @@ def build_knowledge_tools(
             f"{d.get('address', '')} {d.get('function_name', '')} — {d.get('text', '')}"
             for d in docs
         ]
-        return f"{len(docs)} finding(s):\n" + "\n".join(lines)
+        return f"{len(docs)} finding(s):\n" + "\n".join(lines) + _cap_note(docs)
 
     @tool
     def query_by_category(category: str, tags: list[str] | None = None) -> str:
@@ -375,7 +368,7 @@ def build_knowledge_tools(
                     "confidence": 1,
                     "_id": 0,
                 },
-            )
+            ).limit(QUERY_RESULT_CAP)
         )
         if not docs:
             return f"No findings for category '{category}'."
@@ -384,7 +377,7 @@ def build_knowledge_tools(
             f"{d.get('confidence', '')}] {d.get('text', '')}"
             for d in docs
         ]
-        return f"{len(docs)} finding(s):\n" + "\n".join(lines)
+        return f"{len(docs)} finding(s):\n" + "\n".join(lines) + _cap_note(docs)
 
     @tool
     def get_knowledge_summary() -> str:
@@ -441,7 +434,9 @@ def build_knowledge_tools(
                     "saved_at": 1,
                     "_id": 0,
                 },
-            ).sort("category", 1)
+            )
+            .sort("category", 1)
+            .limit(QUERY_RESULT_CAP)
         )
         if not docs:
             return f"Knowledge base is empty for '{binary_name}'."
@@ -457,9 +452,13 @@ def build_knowledge_tools(
                 ],
             )
             label = " | ".join(parts)
-            snippet = d.get("text", "")[:100]
+            snippet = d.get("text", "")[:LISTING_SNIPPET_CHARS]
             lines.append(f"[{label}]  {snippet}")
-        return f"{len(docs)} total findings for '{binary_name}':\n" + "\n".join(lines)
+        return (
+            f"{len(docs)} total findings for '{binary_name}':\n"
+            + "\n".join(lines)
+            + _cap_note(docs)
+        )
 
     @tool
     def query_by_tags(tags: list[str]) -> str:
@@ -484,7 +483,9 @@ def build_knowledge_tools(
                     "tags": 1,
                     "_id": 0,
                 },
-            ).sort("category", 1)
+            )
+            .sort("category", 1)
+            .limit(QUERY_RESULT_CAP)
         )
         if not docs:
             return f"No findings tagged with {tags}."
@@ -494,7 +495,11 @@ def build_knowledge_tools(
             f"[{', '.join(d.get('tags', []))}] — {d.get('text', '')}"
             for d in docs
         ]
-        return f"{len(docs)} finding(s) for tags {tags}:\n" + "\n".join(lines)
+        return (
+            f"{len(docs)} finding(s) for tags {tags}:\n"
+            + "\n".join(lines)
+            + _cap_note(docs)
+        )
 
     @tool
     def list_analyzed_binaries() -> str:
@@ -503,14 +508,21 @@ def build_knowledge_tools(
         Use this to see what other binaries have been analyzed and whether
         cross-binary queries might surface relevant findings.
         """
-        names = collection.distinct("binary_name")
-        if not names:
+        # One grouped count rather than a `distinct` plus a `count_documents`
+        # per binary, which scaled with the number of binaries analyzed.
+        counts = collection.aggregate(
+            [
+                {"$group": {"_id": "$binary_name", "count": {"$sum": 1}}},
+                {"$sort": {"_id": 1}},
+            ]
+        )
+        lines = [
+            f"  {row['_id']}: {row['count']} finding(s)"
+            f"{' ← current' if row['_id'] == binary_name else ''}"
+            for row in counts
+        ]
+        if not lines:
             return "Knowledge base is empty."
-        lines = []
-        for name in sorted(names):
-            count = collection.count_documents({"binary_name": name})
-            marker = " ← current" if name == binary_name else ""
-            lines.append(f"  {name}: {count} finding(s){marker}")
         return "Analyzed binaries:\n" + "\n".join(lines)
 
     retriever = vector_store.as_retriever(
