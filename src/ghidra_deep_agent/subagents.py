@@ -68,6 +68,7 @@ PLAN_MODE_BLOCKED_TOOLS = frozenset(
         "export_program",
         "scripts",
         "recover_prototypes",  # local tool: commits recovered prototypes (mutates)
+        "apply_switch_override",  # local tool: writes jump-table overrides (mutates)
         "project_files",  # has a `delete` action
         "analysis_options",
         "analysis_control",

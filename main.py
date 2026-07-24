@@ -47,6 +47,7 @@ from ghidra_deep_agent.subagents import (
     make_model_resolver,
     resolve_model_spec,
 )
+from ghidra_deep_agent.switch_tools import build_switch_tools
 from ghidra_deep_agent.tui import GhidraAgentApp
 from ghidra_deep_agent.validation import create_argument_validation_middleware
 
@@ -162,10 +163,18 @@ async def main() -> None:
     # server's `scripts` tool is disabled.
     prototype_tools = build_prototype_tools(tools)
 
+    # Local jump-table tools: `find_unrecovered_switches` (read-only detection)
+    # and `apply_switch_override` (writes the decompiler jump-table override).
+    # Both drive Ghidra-side scripts through the MCP `scripts` executor; omitted
+    # (with a warning) when the server's `scripts` tool is disabled.
+    switch_tools = build_switch_tools(tools)
+
     # Resolve per-agent models and tool sets from the config. The coordinator
     # gets a restricted, high-level tool set; sub-agents are built from the full
     # tool list so their allowlists are unaffected by that restriction.
-    all_tools = filter_withheld_tools(knowledge_tools + prototype_tools + tools)
+    all_tools = filter_withheld_tools(
+        knowledge_tools + prototype_tools + switch_tools + tools
+    )
     built_model = resolve_model(agent_config.main_model)
     main_model_spec = resolve_model_spec(agent_config.main_model, agent_config)
     main_tools = build_main_tools(all_tools, agent_config)
