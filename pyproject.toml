@@ -52,9 +52,11 @@ exclude = ["agent_output*"]
 select = ["E", "F", "I", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
-# This module is almost entirely an embedded Java GhidraScript held as a string;
-# its lines follow Java conventions, not Python's 88-col limit.
+# These modules are almost entirely an embedded Java GhidraScript held as a
+# string; their lines follow Java conventions, not Python's 88-col limit.
 "src/ghidra_deep_agent/recover_prototypes_script.py" = ["E501"]
+"src/ghidra_deep_agent/find_unrecovered_switches_script.py" = ["E501"]
+"src/ghidra_deep_agent/apply_switch_override_script.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"

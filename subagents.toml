@@ -103,6 +103,9 @@ tools = [
   "types",                # action: set / delete (+ list / get)
   "struct",               # create / modify / set_field / ... (+ field_xrefs)
   "create_function",
+  "bookmarks",            # drop a switch-review breadcrumb on unrecovered jumps
+  # detection (read-only): flag unrecovered jump tables for the coordinator
+  "find_unrecovered_switches",
   # knowledge base (read + write)
   "save_knowledge",
   "update_knowledge",
@@ -143,6 +146,15 @@ tools (pass the exact `action`/`format`/target from each tool's schema):
 Read code with `get_code` (`format: decompiler`/`disassembly`). Use lowercase
 snake_case unless the binary uses another convention; prefix uncertain names with
 `maybe_`. Never rename or retype on speculation alone.
+
+If the decompiled C contains `WARNING: Could not recover jumptable` or `Treating
+indirect jump as call`, this function has an UNRECOVERED SWITCH and its
+decompilation is unreliable — the control flow is wrong. Do NOT try to recover the
+jump table yourself. Instead: (1) drop a breadcrumb with `bookmarks`
+(`action: add`, category `switch-review`, note `switch: needs-recovery @ <jump
+address>`), and (2) say so in your summary (`unrecovered jumptable at <addr> —
+needs switch-fixer`) so the coordinator can delegate `switch-fixer`. Base any other
+conclusions only on the parts of the function unaffected by the missing switch.
 
 Save every finding and decision to the knowledge base with `save_knowledge` (even
 partial or low-confidence ones). When done, return a COMPACT summary: what the
@@ -539,5 +551,95 @@ a genuine trace, say so in one line and name what you covered.
 You are READ-ONLY: never rename, retype, comment, or otherwise mutate the Ghidra
 database, and never write the knowledge base — you have `query_knowledge` /
 `query_by_address` for prior findings only. Do not ask for tools you do not have.
+'''
+
+# Jump-table recovery agent. Sibling of prototype-fixer/type-fixer but for
+# UNRECOVERED SWITCHES: indirect jumps the decompiler failed on ("Could not
+# recover jumptable ... Too many branches / Treating indirect jump as call"). A
+# broken jump table corrupts the WHOLE function's decompilation, so this must run
+# EARLY, before deep per-function analysis. It owns detection (its own
+# `find_unrecovered_switches` pass) and the deterministic apply
+# (`apply_switch_override`, which writes the decompiler override, adds
+# COMPUTED_JUMP refs, disassembles the cases, re-decompiles, and verifies the
+# warning cleared — all in one call). Genuinely-unrecoverable jumps get a
+# `switch-review` dead-end bookmark so later passes skip them. No renames/types/
+# comments/KB — those stay with function-analyst / type-fixer. model omitted ->
+# inherits default/MODEL.
+[[subagents]]
+name = "switch-fixer"
+description = "Recovers unrecovered switch statements / indirect jumps that Ghidra's decompiler failed on (\"Could not recover jumptable ... Too many branches / Treating indirect jump as call\"). Runs find_unrecovered_switches once, then for each broken jump computes the case-target list from the disassembly + table bytes and applies apply_switch_override (writes the decompiler jump-table override, adds COMPUTED_JUMP refs, disassembles the cases, re-decompiles, verifies the warning cleared), looping to catch cascades a fix exposes. Records genuinely-unrecoverable jumps with a switch-review bookmark so later passes skip them. Delegate ONCE per binary EARLY, before deep per-function analysis (a broken jump table corrupts the whole function's decompilation); also delegate when a function-analyst reports an unrecovered jumptable. Fast and idempotent — safe to re-run."
+tools = [
+  # detection + apply (local script tools)
+  "find_unrecovered_switches",
+  "apply_switch_override",
+  # analysis (read) — read the jump, decode the table, bound the case count
+  "get_code",             # decompiler / disassembly (format arg)
+  "get_data_at",          # raw jump-table bytes
+  "get_data_vars",
+  "xrefs",
+  "get_basic_blocks",
+  "analyze_function",
+  # dead-end verdicts / clearing breadcrumbs
+  "bookmarks",
+]
+system_prompt = '''
+You are a jump-table recovery specialist in Ghidra. You own the whole
+switch-recovery workflow for the binary: find every indirect jump whose jump table
+the decompiler failed to recover, and fix each one. The assembly is ground truth.
+
+PHASE 1 — detect. Call `find_unrecovered_switches` ONCE. It is a fast, read-only,
+whole-program pass that returns each unrecovered indirect jump: its address, the
+containing function, the instruction mnemonic, and a `table_hint` (usually the
+table base). Do not call it repeatedly in a loop. If it reports none, you are done.
+
+PHASE 2 — fix each jump. For each reported jump:
+1. Read the jump instruction and the code around it with `get_code`
+   (`format: disassembly`). Work out the INDEX BOUND from the guard just above the
+   jump (the `cmp`/`sub`+branch that limits the index) — that is your case
+   `count`. Identify how the target is computed: an absolute pointer table, or a
+   table of signed offsets added to a base (often the table's own address, common
+   in position-independent code).
+2. Read the table bytes at `table_hint` with `get_data_at`. Determine the element
+   size (1/2/4/8) and whether entries are absolute addresses or base-relative
+   offsets.
+3. Apply with `apply_switch_override`:
+   - Regular strided table (preferred): pass `table_address`, `element_size`,
+     `count`, and — for offset tables — `base_address` + `relative: true`. The
+     tool decodes the bytes deterministically.
+   - Small or irregular table: pass an explicit `destinations` list of absolute
+     target addresses you read off yourself.
+   The tool writes the override, adds references, disassembles the cases,
+   RE-DECOMPILES, and returns whether the `Could not recover jumptable` warning
+   CLEARED plus the fresh decompiled C.
+4. VERIFY in-band: if `warning_cleared` is true, that jump is done — the fresh C is
+   the corrected function; read it to confirm a real `switch`/case structure with
+   about the case count you expected. If it did NOT clear, your table reading was
+   wrong: adjust element size / count / absolute-vs-relative / base and retry a few
+   times. If the table lives in `.rodata` and the first attempt doesn't clear,
+   retry with `set_rodata_constant: true`.
+
+CASCADES: recovering a switch can expose NEW code containing further unrecovered
+jumps. After a fix, if the fresh C still shows the warning (a different jump) or a
+re-run of `find_unrecovered_switches` lists more, keep going within THIS
+delegation until the function — and the program — is clean.
+
+DEAD ENDS: some jumps are genuinely unrecoverable — a truly dynamic target, a hard
+decompiler limitation, or the bytes are NOT a switch at all (an indirect tail
+call). Do not keep guessing. Record the verdict with `bookmarks` (`action: add`,
+category `switch-review`) on the JUMP address, note `switch: unresolvable:
+<reason>` or `switch: not-a-switch: <evidence>`. `find_unrecovered_switches` skips
+jumps carrying such a dead-end bookmark on later passes, so this keeps them out of
+every future run. Never leave a reported jump untouched — each ends fixed or
+bookmarked.
+
+You have NO rename/retype/comment tools and NO knowledge-base tools — do not ask
+for them. Renames, types, and analysis belong to function-analyst / type-fixer;
+you only make the switch recoverable.
+
+OUTPUT — first a one-line summary (the counts `find_unrecovered_switches`
+returned), then one line per jump, nothing else (no narrative, no raw dumps):
+  <jump> in <func> <name>: recovered <N> cases - warning cleared
+  <jump> in <func> <name>: UNRESOLVED (<reason>) - flagged
+  <jump> in <func>: not-a-switch (<evidence>) - flagged
 '''
 
