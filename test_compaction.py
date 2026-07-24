@@ -1,9 +1,8 @@
 """
 Unit tests for scope-aware auto-summarization tuning: the monkeypatched
-deepagents factory must hand sub-agents the aggressive built-in thresholds
-(trigger 50k tokens / keep 10k tokens), leave the main agent on deepagents'
-stock defaults, honor the per-scope ``COMPACT_*`` / ``COMPACT_MAIN_*`` env
-knobs, and route summaries to ``summary_model`` when one is given.
+deepagents factory must leave both scopes on deepagents' stock defaults when
+no env knobs are set, honor the per-scope ``COMPACT_*`` / ``COMPACT_MAIN_*``
+env knobs, and route summaries to ``summary_model`` when one is given.
 
 Run:  uv run pytest test_compaction.py -v
 """
@@ -59,11 +58,12 @@ def test_patch_applied_and_idempotent() -> None:
     assert getattr(graph, "create_summarization_middleware") is patched
 
 
-def test_subagent_gets_builtin_defaults() -> None:
+def test_subagent_gets_stock_defaults() -> None:
     install_tuned_summarization(main_model=_model())
     mw = _build(_model())
-    assert mw._lc_helper.trigger == ("tokens", 50000)
-    assert mw._lc_helper.keep == ("tokens", 10000)
+    # deepagents' no-profile fallbacks — no forced thresholds without env knobs.
+    assert mw._lc_helper.trigger == ("tokens", 170000)
+    assert mw._lc_helper.keep == ("messages", 6)
 
 
 def test_main_model_gets_stock_defaults() -> None:
@@ -75,18 +75,24 @@ def test_main_model_gets_stock_defaults() -> None:
     assert mw._lc_helper.keep == ("messages", 6)
 
 
-def test_main_matched_by_name_from_spec_string() -> None:
+def test_main_matched_by_name_from_spec_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COMPACT_TRIGGER_TOKENS", "30000")
     install_tuned_summarization(main_model="openrouter:acme/big-model")
     mw = _build(_model("acme/big-model"))
     assert mw._lc_helper.trigger == ("tokens", 170000)
     mw = _build(_model("acme/other-model"))
-    assert mw._lc_helper.trigger == ("tokens", 50000)
+    assert mw._lc_helper.trigger == ("tokens", 30000)
 
 
-def test_no_main_model_treats_everything_as_subagent() -> None:
+def test_no_main_model_treats_everything_as_subagent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COMPACT_TRIGGER_TOKENS", "30000")
     install_tuned_summarization()
     mw = _build(_model())
-    assert mw._lc_helper.trigger == ("tokens", 50000)
+    assert mw._lc_helper.trigger == ("tokens", 30000)
 
 
 def test_env_overrides_land_in_their_scope(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -97,7 +103,7 @@ def test_env_overrides_land_in_their_scope(monkeypatch: pytest.MonkeyPatch) -> N
     install_tuned_summarization(main_model=main)
     sub_mw = _build(_model())
     assert sub_mw._lc_helper.trigger == ("tokens", 30000)
-    assert sub_mw._lc_helper.keep == ("tokens", 10000)
+    assert sub_mw._lc_helper.keep == ("messages", 6)
     main_mw = _build(main)
     assert main_mw._lc_helper.trigger == ("tokens", 100000)
     assert main_mw._lc_helper.keep == ("messages", 12)
@@ -117,7 +123,7 @@ def test_fraction_without_profile_warns_and_falls_back(
     monkeypatch.setenv("COMPACT_TRIGGER_FRACTION", "0.5")
     install_tuned_summarization()
     mw = _build(_model())
-    assert mw._lc_helper.trigger == ("tokens", 50000)
+    assert mw._lc_helper.trigger == ("tokens", 170000)
     assert "COMPACT_TRIGGER_FRACTION ignored" in capsys.readouterr().err
 
 
