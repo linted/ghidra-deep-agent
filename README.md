@@ -77,6 +77,7 @@ All configuration is done via environment variables (`.env` file or shell export
 | `AGENT_OUTPUT_DIR` | *(unset)* | Optional directory the agent can read/write files in |
 | `SANDBOX` | *(unset)* | Set to `openshell` to run the agent's shell in a sandbox — see [Sandboxed shell](#sandboxed-shell-openshell) |
 | `SANDBOX_SYNC_MAX_BYTES` | `52428800` | Per-file size cap (bytes) for sandbox file sync; larger files are skipped |
+| `SANDBOX_SYNC_TAR_MIN_FILES` | `4` | Pending-file count at which the seed switches to a single-tarball bulk upload |
 | `RECURSION_LIMIT` | `100` | LangGraph recursion limit for deep analysis sessions |
 | `AGENTS_MD` | *(unset)* | Optional path to an `AGENTS.md` memory file |
 | `LANGSMITH_API_KEY` | *(unset)* | *(optional)* LangSmith API key to enable run tracing |
@@ -214,7 +215,9 @@ SANDBOX=openshell
   automatically, and the system prompt tells the agent to keep durable files there.
   Files written to absolute paths elsewhere (e.g. `/tmp`) are still lost on teardown
   (see `TODO.md` for an optional hard filesystem-policy lock). Per-file transfers are
-  capped by `SANDBOX_SYNC_MAX_BYTES`.
+  capped by `SANDBOX_SYNC_MAX_BYTES`; when `SANDBOX_SYNC_TAR_MIN_FILES` or more files
+  need uploading (e.g. the first seed of a large output dir), they are bundled into a
+  single tarball and extracted with one command instead of uploaded one by one.
 - **Fail-fast:** if the sandbox can't be created (gateway unreachable, CLI not
   authenticated), startup exits with an error rather than silently running unsandboxed.
 - **Note:** the Ghidra MCP connection is unaffected — it runs from the host, not the

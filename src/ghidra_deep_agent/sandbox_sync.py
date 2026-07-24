@@ -17,8 +17,10 @@ never kill the turn.
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import shlex
+import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,12 @@ from ghidra_deep_agent.toasts import notify_toast
 
 _DEFAULT_MAX_BYTES = 50 * 1024 * 1024
 _MAX_BYTES_ENV = "SANDBOX_SYNC_MAX_BYTES"
+
+_DEFAULT_TAR_MIN_FILES = 4
+_TAR_MIN_FILES_ENV = "SANDBOX_SYNC_TAR_MIN_FILES"
+
+# Outside the sync root so the sync-back ``find`` can never pick it up.
+_SEED_TAR_REMOTE = "/tmp/.ghidra_seed.tar.gz"
 
 
 def _default_max_bytes() -> int:
@@ -45,6 +53,18 @@ def _default_max_bytes() -> int:
     return value if value > 0 else _DEFAULT_MAX_BYTES
 
 
+def _default_tar_min_files() -> int:
+    """Bulk-seed threshold from ``SANDBOX_SYNC_TAR_MIN_FILES`` (file count)."""
+    raw = os.environ.get(_TAR_MIN_FILES_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_TAR_MIN_FILES
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_TAR_MIN_FILES
+    return value if value > 0 else _DEFAULT_TAR_MIN_FILES
+
+
 class SandboxSyncMiddleware(AgentMiddleware):
     """Keep ``local_dir`` and a sandbox directory in sync across turns."""
 
@@ -55,6 +75,7 @@ class SandboxSyncMiddleware(AgentMiddleware):
         *,
         remote_root: str = SANDBOX_WORKDIR,
         max_bytes: int | None = None,
+        tar_min_files: int | None = None,
     ) -> None:
         super().__init__()
         self._backend = backend
@@ -64,12 +85,17 @@ class SandboxSyncMiddleware(AgentMiddleware):
         # thousands of unrelated files into the local mirror.
         self._remote_root = remote_root.rstrip("/") or "/"
         self._max_bytes = max_bytes if max_bytes is not None else _default_max_bytes()
+        self._tar_min_files = (
+            tar_min_files if tar_min_files is not None else _default_tar_min_files()
+        )
         # relpath -> sha256 hex of the last content synced in either direction.
         self._manifest: dict[str, str] = {}
         # relpaths already warned about for exceeding the size cap (warn once).
         self._warned_oversize: set[str] = set()
         # Whether the remote root has been created this session (created lazily).
         self._root_ready = False
+        # Whether we already warned that bulk seeding fell back to per-file.
+        self._warned_tar_fallback = False
 
     async def abefore_agent(
         self, state: AgentState, runtime: Runtime[Any]
@@ -150,12 +176,73 @@ class SandboxSyncMiddleware(AgentMiddleware):
         if not uploads:
             return
         await self._ensure_root()
+        if len(uploads) >= self._tar_min_files and await self._seed_via_tar(
+            uploads, pending
+        ):
+            return
         for resp in await self._backend.aupload_files(uploads):
             meta = pending.get(resp.path)
             if meta is None or resp.error is not None:
                 continue  # leave out of the manifest so it retries next turn
             rel, digest = meta
             self._manifest[rel] = digest
+
+    async def _seed_via_tar(
+        self,
+        uploads: list[tuple[str, bytes]],
+        pending: dict[str, tuple[str, str]],
+    ) -> bool:
+        """Upload all pending files as one gzipped tarball and extract it.
+
+        Many small files cost one exec round-trip each when uploaded
+        individually; a single tarball turns that into one upload plus one
+        extract. Returns True when every pending file landed (manifest
+        updated); False to make the caller fall back to per-file uploads —
+        e.g. when the sandbox image lacks ``tar``.
+        """
+        buf = io.BytesIO()
+        # compresslevel=1: the payload is uploaded base64-encoded, so light
+        # compression already pays for itself; level 9 would just burn CPU.
+        with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=1) as tar:
+            for remote, data in uploads:
+                rel, _digest = pending[remote]
+                info = tarfile.TarInfo(name=rel)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        try:
+            responses = await self._backend.aupload_files(
+                [(_SEED_TAR_REMOTE, buf.getvalue())]
+            )
+            if not responses or responses[0].error is not None:
+                error = responses[0].error if responses else "no response"
+                self._warn_tar_fallback(f"tarball upload failed: {error}")
+                return False
+            result = await self._backend.aexecute(
+                f"tar -xzf {shlex.quote(_SEED_TAR_REMOTE)} "
+                f"-C {shlex.quote(self._remote_root)} "
+                f"&& rm -f {shlex.quote(_SEED_TAR_REMOTE)}"
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back to per-file uploads
+            self._warn_tar_fallback(str(exc))
+            return False
+        if result.exit_code not in (0, None):
+            self._warn_tar_fallback(
+                f"extract exited {result.exit_code}: {result.output.strip()[:200]}"
+            )
+            return False
+        for rel, digest in pending.values():
+            self._manifest[rel] = digest
+        return True
+
+    def _warn_tar_fallback(self, detail: str) -> None:
+        if self._warned_tar_fallback:
+            return
+        self._warned_tar_fallback = True
+        notify_toast(
+            f"Sandbox bulk seed unavailable ({detail}); using per-file uploads",
+            severity="warning",
+            title="Sandbox",
+        )
 
     async def _sync_back(self) -> None:
         """Download files changed inside the sandbox back to the local dir."""
