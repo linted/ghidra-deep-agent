@@ -20,7 +20,6 @@ the model gets an explicit "did not complete" message rather than a dangling
 """
 
 import asyncio
-import os
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -32,6 +31,8 @@ from langchain_core.callbacks import adispatch_custom_event, dispatch_custom_eve
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.types import Command
+
+from ghidra_deep_agent.defaults import env_float
 
 # The submission stubs are very specific; require a marker phrase plus an id to
 # avoid ever mistaking real tool output (decompilation, disassembly) for a stub.
@@ -278,10 +279,12 @@ def build_async_task_middleware(
     status_tool = next((t for t in tools if t.name == "get_task_status"), None)
     if status_tool is None:
         return None
-    timeout_s = float(os.environ.get("GHIDRA_ASYNC_TIMEOUT", "180"))
-    initial_s = float(os.environ.get("GHIDRA_ASYNC_POLL_INTERVAL", "0.25"))
-    factor = float(os.environ.get("GHIDRA_ASYNC_POLL_FACTOR", "1.6"))
-    max_s = float(os.environ.get("GHIDRA_ASYNC_POLL_MAX", "2.0"))
+    timeout_s = env_float("GHIDRA_ASYNC_TIMEOUT", 180.0)
+    initial_s = env_float("GHIDRA_ASYNC_POLL_INTERVAL", 0.25)
+    # A factor <= 1 would never back off (and < 1 would poll ever faster),
+    # so the floor is 1.0 rather than merely "positive".
+    factor = max(1.0, env_float("GHIDRA_ASYNC_POLL_FACTOR", 1.6))
+    max_s = env_float("GHIDRA_ASYNC_POLL_MAX", 2.0)
     return AsyncTaskMiddleware(
         status_tool,
         timeout_s=timeout_s,

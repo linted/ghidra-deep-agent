@@ -27,6 +27,7 @@ from langchain.agents.middleware import (
 )
 from langchain_core.language_models import BaseChatModel
 
+from ghidra_deep_agent.defaults import env_int
 from ghidra_deep_agent.toasts import notify_toast
 
 ModelResolver = Callable[[str | None], str | BaseChatModel]
@@ -54,7 +55,7 @@ class UsageLimitError(Exception):
 # deepagents filesystem built-ins whose failures are transient I/O (and whose
 # retries are safe — idempotent reads/writes of agent artifacts). We do NOT
 # retry Ghidra MCP tools here: their transport already surfaces server errors as
-# structured messages (see ``handle_mcp_errors`` in main.py), and many are not
+# structured messages (see ``handle_mcp_errors`` in cli.py), and many are not
 # idempotent.
 _RETRYABLE_FS_TOOLS = ("write_file", "edit_file", "read_file")
 
@@ -193,7 +194,7 @@ def build_model_resilience_middleware(
     itself retried). Returns an empty-fallback list when ``MODEL_FALLBACK`` is
     unset.
     """
-    max_retries = int(os.environ.get("MODEL_MAX_RETRIES", "3"))
+    max_retries = env_int("MODEL_MAX_RETRIES", 3)
     middleware: list[AgentMiddleware] = []
 
     fallbacks = _fallback_specs()
@@ -213,7 +214,7 @@ def build_model_resilience_middleware(
 
 def build_tool_retry_middleware() -> ToolRetryMiddleware:
     """Retry transient filesystem-tool I/O errors, scoped to idempotent tools."""
-    max_retries = int(os.environ.get("TOOL_MAX_RETRIES", "3"))
+    max_retries = env_int("TOOL_MAX_RETRIES", 3)
     return ToolRetryMiddleware(
         max_retries=max_retries,
         tools=list(_RETRYABLE_FS_TOOLS),

@@ -171,7 +171,7 @@ class ArgumentValidationMiddleware(AgentMiddleware):
 def create_argument_validation_middleware(
     write_actions: Mapping[str, frozenset[str]] | None = None,
 ) -> ArgumentValidationMiddleware:
-    """Build the argument-validation middleware (factory for ``main.py``).
+    """Build the argument-validation middleware (factory for ``cli.py``).
 
     Pass ``write_actions`` (tool name -> mutating ``action`` values) to also
     reject write actions on consolidated read/write tools — used to keep the

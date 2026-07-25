@@ -29,6 +29,11 @@ from ghidra_deep_agent.compaction import (
     create_forced_summarization_tool_middleware,
     install_tuned_summarization,
 )
+from ghidra_deep_agent.defaults import (
+    DEFAULT_MAX_CONTEXT_TOKENS,
+    DEFAULT_RECURSION_LIMIT,
+    env_int,
+)
 from ghidra_deep_agent.ghidra_transport import get_mcp_config
 from ghidra_deep_agent.knowledge import build_knowledge_tools
 from ghidra_deep_agent.mcp_cache import build_mcp_cache_middleware
@@ -353,7 +358,7 @@ async def main() -> None:
             f"{resolve_model_spec(sub_cfg.model, agent_config)}"
         )
 
-    recursion_limit = int(os.environ.get("RECURSION_LIMIT", "10000"))
+    recursion_limit = env_int("RECURSION_LIMIT", DEFAULT_RECURSION_LIMIT)
     # Name each top-level graph so LangSmith traces show the app instead of the
     # langgraph library default ("LangGraph").
     app_name = os.environ.get("APP_NAME", "ghidra-deep-agent")
@@ -375,12 +380,13 @@ async def main() -> None:
             # smaller/cheaper model; unset keeps the prior behavior of summarizing
             # with the main model.
             summary_spec = os.environ.get("SUMMARY_MODEL")
+            # None when unset, which `install_tuned_summarization` reads as "use
+            # the agent's own model".
+            summary_override = resolve_model(summary_spec) if summary_spec else None
             # Resolved eagerly: the TUI calls `.ainvoke` on this to summarize prior
             # context when entering plan/ask mode, and `build_model` hands back a
             # bare string for any provider it doesn't special-case.
-            summary_model = ensure_chat_model(
-                resolve_model(summary_spec) if summary_spec else built_model
-            )
+            summary_model = ensure_chat_model(summary_override or built_model)
 
             # Tune the auto-summarizer create_deep_agent wires internally.
             # Sub-agents compact aggressively by default (they never reached
@@ -388,10 +394,7 @@ async def main() -> None:
             # by its model — keeps stock thresholds. COMPACT_* / COMPACT_MAIN_*
             # env knobs override either scope, and SUMMARY_MODEL routes the
             # auto summary too, not just /compact.
-            install_tuned_summarization(
-                resolve_model(summary_spec) if summary_spec else None,
-                main_model=built_model,
-            )
+            install_tuned_summarization(summary_override, main_model=built_model)
 
             # Shared by both graphs (normal + plan mode). Built once so the two
             # agents carry identical middleware behavior.
@@ -462,8 +465,8 @@ async def main() -> None:
             # providers it doesn't special-case, and a string has no `.profile`,
             # which silently pinned the gauge to the fallback for those models.
             profile = getattr(ensure_chat_model(built_model), "profile", None) or {}
-            ctx_max = profile.get("max_input_tokens") or int(
-                os.environ.get("MAX_CONTEXT_TOKENS", "200000")
+            ctx_max = profile.get("max_input_tokens") or env_int(
+                "MAX_CONTEXT_TOKENS", DEFAULT_MAX_CONTEXT_TOKENS
             )
 
             app = GhidraAgentApp(

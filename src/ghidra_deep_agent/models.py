@@ -9,6 +9,8 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_deepseek import ChatDeepSeek
 
+from ghidra_deep_agent.defaults import config_path
+
 
 class _ChatDeepSeekFixed(ChatDeepSeek):
     """ChatDeepSeek that round-trips reasoning_content back to the API.
@@ -90,11 +92,7 @@ _openrouter_presets_cache: dict[str, dict[str, Any]] | None = None
 
 def _openrouter_config_path() -> Path:
     """Resolve presets path: ``OPENROUTER_CONFIG`` env, else repo-root TOML."""
-    env = os.environ.get("OPENROUTER_CONFIG")
-    if env:
-        return Path(env).expanduser()
-    # models.py -> ghidra_deep_agent -> src -> <repo root>
-    return Path(__file__).resolve().parents[2] / _OPENROUTER_CONFIG_FILENAME
+    return config_path("OPENROUTER_CONFIG", _OPENROUTER_CONFIG_FILENAME)
 
 
 def _load_openrouter_presets() -> dict[str, dict[str, Any]]:

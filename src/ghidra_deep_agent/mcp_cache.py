@@ -53,6 +53,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 from pymongo.collection import Collection
 
+from ghidra_deep_agent.defaults import env_int
 from ghidra_deep_agent.mongo_util import get_mongo_client
 
 # Read tools whose output is invariant for a program regardless of any renames /
@@ -334,7 +335,7 @@ def build_mcp_cache_middleware(
     if not cached_tools and not mutable_tools:
         return None
 
-    ttl_seconds = int(os.environ.get("MONGODB_TOOL_CACHE_TTL", "86400"))
+    ttl_seconds = env_int("MONGODB_TOOL_CACHE_TTL", 86400)
     coll_name = os.environ.get("MONGODB_TOOL_CACHE_COLLECTION", "tool_cache")
     debug = bool(os.environ.get("MONGODB_TOOL_CACHE_DEBUG"))
 

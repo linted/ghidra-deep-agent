@@ -132,6 +132,10 @@ def _format_find_summary(payload: dict[str, Any]) -> str:
                     error=f.get("error", "?"),
                 )
             )
+        # The script caps this list and flags when it did; without the flag the
+        # listing silently under-reports on a binary with many failures.
+        if payload.get("failed_truncated"):
+            lines.append("  (list truncated; decompile_failed above is the true total)")
     return "\n".join(lines)
 
 

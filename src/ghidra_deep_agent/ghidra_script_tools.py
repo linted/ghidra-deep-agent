@@ -13,7 +13,6 @@ and the calling module returns no tools at all.
 """
 
 import json
-import os
 import re
 import sys
 from typing import Any
@@ -21,10 +20,15 @@ from typing import Any
 from langchain_core.tools import BaseTool
 
 from ghidra_deep_agent.async_tasks import resolve_async_result, to_text
+from ghidra_deep_agent.defaults import env_float
+
 
 # A whole-program decompile pass can run for minutes; poll well past the default
 # async timeout. One knob covers every script-driving tool.
-SCRIPT_TIMEOUT_S = float(os.environ.get("GHIDRA_RECOVER_TIMEOUT", "1800"))
+def script_timeout_s() -> float:
+    """Read the script poll timeout at call time, not import time."""
+    return env_float("GHIDRA_RECOVER_TIMEOUT", 1800.0)
+
 
 # How much raw script output to echo back when no manifest could be found.
 _RAW_TAIL_CHARS = 800
@@ -78,11 +82,11 @@ class GhidraScriptRunner:
         scripts_tool: BaseTool,
         status_tool: BaseTool | None,
         *,
-        timeout_s: float = SCRIPT_TIMEOUT_S,
+        timeout_s: float | None = None,
     ) -> None:
         self._scripts_tool = scripts_tool
         self._status_tool = status_tool
-        self._timeout_s = timeout_s
+        self._timeout_s = script_timeout_s() if timeout_s is None else timeout_s
         # Resolved output of the most recent deploy. Ghidra compiles the whole
         # script directory as one OSGi bundle, so a javac error surfaces here —
         # and only here. Kept so the no-manifest path can show it instead of the
