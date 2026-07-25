@@ -29,6 +29,10 @@ from ghidra_deep_agent.compaction import (
     create_forced_summarization_tool_middleware,
     install_tuned_summarization,
 )
+from ghidra_deep_agent.defaults import (
+    DEFAULT_MAX_CONTEXT_TOKENS,
+    DEFAULT_RECURSION_LIMIT,
+)
 from ghidra_deep_agent.ghidra_transport import get_mcp_config
 from ghidra_deep_agent.knowledge import build_knowledge_tools
 from ghidra_deep_agent.mcp_cache import build_mcp_cache_middleware
@@ -343,7 +347,9 @@ async def main() -> None:
             f"{resolve_model_spec(sub_cfg.model, agent_config)}"
         )
 
-    recursion_limit = int(os.environ.get("RECURSION_LIMIT", "10000"))
+    recursion_limit = int(
+        os.environ.get("RECURSION_LIMIT", str(DEFAULT_RECURSION_LIMIT))
+    )
     # Name each top-level graph so LangSmith traces show the app instead of the
     # langgraph library default ("LangGraph").
     app_name = os.environ.get("APP_NAME", "ghidra-deep-agent")
@@ -445,7 +451,7 @@ async def main() -> None:
 
             profile = getattr(built_model, "profile", None) or {}
             ctx_max = profile.get("max_input_tokens") or int(
-                os.environ.get("MAX_CONTEXT_TOKENS", "200000")
+                os.environ.get("MAX_CONTEXT_TOKENS", str(DEFAULT_MAX_CONTEXT_TOKENS))
             )
 
             app = GhidraAgentApp(
