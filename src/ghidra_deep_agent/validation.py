@@ -63,6 +63,25 @@ class ArgumentValidationMiddleware(AgentMiddleware):
         # Tool name -> set of `action` values that mutate state. Populated only
         # for read-only contexts; empty means "allow everything the schema does".
         self._write_actions = dict(write_actions or {})
+        # Tool name -> its compiled validator, or None when the schema itself is
+        # malformed. Cached because building one meta-schema-validates the
+        # schema (`check_schema`), and a tool's args_schema never changes — so
+        # every call after the first was paying for the same result.
+        self._validators: dict[str, Any | None] = {}
+
+    def _validator_for(self, tool_name: str, schema: dict[str, Any]) -> Any | None:
+        """Compiled validator for a tool's schema; ``None`` if it is malformed."""
+        if tool_name in self._validators:
+            return self._validators[tool_name]
+        validator: Any | None
+        try:
+            validator_cls = jsonschema.validators.validator_for(schema)
+            validator_cls.check_schema(schema)
+            validator = validator_cls(schema)
+        except jsonschema.exceptions.SchemaError:
+            validator = None
+        self._validators[tool_name] = validator
+        return validator
 
     def _check(self, request: ToolCallRequest) -> ToolMessage | None:
         """Return a structured error ToolMessage if the call should be rejected.
@@ -82,16 +101,16 @@ class ArgumentValidationMiddleware(AgentMiddleware):
         if not isinstance(schema, dict) or not isinstance(args, dict):
             return None
 
-        try:
-            validator_cls = jsonschema.validators.validator_for(schema)
-            validator_cls.check_schema(schema)
-            validator = validator_cls(schema)
-            errors = sorted(
+        validator = self._validator_for(tool.name, schema)
+        # A malformed schema is never grounds to block — let the server decide.
+        # The read-only write-action check below still applies.
+        errors = (
+            []
+            if validator is None
+            else sorted(
                 validator.iter_errors(args), key=lambda e: list(e.absolute_path)
             )
-        except jsonschema.exceptions.SchemaError:
-            # Schema handling failed — never block on that; let the server decide.
-            errors = []
+        )
 
         if errors:
             return _error_message(
