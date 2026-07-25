@@ -18,6 +18,10 @@ from textual.timer import Timer
 from textual.widgets import Footer, Header, Input
 from textual.worker import Worker, WorkerState
 
+from ghidra_deep_agent.defaults import (
+    DEFAULT_MAX_CONTEXT_TOKENS,
+    DEFAULT_RECURSION_LIMIT,
+)
 from ghidra_deep_agent.prompt import (
     APPROVED_PLAN_INSTRUCTION,
     MARKED_BACKGROUND,
@@ -25,7 +29,7 @@ from ghidra_deep_agent.prompt import (
 )
 from ghidra_deep_agent.resilience import UsageLimitError
 from ghidra_deep_agent.sessions import SessionStore
-from ghidra_deep_agent.toasts import ToastRequest, register_toast_sink
+from ghidra_deep_agent.toasts import ToastRequest, notify_toast, register_toast_sink
 from ghidra_deep_agent.tui.events import handle_event
 from ghidra_deep_agent.tui.formatting import extract_text
 from ghidra_deep_agent.tui.help_screen import HelpScreen
@@ -120,7 +124,7 @@ class GhidraAgentApp(App[None]):
         session_id: str = "",
         mcp_ok: bool = True,
         db_ok: bool = True,
-        max_context_tokens: int = 200_000,
+        max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
         session_store: SessionStore | None = None,
         binary_name: str = "",
     ) -> None:
@@ -174,6 +178,8 @@ class GhidraAgentApp(App[None]):
         self._agent_running = False
         self._agent_worker: Worker[None] | None = None
         self._unregister_toast_sink: Callable[[], None] | None = None
+        # Keys of best-effort failures already toasted (see `_warn_once`).
+        self._warned_failures: set[str] = set()
         self._mcp_ok = mcp_ok
         self._db_ok = db_ok
         self._max_context_tokens = max_context_tokens
@@ -251,13 +257,33 @@ class GhidraAgentApp(App[None]):
             self._dispatch_slash(query)
             return
 
-        if self._agent_running:
-            self.query_one(StatusBar).flash(
-                "[yellow]Agent still running — please wait.[/yellow]"
-            )
+        if not self._require_idle(self.query_one(StatusBar)):
             return
 
         self._start_run(query, query)
+
+    def _warn_once(self, key: str, message: str) -> None:
+        """Toast a best-effort failure the first time it happens.
+
+        These paths deliberately swallow errors so a hiccup can't kill a turn,
+        but silence makes a *persistent* failure invisible — a session that
+        never records, or a plan that never gets its background context. One
+        toast per kind per session: enough to notice, not enough to nag.
+        """
+        if key in self._warned_failures:
+            return
+        self._warned_failures.add(key)
+        notify_toast(message, severity="warning", title="Agent")
+
+    def _require_idle(self, bar: StatusBar) -> bool:
+        """True when no run is in flight; otherwise flash and return False.
+
+        Every command that would start or replace a run goes through this.
+        """
+        if self._agent_running:
+            bar.flash("[yellow]Agent still running — please wait.[/yellow]")
+            return False
+        return True
 
     def _start_run(self, display: str, agent_input: str) -> None:
         self._set_busy(True)
@@ -290,9 +316,10 @@ class GhidraAgentApp(App[None]):
             return
         try:
             await self._session_store.atouch(self._session_id, first_prompt=prompt)
-        except Exception:
-            # Session bookkeeping must never disrupt the run.
-            pass
+        except Exception as exc:
+            # Session bookkeeping must never disrupt the run — but if it keeps
+            # failing, `/resume` will quietly not list this session.
+            self._warn_once("touch_session", f"Session not recorded for /resume: {exc}")
 
     def _dispatch_slash(self, command: str) -> None:
         cmd = command.split()[0].lower()
@@ -305,8 +332,7 @@ class GhidraAgentApp(App[None]):
         elif cmd == "/quit":
             self.exit()
         elif cmd == "/compact":
-            if self._agent_running:
-                bar.flash("[yellow]Agent still running — please wait.[/yellow]")
+            if not self._require_idle(bar):
                 return
             self._start_run(
                 "/compact",
@@ -314,13 +340,11 @@ class GhidraAgentApp(App[None]):
                 "conversation history.",
             )
         elif cmd == "/resume":
-            if self._agent_running:
-                bar.flash("[yellow]Agent still running — please wait.[/yellow]")
+            if not self._require_idle(bar):
                 return
             self._open_resume_picker()
         elif cmd == "/continue":
-            if self._agent_running:
-                bar.flash("[yellow]Agent still running — please wait.[/yellow]")
+            if not self._require_idle(bar):
                 return
             # In a side-mode, resume that mode's ephemeral thread. Guard against
             # a mode flag set with no thread minted (nothing to replay).
@@ -332,14 +356,12 @@ class GhidraAgentApp(App[None]):
                 return
             self._resume_run()
         elif cmd == "/plan":
-            if self._agent_running:
-                bar.flash("[yellow]Agent still running — please wait.[/yellow]")
+            if not self._require_idle(bar):
                 return
             goal = command[len(cmd) :].strip()
             self._enter_plan_mode(goal)
         elif cmd == "/approve":
-            if self._agent_running:
-                bar.flash("[yellow]Agent still running — please wait.[/yellow]")
+            if not self._require_idle(bar):
                 return
             self._approve_plan()
         elif cmd == "/plan-cancel":
@@ -349,8 +371,7 @@ class GhidraAgentApp(App[None]):
             self._exit_plan_mode()
             bar.flash("[magenta]Plan mode cancelled.[/magenta]")
         elif cmd == "/ask":
-            if self._agent_running:
-                bar.flash("[yellow]Agent still running — please wait.[/yellow]")
+            if not self._require_idle(bar):
                 return
             question = command[len(cmd) :].strip()
             self._enter_ask_mode(question)
@@ -418,7 +439,9 @@ class GhidraAgentApp(App[None]):
         last."""
         try:
             state = await self._agent.aget_state(self._config)
-        except Exception:
+        except Exception as exc:
+            # Painting nothing looks exactly like "the session was empty".
+            self._warn_once("replay", f"Could not load the session's history: {exc}")
             return
         for msg in reversed(state.values.get("messages", [])):
             if getattr(msg, "type", None) == "ai":
@@ -426,6 +449,39 @@ class GhidraAgentApp(App[None]):
                 if text:
                     self.query_one(ResponseLog).log_assistant(text)
                     return
+
+    # -- side modes (plan / ask) ---------------------------------------------
+    # Both are read-only modes that run on their own ephemeral checkpointer
+    # thread, minted on entry and dropped on exit. The helpers below hold what
+    # they share; the pairs after them hold what actually differs (plan also
+    # mints a plan file).
+
+    def _new_side_stamp(self, *, active: bool, has_thread: bool) -> str | None:
+        """Timestamp for a fresh side-mode thread, or ``None`` to keep the current.
+
+        A new thread is minted only when entering from the normal state — while
+        already in the mode, the existing thread keeps handling follow-ups (and
+        no background summary is re-seeded).
+        """
+        if active and has_thread:
+            return None
+        return datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+
+    def _side_thread_config(self, kind: str, stamp: str) -> dict[str, Any]:
+        """Graph config for a side mode's ephemeral thread."""
+        return {
+            "configurable": {"thread_id": f"{self._session_id}::{kind}::{stamp}"},
+            "recursion_limit": self._config.get(
+                "recursion_limit", DEFAULT_RECURSION_LIMIT
+            ),
+        }
+
+    def _start_or_hint(self, bar: StatusBar, text: str, prefix: str, hint: str) -> None:
+        """Run the mode's first turn, or hint at what to type when it's empty."""
+        if text:
+            self._start_run(prefix + text, text)
+        else:
+            bar.flash(hint)
 
     # -- plan mode -----------------------------------------------------------
 
@@ -443,29 +499,25 @@ class GhidraAgentApp(App[None]):
         self._last_plan_text = None
 
     def _enter_plan_mode(self, goal: str) -> None:
-        """Enter plan mode, minting a fresh timestamped plan file + thread.
-
-        A new plan file and planning thread are minted only when entering from
-        the normal state; while already in plan mode the current plan file and
-        thread keep being revised (and no background summary is re-seeded).
-        """
+        """Enter plan mode, minting a fresh timestamped plan file + thread."""
         bar = self.query_one(StatusBar)
         # `/plan` and `/ask` are mutually exclusive — leave ask mode first.
         if self._ask_mode:
             self._exit_ask_mode()
-        if not self._plan_mode or self._plan_path is None:
-            stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        stamp = self._new_side_stamp(
+            active=self._plan_mode, has_thread=self._plan_path is not None
+        )
+        if stamp is not None:
             self._plan_path = f"plans/{stamp}-{_slug(goal)}.md"
-            self._plan_config = {
-                "configurable": {"thread_id": f"{self._session_id}::plan::{stamp}"},
-                "recursion_limit": self._config.get("recursion_limit", 10000),
-            }
+            self._plan_config = self._side_thread_config("plan", stamp)
             self._plan_needs_seed = True
         self._set_plan_mode(True)
-        if goal:
-            self._start_run("/plan " + goal, goal)
-        else:
-            bar.flash("[magenta]Plan mode ON — describe what to plan.[/magenta]")
+        self._start_or_hint(
+            bar,
+            goal,
+            "/plan ",
+            "[magenta]Plan mode ON — describe what to plan.[/magenta]",
+        )
 
     # -- ask mode ------------------------------------------------------------
 
@@ -483,26 +535,21 @@ class GhidraAgentApp(App[None]):
     def _enter_ask_mode(self, question: str) -> None:
         """Enter ask mode, minting a fresh ephemeral Q&A thread.
 
-        A new thread is minted only when entering from the normal state; while
-        already in ask mode the current thread keeps handling follow-ups (and no
-        background summary is re-seeded). `/plan` is left first — the two
-        side-modes are mutually exclusive.
+        `/plan` is left first — the two side-modes are mutually exclusive.
         """
         bar = self.query_one(StatusBar)
         if self._plan_mode:
             self._exit_plan_mode()
-        if not self._ask_mode or self._ask_config is None:
-            stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-            self._ask_config = {
-                "configurable": {"thread_id": f"{self._session_id}::ask::{stamp}"},
-                "recursion_limit": self._config.get("recursion_limit", 10000),
-            }
+        stamp = self._new_side_stamp(
+            active=self._ask_mode, has_thread=self._ask_config is not None
+        )
+        if stamp is not None:
+            self._ask_config = self._side_thread_config("ask", stamp)
             self._ask_needs_seed = True
         self._set_ask_mode(True)
-        if question:
-            self._start_run("/ask " + question, question)
-        else:
-            bar.flash("[cyan]Ask mode ON — ask a question.[/cyan]")
+        self._start_or_hint(
+            bar, question, "/ask ", "[cyan]Ask mode ON — ask a question.[/cyan]"
+        )
 
     async def _build_marked_prior_context(self) -> str | None:
         """Summarize the main session so far into a marked background block.
@@ -515,7 +562,10 @@ class GhidraAgentApp(App[None]):
             return None
         try:
             state = await self._agent.aget_state(self._config)
-        except Exception:
+        except Exception as exc:
+            self._warn_once(
+                "seed_state", f"Plan/ask mode started without prior context: {exc}"
+            )
             return None
         messages = state.values.get("messages", [])
         if len(messages) < MIN_MESSAGES_FOR_SUMMARY:
@@ -527,7 +577,12 @@ class GhidraAgentApp(App[None]):
             reply = await self._summary_model.ainvoke(
                 PLAN_CONTEXT_SUMMARY_PROMPT.format(transcript=transcript)
             )
-        except Exception:
+        except Exception as exc:
+            self._warn_once(
+                "seed_summary",
+                f"Plan/ask mode started without prior context ({exc}); "
+                "check SUMMARY_MODEL.",
+            )
             return None
         summary = extract_text(reply).strip()
         return MARKED_BACKGROUND.format(summary=summary) if summary else None
