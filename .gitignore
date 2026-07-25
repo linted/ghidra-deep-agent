@@ -1,12 +1,21 @@
 .env
 .venv
 __pycache__/
-agent_output/
 *AGENTS.md
 mongodb/pwfile
 mongodb/keyfile
 mongodb/firmware_pwfile
 mongodb/admin_pwfile
 mongodb/tls/
-agent_output*/
 openrouter.toml
+
+# Analysis artifacts the agent writes about a target binary. These are findings
+# about someone else's software, not this project's source — keep them local.
+agent_output/
+agent_output*/
+external_analysis/
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/

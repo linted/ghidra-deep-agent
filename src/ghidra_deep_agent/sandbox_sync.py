@@ -106,7 +106,7 @@ class SandboxSyncMiddleware(AgentMiddleware):
     ) -> dict[str, Any] | None:
         try:
             await self._seed()
-        except Exception as exc:  # noqa: BLE001 - a sync hiccup must not kill the turn
+        except Exception as exc:  # a sync hiccup must not kill the turn
             notify_toast(
                 f"Sandbox seed failed: {exc}", severity="warning", title="Sandbox"
             )
@@ -117,7 +117,7 @@ class SandboxSyncMiddleware(AgentMiddleware):
     ) -> dict[str, Any] | None:
         try:
             await self._sync_back()
-        except Exception as exc:  # noqa: BLE001 - a sync hiccup must not kill the turn
+        except Exception as exc:  # a sync hiccup must not kill the turn
             notify_toast(
                 f"Sandbox sync-back failed: {exc}", severity="warning", title="Sandbox"
             )
@@ -255,7 +255,7 @@ class SandboxSyncMiddleware(AgentMiddleware):
                 f"-C {shlex.quote(self._remote_root)}; "
                 f"rc=$?; rm -f {shlex.quote(seed_tar)}; exit $rc"
             )
-        except Exception as exc:  # noqa: BLE001 - fall back to per-file uploads
+        except Exception as exc:  # fall back to per-file uploads
             self._warn_tar_fallback(str(exc))
             return False
         if result.exit_code not in (0, None):

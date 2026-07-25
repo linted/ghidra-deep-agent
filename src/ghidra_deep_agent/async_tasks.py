@@ -224,7 +224,7 @@ class AsyncTaskMiddleware(AgentMiddleware):
         """Tell the TUI the async task finished (see ASYNC_DONE_EVENT)."""
         try:
             dispatch_custom_event(ASYNC_DONE_EVENT, {"task_id": task_id})
-        except Exception:  # noqa: BLE001 - purely a UI hint; never break the call
+        except Exception:  # purely a UI hint; never break the call
             pass
 
     # --- async -----------------------------------------------------------------
@@ -259,7 +259,7 @@ class AsyncTaskMiddleware(AgentMiddleware):
         """Tell the TUI the async task finished (see ASYNC_DONE_EVENT)."""
         try:
             await adispatch_custom_event(ASYNC_DONE_EVENT, {"task_id": task_id})
-        except Exception:  # noqa: BLE001 - purely a UI hint; never break the call
+        except Exception:  # purely a UI hint; never break the call
             pass
 
 
