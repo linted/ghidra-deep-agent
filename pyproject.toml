@@ -73,9 +73,27 @@ ignore = ["B009", "B010"]
 
 [tool.pytest.ini_options]
 testpaths = ["."]
-# Agent run artifacts live at the repo root and can contain .py files; keep them
-# out of collection (the default norecursedirs already covers dot-dirs/.venv).
-norecursedirs = ["agent_output*", "external_analysis", "mongodb", "scripts"]
+# Setting norecursedirs REPLACES pytest's defaults rather than extending them,
+# so the built-in patterns have to be repeated here — without the leading `.*`,
+# collection walks into `.claude/worktrees/**` and picks up a full copy of the
+# suite from every active worktree.
+norecursedirs = [
+    # pytest's defaults, restated:
+    "*.egg",
+    ".*",
+    "_darcs",
+    "build",
+    "CVS",
+    "dist",
+    "node_modules",
+    "venv",
+    "{arch}",
+    # ours: agent run artifacts at the repo root, which can contain .py files.
+    "agent_output*",
+    "external_analysis",
+    "mongodb",
+    "scripts",
+]
 markers = [
     "integration: needs live services (MongoDB with vector search, an embedding model)",
 ]
