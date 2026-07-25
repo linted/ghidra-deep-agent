@@ -8,6 +8,7 @@ from typing import Any, cast
 
 from ghidra_deep_agent.resilience import UsageLimitError
 from ghidra_deep_agent.tui import GhidraAgentApp
+from ghidra_deep_agent.tui.commands import COMMANDS, help_lines
 from ghidra_deep_agent.tui.events import handle_event, parse_checkpoint_ns
 from ghidra_deep_agent.tui.help_screen import HelpScreen
 from ghidra_deep_agent.tui.messages import SubagentReport
@@ -20,6 +21,7 @@ from ghidra_deep_agent.tui.widgets import (
     StatusBar,
     ThinkingPanel,
 )
+from ghidra_deep_agent.tui.widgets.command_input import SLASH_COMMANDS
 
 
 class _Chunk:
@@ -606,6 +608,32 @@ def test_entering_a_side_mode_always_mints_a_thread() -> None:
                 await pilot.pause()
 
     asyncio.run(run())
+
+
+def test_every_command_is_dispatchable_documented_and_autocompleted() -> None:
+    """The three views of a command are generated from one table.
+
+    They used to be written out separately, so a command could be dispatchable
+    but missing from autocomplete, or documented but no longer handled.
+    """
+    app = _make_app()
+    handlers = set(app._slash_handlers())
+    declared = {c.name for c in COMMANDS}
+
+    assert handlers == declared, "handler map and command table disagree"
+    assert set(SLASH_COMMANDS) == declared, "autocomplete list is out of sync"
+    documented = "\n".join(help_lines())
+    for name in declared:
+        assert name in documented, f"{name} is undocumented"
+
+
+def test_run_starting_commands_are_marked_needs_idle() -> None:
+    """The busy guard is now a table flag, not seven copy-pasted branches."""
+    by_name = {c.name: c for c in COMMANDS}
+    for name in ("/compact", "/resume", "/continue", "/plan", "/ask", "/approve"):
+        assert by_name[name].needs_idle, f"{name} could interleave two runs"
+    for name in ("/clear", "/yank", "/help", "/quit"):
+        assert not by_name[name].needs_idle
 
 
 def test_commands_that_start_a_run_are_refused_while_busy() -> None:

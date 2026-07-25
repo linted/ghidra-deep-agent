@@ -31,6 +31,7 @@ from ghidra_deep_agent.prompt import (
 from ghidra_deep_agent.resilience import UsageLimitError
 from ghidra_deep_agent.sessions import SessionStore
 from ghidra_deep_agent.toasts import ToastRequest, notify_toast, register_toast_sink
+from ghidra_deep_agent.tui.commands import COMMANDS_BY_NAME
 from ghidra_deep_agent.tui.events import handle_event
 from ghidra_deep_agent.tui.formatting import extract_text
 from ghidra_deep_agent.tui.help_screen import HelpScreen
@@ -322,62 +323,66 @@ class GhidraAgentApp(App[None]):
             # failing, `/resume` will quietly not list this session.
             self._warn_once("touch_session", f"Session not recorded for /resume: {exc}")
 
+    def _slash_handlers(self) -> dict[str, Callable[[str], None]]:
+        """Command name -> handler, taking whatever followed the command."""
+        return {
+            "/clear": self._cmd_clear,
+            "/yank": lambda _arg: self.action_yank(),
+            "/quit": lambda _arg: self.exit(),
+            "/compact": self._cmd_compact,
+            "/resume": self._cmd_resume,
+            # A side mode always carries its own thread, so `/continue` inside one
+            # resumes that thread rather than the main session's.
+            "/continue": lambda _arg: self._resume_run(),
+            "/plan": lambda arg: self._enter_side_mode("plan", arg),
+            "/approve": lambda _arg: self._approve_plan(),
+            "/plan-cancel": lambda _arg: self._cmd_cancel_side("plan"),
+            "/ask": lambda arg: self._enter_side_mode("ask", arg),
+            "/ask-cancel": lambda _arg: self._cmd_cancel_side("ask"),
+            "/help": lambda _arg: self.action_help(),
+        }
+
+    def _cmd_resume(self, _arg: str) -> None:
+        # `_open_resume_picker` is a @work method; discard the Worker it returns.
+        self._open_resume_picker()
+
+    def _cmd_clear(self, _arg: str) -> None:
+        self.action_clear_log()
+        self.query_one(StatusBar).flash("[green]Cleared.[/green]")
+
+    def _cmd_compact(self, _arg: str) -> None:
+        self._start_run(
+            "/compact",
+            "Call the `compact_conversation` tool now to compact the "
+            "conversation history.",
+        )
+
+    def _cmd_cancel_side(self, kind: Kind) -> None:
+        bar = self.query_one(StatusBar)
+        if self._side is None or self._side.kind != kind:
+            bar.flash(f"[yellow]Not in {kind} mode.[/yellow]")
+            return
+        color = "magenta" if kind == "plan" else "cyan"
+        self._exit_side_mode()
+        bar.flash(f"[{color}]{self._side_label(kind)} mode cancelled.[/{color}]")
+
+    @staticmethod
+    def _side_label(kind: Kind) -> str:
+        return "Plan" if kind == "plan" else "Ask"
+
     def _dispatch_slash(self, command: str) -> None:
         cmd = command.split()[0].lower()
         bar = self.query_one(StatusBar)
-        if cmd == "/clear":
-            self.action_clear_log()
-            bar.flash("[green]Cleared.[/green]")
-        elif cmd == "/yank":
-            self.action_yank()
-        elif cmd == "/quit":
-            self.exit()
-        elif cmd == "/compact":
-            if not self._require_idle(bar):
-                return
-            self._start_run(
-                "/compact",
-                "Call the `compact_conversation` tool now to compact the "
-                "conversation history.",
-            )
-        elif cmd == "/resume":
-            if not self._require_idle(bar):
-                return
-            self._open_resume_picker()
-        elif cmd == "/continue":
-            if not self._require_idle(bar):
-                return
-            # A side mode always carries its own thread, so `/continue` in one
-            # resumes that thread rather than the main session's.
-            self._resume_run()
-        elif cmd == "/plan":
-            if not self._require_idle(bar):
-                return
-            self._enter_side_mode("plan", command[len(cmd) :].strip())
-        elif cmd == "/approve":
-            if not self._require_idle(bar):
-                return
-            self._approve_plan()
-        elif cmd == "/plan-cancel":
-            if self._side is None or not self._side.is_plan:
-                bar.flash("[yellow]Not in plan mode.[/yellow]")
-                return
-            self._exit_side_mode()
-            bar.flash("[magenta]Plan mode cancelled.[/magenta]")
-        elif cmd == "/ask":
-            if not self._require_idle(bar):
-                return
-            self._enter_side_mode("ask", command[len(cmd) :].strip())
-        elif cmd == "/ask-cancel":
-            if self._side is None or not self._side.is_ask:
-                bar.flash("[yellow]Not in ask mode.[/yellow]")
-                return
-            self._exit_side_mode()
-            bar.flash("[cyan]Ask mode cancelled.[/cyan]")
-        elif cmd == "/help":
-            self.action_help()
-        else:
+        spec = COMMANDS_BY_NAME.get(cmd)
+        if spec is None:
             bar.flash(f"[red]Unknown command: {cmd}[/red]")
+            return
+        # One busy guard for every run-starting command, driven by the table —
+        # previously copy-pasted into each branch, where a new command could
+        # silently omit it.
+        if spec.needs_idle and not self._require_idle(bar):
+            return
+        self._slash_handlers()[cmd](command[len(cmd) :].strip())
 
     @work(exclusive=False)
     async def _open_resume_picker(self) -> None:
