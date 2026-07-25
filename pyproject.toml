@@ -59,6 +59,20 @@ select = ["E", "F", "I", "UP"]
 "src/ghidra_deep_agent/apply_switch_override_script.py" = ["E501"]
 "src/ghidra_deep_agent/ollvm_deobfuscate_script.py" = ["E501"]
 
+[tool.pytest.ini_options]
+testpaths = ["."]
+# Agent run artifacts live at the repo root and can contain .py files; keep them
+# out of collection (the default norecursedirs already covers dot-dirs/.venv).
+norecursedirs = ["agent_output*", "external_analysis", "mongodb", "scripts"]
+markers = [
+    "integration: needs live services (MongoDB with vector search, an embedding model)",
+]
+filterwarnings = [
+    "default",
+    # langchain_core imports pydantic.v1 shims; noisy on Python 3.14 and not ours to fix.
+    "ignore:Core Pydantic V1 functionality isn't compatible with Python 3.14:UserWarning",
+]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true
