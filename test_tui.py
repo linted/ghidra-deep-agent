@@ -491,6 +491,85 @@ def test_continue_in_side_mode_without_thread_is_a_noop() -> None:
     asyncio.run(run())
 
 
+def test_commands_that_start_a_run_are_refused_while_busy() -> None:
+    """Every run-starting command shares one busy guard; none may slip through."""
+
+    async def run() -> None:
+        app = _make_app()
+        async with app.run_test() as pilot:
+            started: list[Any] = []
+            app._start_run = lambda *a: started.append(a)  # type: ignore[method-assign]
+            app._resume_run = lambda: started.append(("resume",))  # type: ignore[method-assign]
+            # Decorated with @work, so its bound type isn't a plain callable.
+            setattr(app, "_open_resume_picker", lambda: started.append(("picker",)))
+            app._agent_running = True
+
+            for command in ("/compact", "/resume", "/continue", "/plan x", "/ask y"):
+                app._dispatch_slash(command)
+            await pilot.pause()
+
+            assert started == []
+
+    asyncio.run(run())
+
+
+def test_side_modes_mint_one_thread_and_reuse_it() -> None:
+    """Entering a side mode mints an ephemeral thread; staying in it reuses it."""
+
+    async def run() -> None:
+        app = _make_app()
+        async with app.run_test() as pilot:
+            app._start_run = lambda *a: None  # type: ignore[method-assign]
+
+            app._enter_plan_mode("first goal")
+            first_config = app._plan_config
+            first_path = app._plan_path
+            assert first_config is not None
+            assert app._plan_needs_seed is True
+
+            # Already in plan mode: the same plan file and thread keep being revised.
+            app._plan_needs_seed = False
+            app._enter_plan_mode("second goal")
+            assert app._plan_config == first_config
+            assert app._plan_path == first_path
+            assert app._plan_needs_seed is False
+
+            # The thread is this session's, namespaced by mode.
+            thread_id = first_config["configurable"]["thread_id"]
+            assert thread_id.startswith(f"{app._session_id}::plan::")
+            assert "recursion_limit" in first_config
+
+            await pilot.pause()
+
+    asyncio.run(run())
+
+
+def test_plan_and_ask_are_mutually_exclusive() -> None:
+    async def run() -> None:
+        app = _make_app()
+        async with app.run_test() as pilot:
+            app._start_run = lambda *a: None  # type: ignore[method-assign]
+
+            app._enter_plan_mode("goal")
+            assert app._plan_mode is True
+
+            app._enter_ask_mode("question")
+            assert app._ask_mode is True
+            assert app._plan_mode is False
+            assert app._plan_config is None
+            assert app._ask_config is not None
+            assert "::ask::" in app._ask_config["configurable"]["thread_id"]
+
+            app._enter_plan_mode("goal again")
+            assert app._plan_mode is True
+            assert app._ask_mode is False
+            assert app._ask_config is None
+
+            await pilot.pause()
+
+    asyncio.run(run())
+
+
 def test_usage_limit_banner_in_plan_mode_omits_relaunch() -> None:
     """The pause banner for a side-mode run must not advise `--session-id`
     relaunch — the ephemeral thread isn't restorable across launches."""

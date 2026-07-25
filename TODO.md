@@ -136,6 +136,19 @@ Sub-agent design — implemented in `src/ghidra_deep_agent/subagents.py` (`build
   the same plan-mode/mutation controls as other write tools. Deferred out of the
   "surface decompile failures" change on purpose.
 
+#### From the repo audit (2026-07-24)
+- [ ] **Dispatch-table `handle_event` / split `_run_agent`** — deliberately left
+  during the audit's TUI dedup pass. `tui/events.py:handle_event` is a ~134-line
+  six-branch `if/elif` on `event["event"]`, and `tui/app.py:_run_agent` is ~119
+  lines (mode selection, input seeding, prompt decoration, stream loop, three
+  exception handlers). Both read fine as linear routers, and both branch sets
+  share locals (`run_id`/`metadata`/`checkpoint_ns`/`is_compaction` in the first,
+  the captured mode/config pair in the second) that a table would have to thread
+  through a context object — roughly as much scaffolding as it removes. Revisit
+  if either grows another branch. The genuinely duplicated parts (the seven-times
+  copy-pasted busy guard, the twice-duplicated side-mode thread config, the
+  hardcoded recursion/context defaults) were already collapsed.
+
 #### From dependency review (2026-07-20)
 - [ ] **Adopt `ToolErrorMiddleware` (langchain 1.3.14)** — evaluate folding the new
   `ToolErrorMiddleware` in alongside our existing `build_tool_retry_middleware`

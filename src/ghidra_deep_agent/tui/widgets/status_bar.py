@@ -4,6 +4,7 @@ from textual.reactive import reactive
 from textual.timer import Timer
 from textual.widgets import Static
 
+from ghidra_deep_agent.defaults import DEFAULT_MAX_CONTEXT_TOKENS
 from ghidra_deep_agent.tui.formatting import fmt_tokens
 
 
@@ -16,7 +17,7 @@ class StatusBar(Static):
     input_tokens: reactive[int] = reactive(0)
     output_tokens: reactive[int] = reactive(0)
     current_context: reactive[int] = reactive(0)
-    max_context: reactive[int] = reactive(200_000)
+    max_context: reactive[int] = reactive(DEFAULT_MAX_CONTEXT_TOKENS)
     active_tools: reactive[int] = reactive(0)
     plan_mode: reactive[bool] = reactive(False)
     ask_mode: reactive[bool] = reactive(False)
