@@ -12,6 +12,7 @@ from collections.abc import Generator
 import pytest
 
 import ghidra_deep_agent.toasts as toasts
+from ghidra_deep_agent.mongo_util import close_mongo_clients
 from ghidra_deep_agent.toasts import ToastRequest, register_toast_sink
 
 
@@ -21,6 +22,18 @@ def _clear_sinks() -> Generator[None, None, None]:
     toasts._sinks.clear()
     yield
     toasts._sinks.clear()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _close_mongo_clients() -> Generator[None, None, None]:
+    """Close the shared Mongo clients at the end of the session.
+
+    `cli.main` closes them in its `finally`, but tests that build knowledge or
+    session stores directly never go through it — leaving pymongo to complain
+    about an unclosed client at interpreter exit.
+    """
+    yield
+    close_mongo_clients()
 
 
 @pytest.fixture
