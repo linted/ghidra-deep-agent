@@ -512,7 +512,8 @@ def test_continue_resumes_active_side_mode() -> None:
             app = _make_app()
             async with app.run_test() as pilot:
                 called: list[bool] = []
-                app._resume_run = lambda: called.append(True)  # type: ignore[method-assign]
+                # Bind `called` per iteration; it is rebound by the enclosing loop.
+                setattr(app, "_resume_run", lambda c=called: c.append(True))
                 setattr(app, flag, True)
                 setattr(app, cfg_attr, {"configurable": {"thread_id": "abc::x"}})
                 app._dispatch_slash("/continue")
@@ -533,7 +534,8 @@ def test_continue_in_side_mode_without_thread_is_a_noop() -> None:
             app = _make_app()
             async with app.run_test() as pilot:
                 called: list[bool] = []
-                app._resume_run = lambda: called.append(True)  # type: ignore[method-assign]
+                # Bind `called` per iteration; it is rebound by the enclosing loop.
+                setattr(app, "_resume_run", lambda c=called: c.append(True))
                 setattr(app, flag, True)
                 setattr(app, cfg_attr, None)
                 app._dispatch_slash("/continue")

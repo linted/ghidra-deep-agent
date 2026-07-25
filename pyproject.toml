@@ -52,7 +52,16 @@ target-version = "py312"
 exclude = ["agent_output*"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP"]
+# B (flake8-bugbear) catches real defects — notably B023, closures capturing a
+# loop variable. Not BLE (blind-except): the broad `except Exception` handlers
+# here are deliberate ("a sync hiccup must not kill the turn") and each carries
+# a comment saying why, so enabling it would only add ~14 noqa lines.
+select = ["E", "F", "I", "UP", "B"]
+# B009/B010 ("getattr/setattr with a constant is not any safer") does not hold
+# here: those calls are typing escapes for monkeypatching a third-party module
+# (compaction.py patches deepagents.graph) and for probing union-typed values.
+# Rewriting them to attribute access is exactly what mypy --strict rejects.
+ignore = ["B009", "B010"]
 
 [tool.ruff.lint.per-file-ignores]
 # These modules are almost entirely an embedded Java GhidraScript held as a

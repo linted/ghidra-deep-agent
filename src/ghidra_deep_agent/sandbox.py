@@ -121,7 +121,7 @@ async def open_sandbox_backend() -> AsyncIterator[SandboxBackendProtocol]:
                     stdin=stdin,
                     timeout_seconds=self._resolve_timeout(None),
                 )
-            except Exception as exc:  # noqa: BLE001 - mirrors the base adapter
+            except Exception as exc:  # mirrors the base adapter
                 return FileUploadResponse(
                     path=path, error=_detailed(f"{type(exc).__name__}: {exc}")
                 )
@@ -146,12 +146,12 @@ async def open_sandbox_backend() -> AsyncIterator[SandboxBackendProtocol]:
     sandbox_cm = openshell.Sandbox(workspace=workspace)
     try:
         sandbox = await asyncio.to_thread(sandbox_cm.__enter__)
-    except Exception as exc:  # noqa: BLE001 - surfaced as a fatal startup error
+    except Exception as exc:  # surfaced as a fatal startup error
         raise OpenShellSandboxError(str(exc)) from exc
 
     try:
         sandbox_id = sandbox.id
-    except Exception:  # noqa: BLE001 - id is best-effort for the status line
+    except Exception:  # id is best-effort for the status line
         sandbox_id = "unknown"
     print(f"Sandbox: openshell [id={sandbox_id}]")
 
@@ -162,7 +162,7 @@ async def open_sandbox_backend() -> AsyncIterator[SandboxBackendProtocol]:
 
     try:
         await asyncio.to_thread(_mkdir_workdir)
-    except Exception as exc:  # noqa: BLE001 - non-fatal; sync middleware retries
+    except Exception as exc:  # non-fatal; sync middleware retries
         print(
             f"Warning: could not pre-create {SANDBOX_WORKDIR}: {exc}",
             file=sys.stderr,
@@ -179,7 +179,7 @@ async def open_sandbox_backend() -> AsyncIterator[SandboxBackendProtocol]:
     finally:
         try:
             await asyncio.to_thread(sandbox_cm.__exit__, None, None, None)
-        except Exception as exc:  # noqa: BLE001 - teardown must not mask a crash
+        except Exception as exc:  # teardown must not mask a crash
             print(
                 f"Warning: OpenShell sandbox teardown failed: {exc}",
                 file=sys.stderr,

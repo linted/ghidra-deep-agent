@@ -46,7 +46,9 @@ All configuration is done via environment variables (`.env` file or shell export
 |---|---|---|
 | `ANTHROPIC_API_KEY` | — | API key for Anthropic *(not needed for Ollama)* |
 | `MODEL` | `anthropic:claude-sonnet-4-6` | Any `provider:model` string supported by LangChain (also `openrouter:<model-id>` — see [Using OpenRouter](#using-openrouter)) |
+| `AGENT_CONFIG` | `./subagents.toml` | Per-agent models and tool allowlists (coordinator + sub-agents); point this at a different TOML to override |
 | `OPENROUTER_API_KEY` | — | API key for OpenRouter *(required for `openrouter:` models)* |
+| `DEEPSEEK_API_KEY` | — | API key for DeepSeek *(required for `deepseek:` models)* |
 | `OPENROUTER_CONFIG` | `./openrouter.toml` | Optional TOML of per-model OpenRouter provider-routing presets — see [Pinning providers](#pinning-providers-provider-routing) |
 | `SUMMARY_MODEL` | *(main `MODEL`)* | Optional `provider:model` for the conversation-summarization call (manual `/compact` **and** the auto summarizer) — route it to a smaller/cheaper model |
 | `COMPACT_TRIGGER_TOKENS` | `50000` | **Sub-agents:** auto-compact when the full prompt (system prompt + tool schemas + history) reaches this many tokens |
@@ -63,10 +65,12 @@ All configuration is done via environment variables (`.env` file or shell export
 | `MONGODB_URI` | `mongodb://localhost:27017` | MongoDB connection string for checkpoint persistence |
 | `MONGODB_DB` | `checkpointing_db` | Database used by the checkpointer and knowledge base |
 | `MONGODB_VECTOR_COLLECTION` | `re_knowledge` | Collection for the vector knowledge base |
+| `MONGODB_SESSIONS_COLLECTION` | `sessions` | Collection holding the resumable-session registry behind `/resume` |
 | `MONGODB_TOOL_CACHE_COLLECTION` | `tool_cache` | Collection caching immutable read-only MCP tool results |
 | `MONGODB_TOOL_CACHE_TTL` | `86400` | Cache entry lifetime in seconds (TTL index); sized to a session |
 | `MONGODB_TOOL_CACHE_TOOLS` | *(immutable read set)* | Comma-separated allowlist override; empty disables the cache |
 | `MONGODB_TOOL_CACHE_MUTABLE_TOOLS` | `get_code,xrefs,get_data_at` | Mutable-tier allowlist: reads cached until any Ghidra mutation tool succeeds, which flushes the tier for the binary; empty disables the tier |
+| `MONGODB_TOOL_CACHE_DEBUG` | *(unset)* | Set to `1` to log per-tool cache `HIT`/`MISS`/`INVALIDATE` lines to stderr |
 | `BINARY_NAME` | *(auto-detected)* | Override the binary name used to scope the knowledge base — see [Binary selection](#binary-selection) |
 | `GHIDRA_MCP_TRANSPORT` | `http` | Transport type: `http` or `sse` (GhidrAssistMCP is HTTP-only) |
 | `GHIDRA_MCP_URL` | `http://localhost:8080/mcp` | URL of the GhidrAssistMCP server (`/mcp` for http, `/sse` for sse) |
@@ -74,12 +78,18 @@ All configuration is done via environment variables (`.env` file or shell export
 | `GHIDRA_ASYNC_POLL_FACTOR` | `1.6` | Backoff multiplier applied to the poll gap after each poll |
 | `GHIDRA_ASYNC_POLL_MAX` | `2.0` | Cap (s) on the async-task poll gap |
 | `GHIDRA_ASYNC_TIMEOUT` | `180` | Give up waiting on an async task after this many seconds |
+| `GHIDRA_RECOVER_TIMEOUT` | `1800` | Give up waiting on a whole-program Ghidra script (`recover_prototypes`, the jump-table and CFF tools) after this many seconds |
 | `AGENT_OUTPUT_DIR` | *(unset)* | Optional directory the agent can read/write files in |
 | `SANDBOX` | *(unset)* | Set to `openshell` to run the agent's shell in a sandbox — see [Sandboxed shell](#sandboxed-shell-openshell) |
+| `OPENSHELL_GATEWAY` | *(from the active gateway)* | Override the OpenShell gateway resolved from `~/.config/openshell/` |
+| `OPENSHELL_GATEWAY_ENDPOINT` | *(from the active gateway)* | Override the OpenShell gateway endpoint |
+| `OPENSHELL_WORKSPACE` | `default` | OpenShell workspace the sandbox is created in |
 | `SANDBOX_SYNC_MAX_BYTES` | `52428800` | Per-file size cap (bytes) for sandbox file sync; larger files are skipped |
 | `SANDBOX_SYNC_TAR_MIN_FILES` | `4` | Pending-file count at which the seed switches to a single-tarball bulk upload |
-| `RECURSION_LIMIT` | `100` | LangGraph recursion limit for deep analysis sessions |
+| `RECURSION_LIMIT` | `10000` | LangGraph recursion limit for deep analysis sessions (LangGraph's own default of 25 is far too low for these) |
+| `MAX_CONTEXT_TOKENS` | `200000` | Context-window size assumed by the TUI gauge when the model exposes no context profile |
 | `AGENTS_MD` | *(unset)* | Optional path to an `AGENTS.md` memory file |
+| `APP_NAME` | `ghidra-deep-agent` | Root run name reported to LangSmith (otherwise traces show the LangGraph default) |
 | `LANGSMITH_API_KEY` | *(unset)* | *(optional)* LangSmith API key to enable run tracing |
 | `LANGSMITH_TRACING` | *(unset)* | Set to `true` to enable LangSmith tracing |
 | `LANGSMITH_PROJECT` | *(unset)* | LangSmith project name for traces |
