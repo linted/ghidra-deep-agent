@@ -51,8 +51,9 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
-from pymongo import MongoClient
 from pymongo.collection import Collection
+
+from ghidra_deep_agent.mongo_util import get_mongo_client
 
 # Read tools whose output is invariant for a program regardless of any renames /
 # retypes / comments the agent applies during the session. Deliberately
@@ -97,6 +98,15 @@ _MUTATING_TOOLS = frozenset(
         # flushes the mutable read cache. `find_unrecovered_switches` is read-only
         # and deliberately NOT listed here.
         "apply_switch_override",
+        # Local tool (switch_tools.py) that rewrites flattened control flow into
+        # direct branches when called with apply=True. Same factory as
+        # `apply_switch_override`; a dry run mutates nothing, but `_mutation_succeeded`
+        # can't tell the two apart from the result text, so invalidating on both is
+        # the safe side of the trade (a needless flush only costs a re-read).
+        "deobfuscate_cff",
+        # Bookmarks don't change decompilation, but they do show up in the listing
+        # reads above, so a successful write flushes the tier for consistency.
+        "bookmarks",
     }
 )
 
@@ -161,6 +171,12 @@ class MCPReadCacheMiddleware(AgentMiddleware):
         self.hits = 0
         self.misses = 0
         self.invalidations = 0
+        # Bumped on every flush. One middleware instance is shared by the
+        # coordinator and every sub-agent, so a slow read (get_code is tens of
+        # seconds) can return *after* a concurrent mutation flushed the tier —
+        # writing a pre-mutation result that then outlives the flush. Readers
+        # capture this before calling the handler and skip the store if it moved.
+        self._generation = 0
 
     # --- helpers ---------------------------------------------------------------
 
@@ -194,6 +210,7 @@ class MCPReadCacheMiddleware(AgentMiddleware):
             {"binary": self._binary, "mutable": True}
         ).deleted_count
         self.invalidations += 1
+        self._generation += 1
         if self._debug:
             print(
                 f"[mcp-cache] INVALIDATE {name} cleared {deleted} mutable entries",
@@ -217,6 +234,23 @@ class MCPReadCacheMiddleware(AgentMiddleware):
 
     def _should_store(self, result: ToolMessage | Command[Any]) -> bool:
         return isinstance(result, ToolMessage) and result.status != "error"
+
+    def _still_current(self, name: str, generation: int) -> bool:
+        """False when a flush landed while this read was in flight.
+
+        Only mutable-tier reads can go stale that way — immutable-tier output is
+        unaffected by Ghidra mutations, so it is always safe to store.
+        """
+        if name not in self._mutable:
+            return True
+        if self._generation == generation:
+            return True
+        if self._debug:
+            print(
+                f"[mcp-cache] SKIP-STORE {name} (flushed while in flight)",
+                file=sys.stderr,
+            )
+        return False
 
     def _mutation_succeeded(self, result: ToolMessage | Command[Any]) -> bool:
         # Commands don't carry a status; assume the mutation happened (a spurious
@@ -246,8 +280,9 @@ class MCPReadCacheMiddleware(AgentMiddleware):
             return self._cached_message(doc, request)
         self.misses += 1
         self._log("MISS", name)
+        generation = self._generation
         result = handler(request)
-        if self._should_store(result):
+        if self._should_store(result) and self._still_current(name, generation):
             assert isinstance(result, ToolMessage)
             self._store(key, name, result.content, result.status)
         return result
@@ -275,8 +310,9 @@ class MCPReadCacheMiddleware(AgentMiddleware):
             return self._cached_message(doc, request)
         self.misses += 1
         self._log("MISS", name)
+        generation = self._generation
         result = await handler(request)
-        if self._should_store(result):
+        if self._should_store(result) and self._still_current(name, generation):
             assert isinstance(result, ToolMessage)
             await asyncio.to_thread(
                 self._store, key, name, result.content, result.status
@@ -303,8 +339,7 @@ def build_mcp_cache_middleware(
     debug = bool(os.environ.get("MONGODB_TOOL_CACHE_DEBUG"))
 
     try:
-        client: MongoClient[dict[str, Any]] = MongoClient(mongodb_uri)
-        collection = client[mongodb_db][coll_name]
+        collection = get_mongo_client(mongodb_uri)[mongodb_db][coll_name]
         _ensure_ttl_index(collection, ttl_seconds)
     except Exception as exc:  # pragma: no cover - environmental
         print(f"Warning: MCP read cache disabled ({exc})", file=sys.stderr)

@@ -17,6 +17,7 @@ import pytest
 from ghidra_deep_agent.resilience import (
     UsageLimitError,
     _is_out_of_credits,
+    _is_transient,
     _is_usage_limit,
     _on_model_retries_exhausted,
 )
@@ -50,13 +51,24 @@ def test_429_status_is_a_usage_limit() -> None:
     [
         "Rate limit exceeded",
         "429 too many requests",
-        "model is overloaded, please retry",
         "you have exceeded your monthly quota",
         "usage limit reached for this window",
     ],
 )
 def test_limit_markers_are_usage_limits(text: str) -> None:
     assert _is_usage_limit(Exception(text)) is True
+
+
+def test_overloaded_is_transient_not_a_usage_limit() -> None:
+    """Provider-at-capacity is a blip, not a quota block.
+
+    It must stay retryable *and* must not escalate to UsageLimitError when the
+    retries are spent — that would halt the turn for a condition that typically
+    clears in seconds.
+    """
+    exc = Exception("model is overloaded, please retry")
+    assert _is_transient(exc) is True
+    assert _is_usage_limit(exc) is False
 
 
 @pytest.mark.parametrize(

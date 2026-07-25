@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 
 from ghidra_deep_agent.resilience import UsageLimitError
 from ghidra_deep_agent.tui import GhidraAgentApp
@@ -472,6 +472,68 @@ def test_report_screen_copy() -> None:
             await pilot.press("ctrl+y")
             await pilot.pause()
             assert app.clipboard == "the full report text"
+
+    asyncio.run(run())
+
+
+def test_session_touch_is_not_cancelled_by_the_agent_run() -> None:
+    """`_run_agent` is exclusive, so a shared worker group would kill the touch.
+
+    Textual cancels every worker in an exclusive worker's group on the same node.
+    Both used to default to "default", so `_start_run` killed the touch worker it
+    had just launched — no session ever recorded a title or a fresh
+    `last_active_at`, and `/resume` listed everything as "(no title)".
+    """
+    touched: list[tuple[str, str | None]] = []
+
+    class RecordingStore:
+        async def atouch(
+            self, session_id: str, first_prompt: str | None = None
+        ) -> None:
+            touched.append((session_id, first_prompt))
+
+        async def arecord_start(self, session_id: str, binary_name: str) -> None:
+            pass
+
+    async def run() -> None:
+        app = _make_app(StubAgent())
+        app._session_store = cast(Any, RecordingStore())
+        async with app.run_test() as pilot:
+            app.query_one(CommandInput).value = "analyze the entry point"
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+    asyncio.run(run())
+
+    assert touched == [("abc", "analyze the entry point")]
+
+
+def test_cancelled_run_leaves_no_active_tool_count() -> None:
+    """A cancelled turn never delivers on_tool_end for what was in flight.
+
+    Without a reset the app-side bookkeeping keeps those run_ids forever and the
+    status bar's "⚙ N active" never returns to zero for the rest of the session.
+    """
+
+    async def run() -> None:
+        app = _make_app()
+        async with app.run_test() as pilot:
+            # Tools that started and will never report completion, as after an
+            # Escape-cancel or an exception mid-stream.
+            app._active_tool_runs.add("run-1")
+            app._hidden_tool_runs.add("run-2")
+            app._pending_async["task-1"] = "run-3"
+            app._subagent_meta["run-4"] = ("recon", 0.0)
+            app.query_one(StatusBar).active_tools = 3
+            await pilot.pause()
+
+            app._reset_run_bookkeeping()
+
+            assert app._active_tool_runs == set()
+            assert app._hidden_tool_runs == set()
+            assert app._pending_async == {}
+            assert app._subagent_meta == {}
+            assert app.query_one(StatusBar).active_tools == 0
 
     asyncio.run(run())
 

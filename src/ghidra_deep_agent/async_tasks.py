@@ -40,8 +40,12 @@ from langgraph.types import Command
 # submitted: <id> ...").
 _STUB_MARKERS = ("Task submitted for async execution", "Script task submitted")
 _TASK_ID_RE = re.compile(r"(?:Task ID:|Script task submitted:)\s*([0-9A-Za-z._-]{6,})")
-# A poll response still in flight.
-_IN_FLIGHT = ("Status: RUNNING", "Status: PENDING")
+# A poll response still in flight. Anchored to the start of a line: a *finished*
+# task's result text is what get_task_status returns, and for an RE tool that text
+# is attacker-controlled binary content — `search_strings` can easily surface a
+# literal "Status: RUNNING". A bare substring test would then keep polling a task
+# that already completed, and throw away the result we were handed.
+_IN_FLIGHT_RE = re.compile(r"^[ \t]*Status:[ \t]*(?:RUNNING|PENDING)\b", re.MULTILINE)
 
 # Custom event this middleware dispatches once an async task finishes (resolved
 # or timed out), carrying ``{"task_id": ...}``. The TUI uses it to defer the
@@ -89,7 +93,7 @@ def _task_id(content: str) -> str | None:
 
 
 def _is_in_flight(content: str) -> bool:
-    return any(flag in content for flag in _IN_FLIGHT)
+    return _IN_FLIGHT_RE.search(content) is not None
 
 
 def _timeout_text(timeout_s: float) -> str:

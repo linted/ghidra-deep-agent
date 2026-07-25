@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from langchain_core.language_models import BaseChatModel
 from rich.rule import Rule
 from textual import work
 from textual.app import App, ComposeResult
@@ -119,7 +120,7 @@ class GhidraAgentApp(App[None]):
         config: dict[str, Any],
         plan_agent: Any = None,
         ask_agent: Any = None,
-        summary_model: Any = None,
+        summary_model: BaseChatModel | None = None,
         model: str = "",
         session_id: str = "",
         mcp_ok: bool = True,
@@ -285,10 +286,26 @@ class GhidraAgentApp(App[None]):
             return False
         return True
 
+    def _reset_run_bookkeeping(self) -> None:
+        """Drop per-run tool state left behind by a cancelled or failed turn.
+
+        A run cancelled with Escape (or aborted by an exception) never delivers
+        ``on_tool_end`` for whatever was in flight, so these containers keep those
+        run_ids forever and the status bar's active-tool count never returns to
+        zero. ``ActivityTree.reset()`` clears the tree's own map; these are the
+        app-side halves of the same bookkeeping.
+        """
+        self._hidden_tool_runs.clear()
+        self._pending_async.clear()
+        self._subagent_meta.clear()
+        self._active_tool_runs.clear()
+        self.query_one(StatusBar).active_tools = 0
+
     def _start_run(self, display: str, agent_input: str) -> None:
         self._set_busy(True)
         self.query_one(ResponseLog).log_user(display)
         self.query_one(ActivityTree).reset()
+        self._reset_run_bookkeeping()
         self._touch_session(display)
         self._agent_worker = self._run_agent(agent_input)
 
@@ -306,10 +323,16 @@ class GhidraAgentApp(App[None]):
         response = self.query_one(ResponseLog)
         response.write("[dim]↻ Continuing from the last checkpoint…[/dim]")
         self.query_one(ActivityTree).reset()
+        self._reset_run_bookkeeping()
         self._touch_session("/continue")
         self._agent_worker = self._run_agent(None)
 
-    @work(exclusive=False)
+    # Own worker group: `_run_agent` is `exclusive=True`, and Textual cancels every
+    # worker sharing the *group* of an exclusive worker on the same node. Both used
+    # to default to "default", so starting a run killed the touch worker launched one
+    # line earlier — before its first await — and no session ever got a title or a
+    # refreshed `last_active_at`.
+    @work(exclusive=False, group="session")
     async def _touch_session(self, prompt: str) -> None:
         """Bump the session's activity time (fire-and-forget, best-effort)."""
         if self._session_store is None:
@@ -419,7 +442,7 @@ class GhidraAgentApp(App[None]):
             self._exit_ask_mode()
         self._session_id = session_id
         self._config["configurable"]["thread_id"] = session_id
-        self._subagent_meta.clear()
+        self._reset_run_bookkeeping()
         self._subagent_reports.clear()
         self.action_clear_log()
         await self._replay_last_reply()

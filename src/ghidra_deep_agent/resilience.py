@@ -84,11 +84,14 @@ _TRANSIENT_MARKERS = (
 # routes the exhausted call to a clean halt (UsageLimitError) instead of a
 # swallowed error turn, so the run stays cleanly resumable. Distinct from a plain
 # network blip (timeout / connection reset / 5xx), which keeps the old behavior.
+# NB: "overloaded" is deliberately absent. It means the *provider* is at capacity
+# (a 529-style blip that clears in seconds), not that we've hit a quota — so it
+# belongs in _TRANSIENT_MARKERS only. Listing it here too escalated a short
+# capacity blip into a full halt once the retries were spent.
 _USAGE_LIMIT_MARKERS = (
     "rate limit",
     "ratelimit",
     "too many requests",
-    "overloaded",
     "quota",
     "usage limit",
     "insufficient_quota",

@@ -22,10 +22,9 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
-from pymongo import MongoClient
 from pymongo.collection import Collection
 
-from ghidra_deep_agent.mongo_util import mongo_write_with_retry
+from ghidra_deep_agent.mongo_util import get_mongo_client, mongo_write_with_retry
 
 _RECENCY_INDEX_NAME = "last_active_at_desc"
 _TITLE_MAX_CHARS = 80
@@ -129,8 +128,7 @@ def build_session_store(mongodb_uri: str, mongodb_db: str) -> SessionStore | Non
     """
     coll_name = os.environ.get("MONGODB_SESSIONS_COLLECTION", "sessions")
     try:
-        client: MongoClient[dict[str, Any]] = MongoClient(mongodb_uri)
-        collection = client[mongodb_db][coll_name]
+        collection = get_mongo_client(mongodb_uri)[mongodb_db][coll_name]
         _ensure_recency_index(collection)
     except Exception as exc:  # pragma: no cover - environmental
         print(f"Warning: session registry disabled ({exc})", file=sys.stderr)

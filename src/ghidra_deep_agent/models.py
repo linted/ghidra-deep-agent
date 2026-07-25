@@ -162,3 +162,21 @@ def build_model(model_string: str) -> BaseChatModel | str:
 
             return ChatOpenRouter(model=model_id, openrouter_provider=prefs)
     return model_string
+
+
+def ensure_chat_model(model: str | BaseChatModel) -> BaseChatModel:
+    """Resolve a model *string* into a real chat model.
+
+    ``build_model`` deliberately returns the string unchanged for every provider
+    it doesn't special-case, leaving resolution to deepagents/``init_chat_model``.
+    That is fine for handing to ``create_deep_agent``, but callers that *use* the
+    model directly need the object: ``.ainvoke`` for the plan/ask context summary
+    and ``.profile`` for the context gauge both silently fail on a bare ``str``.
+    ``compaction.py`` already guards its own call site this way.
+    """
+    if isinstance(model, str):
+        from deepagents._models import resolve_model
+
+        resolved: BaseChatModel = resolve_model(model)
+        return resolved
+    return model

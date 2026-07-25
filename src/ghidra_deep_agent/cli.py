@@ -32,7 +32,8 @@ from ghidra_deep_agent.compaction import (
 from ghidra_deep_agent.ghidra_transport import get_mcp_config
 from ghidra_deep_agent.knowledge import build_knowledge_tools
 from ghidra_deep_agent.mcp_cache import build_mcp_cache_middleware
-from ghidra_deep_agent.models import build_embeddings
+from ghidra_deep_agent.models import build_embeddings, ensure_chat_model
+from ghidra_deep_agent.mongo_util import close_mongo_clients
 from ghidra_deep_agent.program_resolver import resolve_binary_name
 from ghidra_deep_agent.prompt import (
     ASK_MODE_SYSTEM_PROMPT,
@@ -148,12 +149,15 @@ def _build_tools(
     mongodb_db: str,
     embed_string: str,
     binary_name: str,
-) -> list[Any]:
+) -> tuple[list[Any], bool]:
     """Merge the MCP tools with the locally-defined ones.
 
-    Returns the full set, from which per-agent allowlists are then drawn — the
-    coordinator's restricted tool set must not narrow what sub-agents can use.
+    Returns ``(tools, knowledge_ok)``. The full tool set is what per-agent
+    allowlists are then drawn from — the coordinator's restricted tool set must
+    not narrow what sub-agents can use. ``knowledge_ok`` feeds the TUI's `db`
+    health indicator, which otherwise reports healthy unconditionally.
     """
+    knowledge_ok = True
     try:
         embeddings = build_embeddings(embed_string)
         knowledge_tools = build_knowledge_tools(
@@ -163,6 +167,7 @@ def _build_tools(
     except Exception as exc:
         print(f"Warning: knowledge base unavailable ({exc})", file=sys.stderr)
         knowledge_tools = []
+        knowledge_ok = False
 
     # Local `recover_prototypes` tool: drives a Ghidra-side prototype-recovery
     # script through the MCP `scripts` executor. Omitted (with a warning) when the
@@ -175,8 +180,11 @@ def _build_tools(
     # (with a warning) when the server's `scripts` tool is disabled.
     switch_tools = build_switch_tools(mcp_tools)
 
-    return filter_withheld_tools(
-        knowledge_tools + prototype_tools + switch_tools + mcp_tools
+    return (
+        filter_withheld_tools(
+            knowledge_tools + prototype_tools + switch_tools + mcp_tools
+        ),
+        knowledge_ok,
     )
 
 
@@ -315,7 +323,9 @@ async def main() -> None:
     if session_store is not None:
         session_store.record_start(session_id, binary_name)
 
-    all_tools = _build_tools(tools, mongodb_uri, mongodb_db, embed_string, binary_name)
+    all_tools, knowledge_ok = _build_tools(
+        tools, mongodb_uri, mongodb_db, embed_string, binary_name
+    )
     built_model = resolve_model(agent_config.main_model)
     main_model_spec = resolve_model_spec(agent_config.main_model, agent_config)
     main_tools = build_main_tools(all_tools, agent_config)
@@ -365,7 +375,12 @@ async def main() -> None:
             # smaller/cheaper model; unset keeps the prior behavior of summarizing
             # with the main model.
             summary_spec = os.environ.get("SUMMARY_MODEL")
-            summary_model = resolve_model(summary_spec) if summary_spec else built_model
+            # Resolved eagerly: the TUI calls `.ainvoke` on this to summarize prior
+            # context when entering plan/ask mode, and `build_model` hands back a
+            # bare string for any provider it doesn't special-case.
+            summary_model = ensure_chat_model(
+                resolve_model(summary_spec) if summary_spec else built_model
+            )
 
             # Tune the auto-summarizer create_deep_agent wires internally.
             # Sub-agents compact aggressively by default (they never reached
@@ -443,7 +458,10 @@ async def main() -> None:
                 ASK_MODE_SYSTEM_PROMPT, main_tools, ask_mode_subagents
             )
 
-            profile = getattr(built_model, "profile", None) or {}
+            # Probe the *resolved* model: `build_model` returns a bare string for
+            # providers it doesn't special-case, and a string has no `.profile`,
+            # which silently pinned the gauge to the fallback for those models.
+            profile = getattr(ensure_chat_model(built_model), "profile", None) or {}
             ctx_max = profile.get("max_input_tokens") or int(
                 os.environ.get("MAX_CONTEXT_TOKENS", "200000")
             )
@@ -456,8 +474,10 @@ async def main() -> None:
                 config=config,
                 model=main_model_spec,
                 session_id=session_id,
-                mcp_ok=True,
-                db_ok=True,
+                # `_connect_mcp` exits on a failed connection, so reaching here means
+                # the server answered — but it can still answer with zero tools.
+                mcp_ok=bool(tools),
+                db_ok=knowledge_ok,
                 max_context_tokens=ctx_max,
                 session_store=session_store,
                 binary_name=binary_name,
@@ -472,6 +492,10 @@ async def main() -> None:
     finally:
         # Tears down the OpenShell sandbox if one was created; a no-op otherwise.
         await stack.aclose()
+        # The knowledge base, session registry, and read cache share one client
+        # per URI (mongo_util); close it so the connection pool doesn't outlive
+        # the process's useful life. The checkpointer manages its own.
+        close_mongo_clients()
 
     print(f"Session ID: {session_id}")
 

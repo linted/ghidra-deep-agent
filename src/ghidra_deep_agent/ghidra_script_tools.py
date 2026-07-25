@@ -31,11 +31,23 @@ _RAW_TAIL_CHARS = 800
 
 
 def manifest_pattern(mark_start: str, mark_end: str) -> re.Pattern[str]:
-    """Compile the ``MARK_START {json} MARK_END`` pattern a script emits."""
+    """Compile the ``MARK_START {json} MARK_END`` pattern a script emits.
+
+    Non-greedy on purpose: a greedy ``.*`` spans from the *first* start marker to
+    the *last* end marker, so any output carrying two marker pairs — a redeploy
+    that echoes a previous run, or a script that emits twice — captures both
+    payloads plus the markers between them and fails to parse.
+    """
     return re.compile(
-        re.escape(mark_start) + r"\s*(\{.*\})\s*" + re.escape(mark_end),
+        re.escape(mark_start) + r"\s*(\{.*?\})\s*" + re.escape(mark_end),
         re.DOTALL,
     )
+
+
+def find_manifest(pattern: re.Pattern[str], raw: str) -> re.Match[str] | None:
+    """Return the *last* manifest in ``raw`` — the current run's, if several."""
+    matches = list(pattern.finditer(raw))
+    return matches[-1] if matches else None
 
 
 def find_scripts_tools(
@@ -71,6 +83,11 @@ class GhidraScriptRunner:
         self._scripts_tool = scripts_tool
         self._status_tool = status_tool
         self._timeout_s = timeout_s
+        # Resolved output of the most recent deploy. Ghidra compiles the whole
+        # script directory as one OSGi bundle, so a javac error surfaces here —
+        # and only here. Kept so the no-manifest path can show it instead of the
+        # generic "the script may have errored".
+        self._last_deploy_output = ""
 
     async def run(
         self, name: str, source: str, run_args: list[str] | None = None
@@ -89,7 +106,7 @@ class GhidraScriptRunner:
             "overwrite": True,
         }
         create_out = to_text(await self._scripts_tool.ainvoke(create_args))
-        await resolve_async_result(
+        self._last_deploy_output = await resolve_async_result(
             create_out, self._status_tool, timeout_s=self._timeout_s
         )
 
@@ -116,16 +133,27 @@ class GhidraScriptRunner:
         the model, explaining what to check.
         """
         raw = await self.run(name, source, run_args)
-        match = pattern.search(raw)
+        match = find_manifest(pattern, raw)
         if match is None:
             tail = raw[-_RAW_TAIL_CHARS:] if raw else "(empty result)"
+            deploy = self._last_deploy_output.strip()
+            # The deploy step is where a compile error lands, and it is by far the
+            # likeliest reason a run produced no manifest — so show it rather than
+            # leaving the model to guess from the run output alone.
+            deploy_note = (
+                "\nDeploy (compile) output:\n" + deploy[-_RAW_TAIL_CHARS:]
+                if deploy
+                else ""
+            )
             return (
                 None,
                 raw,
                 f"{tool_label}: no JSON manifest found in the script output. "
                 "The `scripts` executor may not return stdout, the `scripts` "
-                "tool may be disabled/misconfigured, or the script errored. "
-                "Raw output tail:\n" + tail,
+                "tool may be disabled/misconfigured, or the script failed to "
+                "compile or errored at runtime. Raw output tail:\n"
+                + tail
+                + deploy_note,
             )
         try:
             payload: dict[str, Any] = json.loads(match.group(1))
