@@ -5,7 +5,7 @@ These knobs are read at startup from ``.env``. A typo used to raise a bare
 neither the variable nor the bad value; a zero or negative value was accepted and
 turned into a busy-poll or a never-backing-off retry loop.
 
-Run:  uv run pytest test_defaults.py -v
+Run:  uv run pytest tests/test_defaults.py -v
 """
 
 from __future__ import annotations

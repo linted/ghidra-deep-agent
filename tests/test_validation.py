@@ -5,7 +5,7 @@ that don't match a dict JSON schema, blocking write actions in a read-only
 context, and never blocking on a malformed schema. Also pins the validator
 cache, since that is what keeps `check_schema` off the per-call path.
 
-Run:  uv run pytest test_validation.py -v
+Run:  uv run pytest tests/test_validation.py -v
 """
 
 from __future__ import annotations

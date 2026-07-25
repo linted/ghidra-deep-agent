@@ -5,7 +5,7 @@ flushes the mutable tier, and no read that was already in flight when a flush
 happened is allowed to write its now-stale result. Both are exercised here
 against a fake collection, so no MongoDB is needed.
 
-Run:  uv run pytest test_mcp_cache.py -v
+Run:  uv run pytest tests/test_mcp_cache.py -v
 """
 
 from __future__ import annotations

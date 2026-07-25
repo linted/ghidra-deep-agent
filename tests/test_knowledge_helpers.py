@@ -4,7 +4,7 @@ The tool bodies need a live MongoDB (see test_knowledge.py); these cover the
 query-shaping logic that does not, so the regex-escaping and result-cap
 behavior is checked on every run.
 
-Run:  uv run pytest test_knowledge_helpers.py -v
+Run:  uv run pytest tests/test_knowledge_helpers.py -v
 """
 
 from __future__ import annotations

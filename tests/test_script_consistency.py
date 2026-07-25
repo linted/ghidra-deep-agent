@@ -11,7 +11,7 @@ Editing one side alone breaks every run of that tool with an unhelpful "no JSON
 manifest found". Unlike ``test_switch_scripts_compile.py`` these need no Ghidra
 and no JDK, so they run everywhere — including CI.
 
-Run:  uv run pytest test_script_consistency.py -v
+Run:  uv run pytest tests/test_script_consistency.py -v
 """
 
 from __future__ import annotations

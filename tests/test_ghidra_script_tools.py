@@ -4,7 +4,7 @@ Covers the deploy/run/parse path that prototype_tools and switch_tools now
 share, including the failure messages the model sees when a script produces no
 usable manifest.
 
-Run:  uv run pytest test_ghidra_script_tools.py -v
+Run:  uv run pytest tests/test_ghidra_script_tools.py -v
 """
 
 from __future__ import annotations

@@ -4,7 +4,7 @@ flag: a read-only sub-agent must (a) drop the write-only tools from its tool set
 and (b) get the write-action-blocking validation middleware, while a normal
 sub-agent gets neither.
 
-Run:  uv run pytest test_subagents.py -v
+Run:  uv run pytest tests/test_subagents.py -v
 """
 
 from __future__ import annotations

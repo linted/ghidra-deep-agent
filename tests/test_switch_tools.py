@@ -6,7 +6,7 @@ the ``apply_switch_override`` argument validation — without a live Ghidra. The
 Java scripts themselves run inside Ghidra and are exercised by the end-to-end
 check in the plan, not here.
 
-Run:  uv run pytest test_switch_tools.py -v
+Run:  uv run pytest tests/test_switch_tools.py -v
 """
 
 from __future__ import annotations

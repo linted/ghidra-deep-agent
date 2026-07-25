@@ -9,7 +9,7 @@ error is turned into a warning toast without killing the turn.
 Uses a dict-backed FakeSandboxBackend (a real BaseSandbox subclass, so the
 middleware's async calls exercise the genuine sync/async delegation). No network.
 
-Run:  uv run pytest test_sandbox_sync.py -v
+Run:  uv run pytest tests/test_sandbox_sync.py -v
 """
 
 from __future__ import annotations
@@ -19,11 +19,9 @@ import hashlib
 import io
 import shlex
 import tarfile
-from collections.abc import Generator
 from pathlib import Path
 from typing import Any, cast
 
-import pytest
 from deepagents.backends.protocol import (
     ExecuteResponse,
     FileDownloadResponse,
@@ -33,16 +31,6 @@ from deepagents.backends.sandbox import BaseSandbox
 
 from ghidra_deep_agent.sandbox_sync import _SEED_TAR_NAME, SandboxSyncMiddleware
 from ghidra_deep_agent.toasts import ToastRequest, register_toast_sink
-
-
-@pytest.fixture(autouse=True)
-def _clear_sinks() -> Generator[None, None, None]:
-    """Toast sinks are module-global; reset between tests to avoid cross-talk."""
-    import ghidra_deep_agent.toasts as toasts
-
-    toasts._sinks.clear()
-    yield
-    toasts._sinks.clear()
 
 
 class FakeSandboxBackend(BaseSandbox):

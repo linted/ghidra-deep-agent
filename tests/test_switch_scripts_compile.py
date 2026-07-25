@@ -6,9 +6,13 @@ Python tests and only surfaces as a "no JSON manifest found" failure in the
 live agent. This test compiles each ``SCRIPT_SOURCE`` with ``javac`` against
 the local Ghidra jars to catch that drift in CI on machines that have Ghidra.
 
-Skips cleanly when Ghidra or a JDK is not installed.
+Marked ``integration``: it needs a local Ghidra install and a JDK, and it skips
+cleanly without them. Left in the default suite it passed *vacuously* on any
+machine (including the CI runner) that has neither — which reads as "the Java is
+checked" when nothing was compiled. The consistency checks that need no Ghidra
+live in ``test_script_consistency.py`` and do run by default.
 
-Run:  uv run pytest test_switch_scripts_compile.py -v
+Run:  uv run pytest -m integration tests/test_switch_scripts_compile.py -v
 """
 
 from __future__ import annotations
@@ -48,6 +52,8 @@ _CLASSPATH_JARS = [
     "Framework/Utility/lib/Utility.jar",
     "Framework/Generic/lib/gson-*.jar",
 ]
+
+pytestmark = pytest.mark.integration
 
 _HOMEBREW_JAVAC = "/opt/homebrew/opt/openjdk@21/bin/javac"
 

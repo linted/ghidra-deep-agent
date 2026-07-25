@@ -5,7 +5,7 @@ deepagents factory must hand sub-agents the aggressive built-in thresholds
 stock defaults, honor the per-scope ``COMPACT_*`` / ``COMPACT_MAIN_*`` env
 knobs, and route summaries to ``summary_model`` when one is given.
 
-Run:  uv run pytest test_compaction.py -v
+Run:  uv run pytest tests/test_compaction.py -v
 """
 
 from __future__ import annotations
