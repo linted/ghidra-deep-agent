@@ -103,6 +103,20 @@ public class OllvmDeobfuscator extends GhidraScript {
         dryRun = resolveDryRun();
         force = hasArg("force", "--force");
 
+        // Every pattern below is AArch64: the dispatch detector keys on `csel`,
+        // address recovery assumes adrp/add pairs, register decoding assumes the
+        // x/w register file, and the opaque-predicate offsets were derived from
+        // one AArch64 binary. On another architecture the scan would not simply
+        // find nothing — it could misread instructions and patch real branches —
+        // so refuse rather than silently mis-analyze.
+        String processor = currentProgram.getLanguage().getProcessor().toString();
+        if (!"AARCH64".equalsIgnoreCase(processor) && !"ARM".equalsIgnoreCase(processor)) {
+            println("Unsupported architecture: " + processor
+                    + ". This pass recognizes AArch64 OLLVM control-flow flattening only.");
+            emitUnsupported(processor);
+            return;
+        }
+
         Function func = resolveTargetFunction();
         if (func == null) {
             println("No target function. Pass a function name or address as a script "
@@ -149,7 +163,7 @@ public class OllvmDeobfuscator extends GhidraScript {
         println("--- Phase 2: Analyzing case blocks ---");
         Map<Long, BlockTransition> transitions = new LinkedHashMap<>();
         for (DispatchSite ds : sites) {
-            analyzeBlocks(ds, func, transitions);
+            analyzeBlocks(ds, transitions);
         }
         for (Map.Entry<Long, BlockTransition> e : transitions.entrySet()) {
             BlockTransition bt = e.getValue();
@@ -204,6 +218,15 @@ public class OllvmDeobfuscator extends GhidraScript {
         sb.append("}");
         println(MANIFEST_START);
         println(sb.toString());
+        println(MANIFEST_END);
+    }
+
+    // Separate from emitManifest so the caller can name the architecture it
+    // refused, which is the one thing the model needs to stop retrying.
+    private void emitUnsupported(String processor) {
+        println(MANIFEST_START);
+        println("{\"status\":\"unsupported_arch\",\"processor\":\""
+                + jsonEsc(processor) + "\"}");
         println(MANIFEST_END);
     }
 
@@ -296,7 +319,6 @@ public class OllvmDeobfuscator extends GhidraScript {
         long brAddr;
         long tableAddr;
         int  tableReg;
-        int  indexReg;
         int  maxIndex   = -1;
         int  clampIndex = -1;
         long[] caseTargets;
@@ -353,7 +375,6 @@ public class OllvmDeobfuscator extends GhidraScript {
         DispatchSite ds = new DispatchSite();
         ds.brAddr   = brInst.getAddress().getOffset();
         ds.tableReg = tableReg;
-        ds.indexReg = brReg;
 
         // Find CMP and CSEL before the LDR
         cur = ldrInst.getPrevious();
@@ -440,14 +461,14 @@ public class OllvmDeobfuscator extends GhidraScript {
     // Phase 2: Analyze case blocks
     //=========================================================================
 
-    private void analyzeBlocks(DispatchSite ds, Function func,
+    private void analyzeBlocks(DispatchSite ds,
                                Map<Long, BlockTransition> out) throws Exception {
         Set<Long> done = new HashSet<>();
         for (int ci = 0; ci < ds.caseTargets.length; ci++) {
             long blockAddr = ds.caseTargets[ci];
             if (done.contains(blockAddr)) continue;
             done.add(blockAddr);
-            BlockTransition bt = scanBlock(blockAddr, ds, func);
+            BlockTransition bt = scanBlock(blockAddr, ds);
             if (bt != null) {
                 out.put(blockAddr, bt);
             } else {
@@ -456,7 +477,7 @@ public class OllvmDeobfuscator extends GhidraScript {
         }
     }
 
-    private BlockTransition scanBlock(long start, DispatchSite ds, Function func) throws Exception {
+    private BlockTransition scanBlock(long start, DispatchSite ds) throws Exception {
         Instruction inst = listing.getInstructionAt(toAddr(start));
         if (inst == null) inst = listing.getInstructionAfter(toAddr(start));
         if (inst == null) {

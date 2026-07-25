@@ -179,6 +179,13 @@ def _format_ollvm_summary(payload: dict[str, Any], report: str) -> str:
     fn = payload.get("function")
     entry = payload.get("entry")
     where = f"{fn} @ {entry}" if fn else f"@ {entry or '?'}"
+    if status == "unsupported_arch":
+        return (
+            "deobfuscate_cff: this pass supports AArch64 only, and the open "
+            f"program is {payload.get('processor', 'a different architecture')}. "
+            "Nothing was analyzed or patched — recover the flattened control flow "
+            "by hand instead of retrying."
+        )
     if status == "no_function":
         return (
             "deobfuscate_cff: no target function resolved from that argument. "
@@ -362,7 +369,11 @@ def build_switch_tools(mcp_tools: list[BaseTool]) -> list[BaseTool]:
         force: bool = False,
     ) -> str:
         """Deobfuscate ONE OLLVM control-flow-flattened (CFF) function by rewriting
-        its dispatcher into direct branches.
+        its dispatcher into direct branches. **AArch64 (ARM64) binaries only.**
+
+        The dispatch detection, address recovery, and opaque-predicate folding are
+        all AArch64-specific. On any other architecture the tool refuses and does
+        nothing — do not retry it there; recover the flattened flow by hand.
 
         Use this for the *other* kind of unrecovered indirect jump: an OLLVM CFF
         *dispatcher* (`br` on a state index loaded from a jump table) that
