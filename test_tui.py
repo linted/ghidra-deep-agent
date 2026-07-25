@@ -251,6 +251,58 @@ def test_subagent_inner_tools_stay_visible() -> None:
     asyncio.run(run())
 
 
+def test_nested_subagents_nest_under_the_nearest_ancestor() -> None:
+    """`_find_parent` must pick the longest *proper* namespace prefix.
+
+    A tool two sub-agents deep belongs under the inner sub-agent, not the
+    outer one and not the root.
+    """
+
+    async def run() -> None:
+        app = _make_app()
+        async with app.run_test() as pilot:
+            activity = app.query_one(ActivityTree)
+            response = app.query_one(ResponseLog)
+            thinking = app.query_one(ThinkingPanel)
+
+            def emit(event: dict[str, Any]) -> None:
+                handle_event(app, event, activity, response, thinking)
+
+            for run_id, ns in (("outer", "tools:a"), ("inner", "tools:a|tools:b")):
+                emit(
+                    {
+                        "event": "on_tool_start",
+                        "run_id": run_id,
+                        "name": "task",
+                        "metadata": {"langgraph_checkpoint_ns": ns},
+                        "parent_ids": [],
+                        "data": {"input": {"description": run_id}},
+                    }
+                )
+            emit(
+                {
+                    "event": "on_tool_start",
+                    "run_id": "leaf",
+                    "name": "get_code",
+                    "metadata": {"langgraph_checkpoint_ns": "tools:a|tools:b|tools:c"},
+                    "parent_ids": ["inner"],
+                    "data": {"input": {"address": "0x1000"}},
+                }
+            )
+            await pilot.pause()
+
+            outer_node = activity._run_map["outer"][0]
+            inner_node = activity._run_map["inner"][0]
+            leaf_node = activity._run_map["leaf"][0]
+            assert inner_node.parent is outer_node
+            assert leaf_node.parent is inner_node
+
+            # An unrelated namespace has no registered ancestor -> root.
+            assert activity._find_parent("tools:zzz") is activity.root
+
+    asyncio.run(run())
+
+
 class _FakeToolMessage:
     def __init__(self, content: Any) -> None:
         self.content = content
