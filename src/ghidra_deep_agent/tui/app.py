@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from langchain_core.language_models import BaseChatModel
 from rich.rule import Rule
 from textual import work
 from textual.app import App, ComposeResult
@@ -30,6 +31,7 @@ from ghidra_deep_agent.prompt import (
 from ghidra_deep_agent.resilience import UsageLimitError
 from ghidra_deep_agent.sessions import SessionStore
 from ghidra_deep_agent.toasts import ToastRequest, notify_toast, register_toast_sink
+from ghidra_deep_agent.tui.commands import COMMANDS_BY_NAME
 from ghidra_deep_agent.tui.events import handle_event
 from ghidra_deep_agent.tui.formatting import extract_text
 from ghidra_deep_agent.tui.help_screen import HelpScreen
@@ -43,7 +45,9 @@ from ghidra_deep_agent.tui.messages import (
     ToolCountChanged,
 )
 from ghidra_deep_agent.tui.report_screen import SubagentReportScreen
+from ghidra_deep_agent.tui.run_state import RunState
 from ghidra_deep_agent.tui.session_select import SessionSelectScreen
+from ghidra_deep_agent.tui.side_mode import Kind, SideMode
 from ghidra_deep_agent.tui.widgets import (
     PLACEHOLDER_BUSY,
     PLACEHOLDER_IDLE,
@@ -119,7 +123,7 @@ class GhidraAgentApp(App[None]):
         config: dict[str, Any],
         plan_agent: Any = None,
         ask_agent: Any = None,
-        summary_model: Any = None,
+        summary_model: BaseChatModel | None = None,
         model: str = "",
         session_id: str = "",
         mcp_ok: bool = True,
@@ -133,42 +137,21 @@ class GhidraAgentApp(App[None]):
         self._plan_agent = plan_agent
         self._ask_agent = ask_agent
         self._summary_model = summary_model
-        self._plan_mode = False
-        self._plan_path: str | None = None
-        # Ephemeral planning-thread config, minted per `/plan`, cleared on
-        # approve/cancel. Keeps planning off the main thread.
-        self._plan_config: dict[str, Any] | None = None
-        # Set on fresh plan-mode entry; the first planning turn seeds the marked
-        # background summary and clears it (revisions don't re-seed).
-        self._plan_needs_seed = False
-        # Ask mode mirrors plan mode's ephemeral-thread machinery (minus the
-        # plan-file/approve step): a read-only Q&A coordinator on its own thread.
-        # `/plan` and `/ask` are mutually exclusive.
-        self._ask_mode = False
-        self._ask_config: dict[str, Any] | None = None
-        self._ask_needs_seed = False
-        # The last top-level assistant reply text, captured synchronously from
-        # the stream loop (see events.py). During plan mode this is the full plan
-        # markdown the planner echoed; `_last_plan_text` snapshots it per turn so
-        # `/approve` never depends on reading the plan file back from disk/state.
-        self._last_reply_text = ""
+        # The active read-only side mode (`/plan` or `/ask`), or None for normal
+        # operation. One object rather than two parallel sets of flags, so "both
+        # modes on" and "mode on with no thread" are unrepresentable.
+        self._side: SideMode | None = None
+        # Per-turn tool bookkeeping, owned by events.py. Replaced wholesale at the
+        # start of each run so a cancelled turn can't leak its in-flight run_ids
+        # into the next one — see RunState's docstring.
+        self.run_state = RunState()
+        # During plan mode the reply is the full plan markdown the planner echoed;
+        # this snapshots it per turn so `/approve` never depends on reading the
+        # plan file back from disk/state.
         self._last_plan_text: str | None = None
-        # Async-task middleware bookkeeping (see tui/events.py): run_ids of hidden
-        # `get_task_status` polls, and task_id -> run_id for async tool calls whose
-        # "completed" marker is deferred until ASYNC_DONE_EVENT arrives.
-        self._hidden_tool_runs: set[str] = set()
-        self._pending_async: dict[str, str] = {}
-        # Sub-agent (`task`) run bookkeeping: run_id -> (description, start time)
-        # while in flight, and the completed runs' final reports for the ctrl+o
-        # viewer (what each sub-agent returned to the main agent).
-        self._subagent_meta: dict[str, tuple[str, float]] = {}
+        # Completed sub-agent reports for the ctrl+o viewer (what each sub-agent
+        # returned to the main agent). Spans turns, so not part of RunState.
         self._subagent_reports: list[SubagentReport] = []
-        # Plain (non-subagent) tool runs currently in flight. A tool call whose
-        # parent_ids chain contains one of these was made from *inside* another
-        # tool (e.g. recover_prototypes invoking `scripts` directly) and is
-        # hidden — it's the composite tool's implementation detail, not the
-        # agent's work.
-        self._active_tool_runs: set[str] = set()
         self._output_dir = os.environ.get("AGENT_OUTPUT_DIR", "")
         self._config = config
         self._model = model
@@ -285,10 +268,23 @@ class GhidraAgentApp(App[None]):
             return False
         return True
 
+    def _reset_run_bookkeeping(self) -> None:
+        """Start the next turn from a clean slate.
+
+        A run cancelled with Escape (or aborted by an exception) never delivers
+        ``on_tool_end`` for whatever was in flight, so its run_ids would otherwise
+        persist and the status bar's active-tool count would never return to zero.
+        ``ActivityTree.reset()`` clears the tree's own map; this is the app-side
+        half of the same bookkeeping.
+        """
+        self.run_state = RunState()
+        self.query_one(StatusBar).active_tools = 0
+
     def _start_run(self, display: str, agent_input: str) -> None:
         self._set_busy(True)
         self.query_one(ResponseLog).log_user(display)
         self.query_one(ActivityTree).reset()
+        self._reset_run_bookkeeping()
         self._touch_session(display)
         self._agent_worker = self._run_agent(agent_input)
 
@@ -306,10 +302,16 @@ class GhidraAgentApp(App[None]):
         response = self.query_one(ResponseLog)
         response.write("[dim]↻ Continuing from the last checkpoint…[/dim]")
         self.query_one(ActivityTree).reset()
+        self._reset_run_bookkeeping()
         self._touch_session("/continue")
         self._agent_worker = self._run_agent(None)
 
-    @work(exclusive=False)
+    # Own worker group: `_run_agent` is `exclusive=True`, and Textual cancels every
+    # worker sharing the *group* of an exclusive worker on the same node. Both used
+    # to default to "default", so starting a run killed the touch worker launched one
+    # line earlier — before its first await — and no session ever got a title or a
+    # refreshed `last_active_at`.
+    @work(exclusive=False, group="session")
     async def _touch_session(self, prompt: str) -> None:
         """Bump the session's activity time (fire-and-forget, best-effort)."""
         if self._session_store is None:
@@ -321,70 +323,66 @@ class GhidraAgentApp(App[None]):
             # failing, `/resume` will quietly not list this session.
             self._warn_once("touch_session", f"Session not recorded for /resume: {exc}")
 
+    def _slash_handlers(self) -> dict[str, Callable[[str], None]]:
+        """Command name -> handler, taking whatever followed the command."""
+        return {
+            "/clear": self._cmd_clear,
+            "/yank": lambda _arg: self.action_yank(),
+            "/quit": lambda _arg: self.exit(),
+            "/compact": self._cmd_compact,
+            "/resume": self._cmd_resume,
+            # A side mode always carries its own thread, so `/continue` inside one
+            # resumes that thread rather than the main session's.
+            "/continue": lambda _arg: self._resume_run(),
+            "/plan": lambda arg: self._enter_side_mode("plan", arg),
+            "/approve": lambda _arg: self._approve_plan(),
+            "/plan-cancel": lambda _arg: self._cmd_cancel_side("plan"),
+            "/ask": lambda arg: self._enter_side_mode("ask", arg),
+            "/ask-cancel": lambda _arg: self._cmd_cancel_side("ask"),
+            "/help": lambda _arg: self.action_help(),
+        }
+
+    def _cmd_resume(self, _arg: str) -> None:
+        # `_open_resume_picker` is a @work method; discard the Worker it returns.
+        self._open_resume_picker()
+
+    def _cmd_clear(self, _arg: str) -> None:
+        self.action_clear_log()
+        self.query_one(StatusBar).flash("[green]Cleared.[/green]")
+
+    def _cmd_compact(self, _arg: str) -> None:
+        self._start_run(
+            "/compact",
+            "Call the `compact_conversation` tool now to compact the "
+            "conversation history.",
+        )
+
+    def _cmd_cancel_side(self, kind: Kind) -> None:
+        bar = self.query_one(StatusBar)
+        if self._side is None or self._side.kind != kind:
+            bar.flash(f"[yellow]Not in {kind} mode.[/yellow]")
+            return
+        color = "magenta" if kind == "plan" else "cyan"
+        self._exit_side_mode()
+        bar.flash(f"[{color}]{self._side_label(kind)} mode cancelled.[/{color}]")
+
+    @staticmethod
+    def _side_label(kind: Kind) -> str:
+        return "Plan" if kind == "plan" else "Ask"
+
     def _dispatch_slash(self, command: str) -> None:
         cmd = command.split()[0].lower()
         bar = self.query_one(StatusBar)
-        if cmd == "/clear":
-            self.action_clear_log()
-            bar.flash("[green]Cleared.[/green]")
-        elif cmd == "/yank":
-            self.action_yank()
-        elif cmd == "/quit":
-            self.exit()
-        elif cmd == "/compact":
-            if not self._require_idle(bar):
-                return
-            self._start_run(
-                "/compact",
-                "Call the `compact_conversation` tool now to compact the "
-                "conversation history.",
-            )
-        elif cmd == "/resume":
-            if not self._require_idle(bar):
-                return
-            self._open_resume_picker()
-        elif cmd == "/continue":
-            if not self._require_idle(bar):
-                return
-            # In a side-mode, resume that mode's ephemeral thread. Guard against
-            # a mode flag set with no thread minted (nothing to replay).
-            if self._plan_mode and self._plan_config is None:
-                bar.flash("[yellow]Nothing to resume in plan mode.[/yellow]")
-                return
-            if self._ask_mode and self._ask_config is None:
-                bar.flash("[yellow]Nothing to resume in ask mode.[/yellow]")
-                return
-            self._resume_run()
-        elif cmd == "/plan":
-            if not self._require_idle(bar):
-                return
-            goal = command[len(cmd) :].strip()
-            self._enter_plan_mode(goal)
-        elif cmd == "/approve":
-            if not self._require_idle(bar):
-                return
-            self._approve_plan()
-        elif cmd == "/plan-cancel":
-            if not self._plan_mode:
-                bar.flash("[yellow]Not in plan mode.[/yellow]")
-                return
-            self._exit_plan_mode()
-            bar.flash("[magenta]Plan mode cancelled.[/magenta]")
-        elif cmd == "/ask":
-            if not self._require_idle(bar):
-                return
-            question = command[len(cmd) :].strip()
-            self._enter_ask_mode(question)
-        elif cmd == "/ask-cancel":
-            if not self._ask_mode:
-                bar.flash("[yellow]Not in ask mode.[/yellow]")
-                return
-            self._exit_ask_mode()
-            bar.flash("[cyan]Ask mode cancelled.[/cyan]")
-        elif cmd == "/help":
-            self.action_help()
-        else:
+        spec = COMMANDS_BY_NAME.get(cmd)
+        if spec is None:
             bar.flash(f"[red]Unknown command: {cmd}[/red]")
+            return
+        # One busy guard for every run-starting command, driven by the table —
+        # previously copy-pasted into each branch, where a new command could
+        # silently omit it.
+        if spec.needs_idle and not self._require_idle(bar):
+            return
+        self._slash_handlers()[cmd](command[len(cmd) :].strip())
 
     @work(exclusive=False)
     async def _open_resume_picker(self) -> None:
@@ -408,18 +406,14 @@ class GhidraAgentApp(App[None]):
             await self._switch_session(chosen)
 
     async def _switch_session(self, session_id: str) -> None:
-        plan_was_active = self._plan_mode
-        ask_was_active = self._ask_mode
-        if plan_was_active:
-            # The planning thread was seeded from the old main session; drop it
-            # rather than carry it across a session switch.
-            self._exit_plan_mode()
-        if ask_was_active:
-            # Same rationale for the ephemeral ask thread.
-            self._exit_ask_mode()
+        # A side mode's thread was seeded from the *old* main session, so drop it
+        # rather than carry it across the switch.
+        was_active = self._side
+        if was_active is not None:
+            self._exit_side_mode()
         self._session_id = session_id
         self._config["configurable"]["thread_id"] = session_id
-        self._subagent_meta.clear()
+        self._reset_run_bookkeeping()
         self._subagent_reports.clear()
         self.action_clear_log()
         await self._replay_last_reply()
@@ -427,10 +421,9 @@ class GhidraAgentApp(App[None]):
         if self._session_store is not None:
             await self._session_store.arecord_start(session_id, self._binary_name)
         msg = f"[green]Resumed session {session_id[:8]}.[/green]"
-        if plan_was_active:
-            msg += " [magenta]Plan mode cancelled.[/magenta]"
-        if ask_was_active:
-            msg += " [cyan]Ask mode cancelled.[/cyan]"
+        if was_active is not None:
+            color = "magenta" if was_active.is_plan else "cyan"
+            msg += f" [{color}]{was_active.label} mode cancelled.[/{color}]"
         self.query_one(StatusBar).flash(msg)
 
     async def _replay_last_reply(self) -> None:
@@ -483,73 +476,50 @@ class GhidraAgentApp(App[None]):
         else:
             bar.flash(hint)
 
-    # -- plan mode -----------------------------------------------------------
-
-    def _set_plan_mode(self, on: bool) -> None:
-        """Flip plan mode and mirror it onto the status bar indicator."""
-        self._plan_mode = on
-        self.query_one(StatusBar).plan_mode = on
-
-    def _exit_plan_mode(self) -> None:
-        """Leave plan mode and drop the ephemeral planning thread + file."""
-        self._set_plan_mode(False)
-        self._plan_path = None
-        self._plan_config = None
-        self._plan_needs_seed = False
-        self._last_plan_text = None
-
-    def _enter_plan_mode(self, goal: str) -> None:
-        """Enter plan mode, minting a fresh timestamped plan file + thread."""
+    def _sync_mode_indicators(self) -> None:
+        """Mirror the active side mode onto the status bar's two indicators."""
         bar = self.query_one(StatusBar)
-        # `/plan` and `/ask` are mutually exclusive — leave ask mode first.
-        if self._ask_mode:
-            self._exit_ask_mode()
-        stamp = self._new_side_stamp(
-            active=self._plan_mode, has_thread=self._plan_path is not None
-        )
-        if stamp is not None:
-            self._plan_path = f"plans/{stamp}-{_slug(goal)}.md"
-            self._plan_config = self._side_thread_config("plan", stamp)
-            self._plan_needs_seed = True
-        self._set_plan_mode(True)
-        self._start_or_hint(
-            bar,
-            goal,
-            "/plan ",
-            "[magenta]Plan mode ON — describe what to plan.[/magenta]",
-        )
+        bar.plan_mode = self._side is not None and self._side.is_plan
+        bar.ask_mode = self._side is not None and self._side.is_ask
 
-    # -- ask mode ------------------------------------------------------------
+    def _exit_side_mode(self) -> None:
+        """Leave whichever side mode is active, dropping its ephemeral thread."""
+        self._side = None
+        self._last_plan_text = None
+        self._sync_mode_indicators()
 
-    def _set_ask_mode(self, on: bool) -> None:
-        """Flip ask mode and mirror it onto the status bar indicator."""
-        self._ask_mode = on
-        self.query_one(StatusBar).ask_mode = on
+    def _enter_side_mode(self, kind: Kind, text: str) -> None:
+        """Enter (or continue) a side mode, minting its thread on fresh entry.
 
-    def _exit_ask_mode(self) -> None:
-        """Leave ask mode and drop the ephemeral ask thread."""
-        self._set_ask_mode(False)
-        self._ask_config = None
-        self._ask_needs_seed = False
-
-    def _enter_ask_mode(self, question: str) -> None:
-        """Enter ask mode, minting a fresh ephemeral Q&A thread.
-
-        `/plan` is left first — the two side-modes are mutually exclusive.
+        Entering the mode already active keeps its thread — follow-ups continue
+        the same conversation and don't re-seed. Entering the *other* mode
+        replaces it: the two are mutually exclusive.
         """
         bar = self.query_one(StatusBar)
-        if self._plan_mode:
-            self._exit_plan_mode()
+        current = self._side if self._side and self._side.kind == kind else None
         stamp = self._new_side_stamp(
-            active=self._ask_mode, has_thread=self._ask_config is not None
+            active=current is not None, has_thread=current is not None
         )
         if stamp is not None:
-            self._ask_config = self._side_thread_config("ask", stamp)
-            self._ask_needs_seed = True
-        self._set_ask_mode(True)
-        self._start_or_hint(
-            bar, question, "/ask ", "[cyan]Ask mode ON — ask a question.[/cyan]"
-        )
+            self._side = SideMode(
+                kind=kind,
+                config=self._side_thread_config(kind, stamp),
+                plan_path=(
+                    f"plans/{stamp}-{_slug(text)}.md" if kind == "plan" else None
+                ),
+            )
+        self._sync_mode_indicators()
+        if kind == "plan":
+            self._start_or_hint(
+                bar,
+                text,
+                "/plan ",
+                "[magenta]Plan mode ON — describe what to plan.[/magenta]",
+            )
+        else:
+            self._start_or_hint(
+                bar, text, "/ask ", "[cyan]Ask mode ON — ask a question.[/cyan]"
+            )
 
     async def _build_marked_prior_context(self) -> str | None:
         """Summarize the main session so far into a marked background block.
@@ -598,19 +568,18 @@ class GhidraAgentApp(App[None]):
         inherits any planner-authored messages.
         """
         bar = self.query_one(StatusBar)
-        if not self._plan_mode:
+        side = self._side
+        if side is None or not side.is_plan:
             bar.flash("[yellow]Not in plan mode — nothing to approve.[/yellow]")
             return
-        plan_path = self._plan_path
+        plan_path = side.plan_path
         plan_text = self._last_plan_text or (
-            self._read_plan_text(plan_path, self._plan_config)
-            if plan_path and self._plan_config is not None
-            else None
+            self._read_plan_text(plan_path, side.config) if plan_path else None
         )
         if not plan_text:
             bar.flash("[yellow]No plan to approve yet — write a plan first.[/yellow]")
             return
-        self._exit_plan_mode()
+        self._exit_side_mode()
         self._start_run(
             "/approve",
             APPROVED_PLAN_INSTRUCTION.format(plan_path=plan_path, plan_text=plan_text),
@@ -735,26 +704,14 @@ class GhidraAgentApp(App[None]):
         # of this turn so a later mode flip can't change which thread we stream to.
         # `/plan` and `/ask` are mutually exclusive side-modes, each on its own
         # ephemeral thread; otherwise the normal agent on the main thread.
-        plan_run = self._plan_mode
-        ask_run = self._ask_mode
-        plan_path = self._plan_path
-        if plan_run:
-            agent, config = self._plan_agent, self._plan_config
-        elif ask_run:
-            agent, config = self._ask_agent, self._ask_config
-        else:
+        side = self._side
+        if side is None:
             agent, config = self._agent, self._config
+        elif side.is_plan:
+            agent, config = self._plan_agent, side.config
+        else:
+            agent, config = self._ask_agent, side.config
         response = self.query_one(ResponseLog)
-        if (plan_run or ask_run) and config is None:
-            # Programming error: a side-mode is on but no thread was minted. Never
-            # fall back to the main config (that reintroduces the bug we fixed).
-            mode = "Plan" if plan_run else "Ask"
-            self.query_one(StatusBar).flash(
-                f"[red]{mode} mode has no thread — aborting run.[/red]"
-            )
-            self._set_busy(False)
-            self.query_one("#query", Input).focus()
-            return
 
         input_data: dict[str, Any] | None
         if query is None:
@@ -766,25 +723,13 @@ class GhidraAgentApp(App[None]):
             messages: list[dict[str, str]] = []
             # On the first turn of a side-mode, seed its fresh thread with a
             # marked summary of the main session so far (background, not work).
-            if (plan_run and self._plan_needs_seed) or (
-                ask_run and self._ask_needs_seed
-            ):
-                self._plan_needs_seed = False
-                self._ask_needs_seed = False
+            if side is not None and side.needs_seed:
+                side.needs_seed = False
                 background = await self._build_marked_prior_context()
                 if background:
                     messages.append({"role": "user", "content": background})
-            if plan_run and plan_path:
-                query = (
-                    f"[Plan mode — write/maintain the complete plan at "
-                    f"`{plan_path}`]\n\n{query}"
-                )
-            elif ask_run:
-                query = (
-                    "[Ask mode — decompose the question(s), delegate investigation "
-                    "to the research sub-agent, and synthesize a grounded, cited "
-                    f"answer]\n\n{query}"
-                )
+            if side is not None:
+                query = side.decorate(query)
             messages.append({"role": "user", "content": query})
             input_data = {"messages": messages}
 
@@ -793,17 +738,17 @@ class GhidraAgentApp(App[None]):
         thinking.reset()
         # Reset before streaming so a turn that produces no top-level reply can't
         # reuse a stale capture (see events.py for where this gets set).
-        self._last_reply_text = ""
+        self.run_state.last_reply_text = ""
         try:
             async for event in agent.astream_events(
                 input_data, config=config, version="v2"
             ):
                 handle_event(self, event, activity, response, thinking)
-            if plan_run and plan_path:
+            if side is not None and side.is_plan and side.plan_path:
                 # The streamed reply is the source of truth for the plan; the
                 # disk/state read is only a fallback. Snapshot it for `/approve`.
-                plan_text = self._last_reply_text or self._read_plan_text(
-                    plan_path, config
+                plan_text = self.run_state.last_reply_text or self._read_plan_text(
+                    side.plan_path, config
                 )
                 self._last_plan_text = plan_text
                 if plan_text:
@@ -819,10 +764,10 @@ class GhidraAgentApp(App[None]):
                 "[bold yellow]⏸ Usage limit reached — run paused and safely "
                 "checkpointed.[/bold yellow]"
             )
-            if plan_run or ask_run:
+            if side is not None:
                 # A side-mode run lives on an ephemeral thread that is not
                 # restorable across launches, so resume must happen in-session.
-                mode = "plan" if plan_run else "ask"
+                mode = side.kind
                 response.write(
                     f"This {mode}-mode run is checkpointed. When your limit "
                     "resets, type [b]/continue[/b] to pick up where it left off "

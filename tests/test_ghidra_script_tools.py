@@ -4,7 +4,7 @@ Covers the deploy/run/parse path that prototype_tools and switch_tools now
 share, including the failure messages the model sees when a script produces no
 usable manifest.
 
-Run:  uv run pytest test_ghidra_script_tools.py -v
+Run:  uv run pytest tests/test_ghidra_script_tools.py -v
 """
 
 from __future__ import annotations
@@ -30,12 +30,13 @@ class FakeScriptsTool:
 
     def __init__(self, run_output: str) -> None:
         self.run_output = run_output
+        self.create_output = "created"
         self.calls: list[dict[str, Any]] = []
 
     async def ainvoke(self, args: dict[str, Any]) -> str:
         self.calls.append(args)
         if args["action"] == "create":
-            return "created"
+            return self.create_output
         return self.run_output
 
 
@@ -156,6 +157,41 @@ def test_malformed_json_is_reported() -> None:
 
     assert payload is None
     assert error.startswith("my_tool: could not parse manifest JSON")
+
+
+def test_two_marker_pairs_take_the_last_manifest() -> None:
+    """A greedy pattern spans both pairs and yields unparseable JSON.
+
+    Output can carry more than one manifest — a redeploy that echoes the previous
+    run, or a script that emits twice. The current run's is the last one.
+    """
+    runner, _ = _runner(_manifest('{"run": 1}') + "\n" + _manifest('{"run": 2}'))
+
+    payload, _raw, error = asyncio.run(
+        runner.run_manifest("x.java", "src", PATTERN, "my_tool")
+    )
+
+    assert error == ""
+    assert payload == {"run": 2}
+
+
+def test_missing_manifest_surfaces_the_deploy_output() -> None:
+    """A javac error lands in the deploy step and nowhere else.
+
+    Ghidra compiles the script directory as one OSGi bundle, so a compile failure
+    is by far the likeliest reason a run produced no manifest — the model can't
+    act on it unless it is shown.
+    """
+    scripts = FakeScriptsTool("no manifest here")
+    scripts.create_output = "error: cannot find symbol\n  symbol: class Addr"
+    runner = GhidraScriptRunner(cast(Any, scripts), None)
+
+    _payload, _raw, error = asyncio.run(
+        runner.run_manifest("x.java", "src", PATTERN, "my_tool")
+    )
+
+    assert "Deploy (compile) output:" in error
+    assert "cannot find symbol" in error
 
 
 def test_raw_tail_is_bounded() -> None:

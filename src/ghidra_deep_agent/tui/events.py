@@ -27,6 +27,7 @@ from ghidra_deep_agent.tui.messages import (
     ToolEnded,
     ToolStarted,
 )
+from ghidra_deep_agent.tui.run_state import RunState
 
 if TYPE_CHECKING:
     from ghidra_deep_agent.tui.app import GhidraAgentApp
@@ -50,7 +51,15 @@ def handle_event(
     activity: ActivityTree,
     response: ResponseLog,
     thinking: ThinkingPanel,
+    run: RunState | None = None,
 ) -> None:
+    """Translate one stream event into Textual messages.
+
+    ``run`` carries the cross-event bookkeeping for the current turn; it defaults
+    to the app's current state, which is what every caller outside tests wants.
+    """
+    if run is None:
+        run = app.run_state
     kind = event.get("event", "")
     run_id: str = event.get("run_id", "")
     metadata: dict[str, Any] = event.get("metadata", {})
@@ -63,7 +72,7 @@ def handle_event(
         # polls surface as tool runs but aren't the agent's work, so hide them
         # (tracking the run_id keeps the paired on_tool_end + counter balanced).
         if name == "get_task_status":
-            app._hidden_tool_runs.add(run_id)
+            run.hidden_tool_runs.add(run_id)
             return
         # A tool call whose ancestry contains a plain tool run was made from
         # inside that tool's body (e.g. recover_prototypes invoking `scripts`
@@ -74,34 +83,34 @@ def handle_event(
         # nested calls stay hidden.
         parent_ids = event.get("parent_ids") or []
         if any(
-            pid in app._active_tool_runs or pid in app._hidden_tool_runs
+            pid in run.active_tool_runs or pid in run.hidden_tool_runs
             for pid in parent_ids
         ):
-            app._hidden_tool_runs.add(run_id)
+            run.hidden_tool_runs.add(run_id)
             return
         raw_input = event.get("data", {}).get("input", {})
         preview = extract_preview(raw_input)
         is_subagent = name == "task"
         if not is_subagent:
-            app._active_tool_runs.add(run_id)
+            run.active_tool_runs.add(run_id)
         else:
             description = (
                 raw_input.get("description") if isinstance(raw_input, dict) else None
             )
-            app._subagent_meta[run_id] = (description or preview, time.monotonic())
+            run.subagent_meta[run_id] = (description or preview, time.monotonic())
         activity.post_message(
             ToolStarted(run_id, name, preview, is_subagent, checkpoint_ns)
         )
         app.post_message(ToolCountChanged(1))
 
     elif kind == "on_tool_end":
-        app._active_tool_runs.discard(run_id)
-        if run_id in app._hidden_tool_runs:
-            app._hidden_tool_runs.discard(run_id)
+        run.active_tool_runs.discard(run_id)
+        if run_id in run.hidden_tool_runs:
+            run.hidden_tool_runs.discard(run_id)
             return
         output = event.get("data", {}).get("output")
         error = bool(event.get("data", {}).get("error"))
-        meta = app._subagent_meta.pop(run_id, None)
+        meta = run.subagent_meta.pop(run_id, None)
         if meta is not None:
             # `task` is a local tool that can never return an async submission
             # stub, so skip stub detection: its Command's str() contains the
@@ -128,7 +137,7 @@ def handle_event(
         # remember the node by task_id and complete it on ASYNC_DONE_EVENT.
         task_id = async_task_id(output) if not error else None
         if task_id is not None:
-            app._pending_async[task_id] = run_id
+            run.pending_async[task_id] = run_id
             return
         snippet = extract_output_snippet(output) if error else ""
         activity.post_message(ToolEnded(run_id, error, snippet))
@@ -136,9 +145,9 @@ def handle_event(
 
     elif kind == "on_custom_event" and event.get("name") == ASYNC_DONE_EVENT:
         task_id = event.get("data", {}).get("task_id")
-        run = app._pending_async.pop(task_id, None) if task_id else None
-        if run is not None:
-            activity.post_message(ToolEnded(run))
+        done_run_id = run.pending_async.pop(task_id, None) if task_id else None
+        if done_run_id is not None:
+            activity.post_message(ToolEnded(done_run_id))
             app.post_message(ToolCountChanged(-1))
 
     elif kind == "on_chat_model_start":
@@ -166,7 +175,7 @@ def handle_event(
             # Stash on the app synchronously so `_run_agent` can read it right
             # after the stream loop (used as the plan text for `/approve`,
             # independent of the async ResponseFinal/AgentDone message flow).
-            app._last_reply_text = text
+            run.last_reply_text = text
             response.post_message(ResponseFinal(text))
 
     elif kind == "on_chat_model_stream":

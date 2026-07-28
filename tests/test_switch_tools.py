@@ -6,7 +6,7 @@ the ``apply_switch_override`` argument validation — without a live Ghidra. The
 Java scripts themselves run inside Ghidra and are exercised by the end-to-end
 check in the plan, not here.
 
-Run:  uv run pytest test_switch_tools.py -v
+Run:  uv run pytest tests/test_switch_tools.py -v
 """
 
 from __future__ import annotations
@@ -209,3 +209,39 @@ def test_apply_rejects_incomplete_table_form() -> None:
         _apply_tool().ainvoke({"jump_address": "0x401080", "table_address": "0x4020a0"})
     )
     assert "needs" in out and "element_size" in out
+
+
+def test_apply_rejects_bad_element_size() -> None:
+    """A stride Ghidra can't read must fail loudly, not per-entry.
+
+    Script-side, element_size=3 throws once per entry and the notes are followed
+    by a misleading "no valid destination addresses were produced" — which reads
+    as "the table is wrong" rather than "your stride is wrong".
+    """
+    out = asyncio.run(
+        _apply_tool().ainvoke(
+            {
+                "jump_address": "0x401080",
+                "table_address": "0x4020a0",
+                "element_size": 3,
+                "count": 4,
+            }
+        )
+    )
+    assert "`element_size` must be one of [1, 2, 4, 8]" in out
+
+
+def test_apply_rejects_out_of_range_count() -> None:
+    """An unbounded count spins the script for millions of rounds."""
+    for count in (0, 10_000_000):
+        out = asyncio.run(
+            _apply_tool().ainvoke(
+                {
+                    "jump_address": "0x401080",
+                    "table_address": "0x4020a0",
+                    "element_size": 4,
+                    "count": count,
+                }
+            )
+        )
+        assert "`count` must be between 1 and" in out

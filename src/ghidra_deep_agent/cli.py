@@ -13,7 +13,7 @@ import sys
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
@@ -29,10 +29,16 @@ from ghidra_deep_agent.compaction import (
     create_forced_summarization_tool_middleware,
     install_tuned_summarization,
 )
+from ghidra_deep_agent.defaults import (
+    DEFAULT_MAX_CONTEXT_TOKENS,
+    DEFAULT_RECURSION_LIMIT,
+    env_int,
+)
 from ghidra_deep_agent.ghidra_transport import get_mcp_config
 from ghidra_deep_agent.knowledge import build_knowledge_tools
 from ghidra_deep_agent.mcp_cache import build_mcp_cache_middleware
-from ghidra_deep_agent.models import build_embeddings
+from ghidra_deep_agent.models import build_embeddings, ensure_chat_model
+from ghidra_deep_agent.mongo_util import close_mongo_clients
 from ghidra_deep_agent.program_resolver import resolve_binary_name
 from ghidra_deep_agent.prompt import (
     ASK_MODE_SYSTEM_PROMPT,
@@ -148,12 +154,15 @@ def _build_tools(
     mongodb_db: str,
     embed_string: str,
     binary_name: str,
-) -> list[Any]:
+) -> tuple[list[Any], bool]:
     """Merge the MCP tools with the locally-defined ones.
 
-    Returns the full set, from which per-agent allowlists are then drawn — the
-    coordinator's restricted tool set must not narrow what sub-agents can use.
+    Returns ``(tools, knowledge_ok)``. The full tool set is what per-agent
+    allowlists are then drawn from — the coordinator's restricted tool set must
+    not narrow what sub-agents can use. ``knowledge_ok`` feeds the TUI's `db`
+    health indicator, which otherwise reports healthy unconditionally.
     """
+    knowledge_ok = True
     try:
         embeddings = build_embeddings(embed_string)
         knowledge_tools = build_knowledge_tools(
@@ -163,6 +172,7 @@ def _build_tools(
     except Exception as exc:
         print(f"Warning: knowledge base unavailable ({exc})", file=sys.stderr)
         knowledge_tools = []
+        knowledge_ok = False
 
     # Local `recover_prototypes` tool: drives a Ghidra-side prototype-recovery
     # script through the MCP `scripts` executor. Omitted (with a warning) when the
@@ -175,8 +185,11 @@ def _build_tools(
     # (with a warning) when the server's `scripts` tool is disabled.
     switch_tools = build_switch_tools(mcp_tools)
 
-    return filter_withheld_tools(
-        knowledge_tools + prototype_tools + switch_tools + mcp_tools
+    return (
+        filter_withheld_tools(
+            knowledge_tools + prototype_tools + switch_tools + mcp_tools
+        ),
+        knowledge_ok,
     )
 
 
@@ -231,22 +244,33 @@ def _validate_sandbox_mode() -> None:
         sys.exit(1)
 
 
-async def _open_backend(
-    stack: contextlib.AsyncExitStack,
-) -> tuple[Any, Any, str]:
+class Storage(NamedTuple):
+    """Where agent files live, and what that implies for prompts/middleware."""
+
+    backend: Any
+    # Syncs AGENT_OUTPUT_DIR to/from the sandbox each turn; None when not sandboxed.
+    sync_middleware: Any
+    # Appended to every agent prompt when sandboxed, so the model knows it has a
+    # shell and where durable files belong. Empty otherwise.
+    prompt_guidance: str
+
+
+async def _open_backend(stack: contextlib.AsyncExitStack) -> Storage:
     """Open the agents' filesystem backend.
 
-    Returns ``(backend, sandbox_sync_middleware, sandbox_prompt_guidance)``. An
-    OpenShell sandbox is entered on ``stack``, so the caller's ``stack.aclose()``
-    tears it down after the TUI exits or crashes and it is never leaked.
+    An OpenShell sandbox is entered on ``stack``, so the caller's
+    ``stack.aclose()`` tears it down after the TUI exits or crashes and it is
+    never leaked.
     """
     mode = sandbox_mode()
     output_dir = os.environ.get("AGENT_OUTPUT_DIR", "")
 
     if mode != OPENSHELL_MODE:
         if output_dir:
-            return FilesystemBackend(root_dir=output_dir, virtual_mode=True), None, ""
-        return StateBackend(), None, ""
+            return Storage(
+                FilesystemBackend(root_dir=output_dir, virtual_mode=True), None, ""
+            )
+        return Storage(StateBackend(), None, "")
 
     # Appended to every agent prompt when sandboxed, so the model knows it has a
     # shell and where to keep durable files.
@@ -267,11 +291,120 @@ async def _open_backend(
             "Sandbox: files live only inside the sandbox this session "
             "(set AGENT_OUTPUT_DIR to persist them locally)."
         )
-        return backend, None, sandbox_guidance
+        return Storage(backend, None, sandbox_guidance)
 
     # Files live in the sandbox; the middleware makes AGENT_OUTPUT_DIR the
     # durable local mirror, synced in before and out after a turn.
-    return backend, SandboxSyncMiddleware(backend, Path(output_dir)), sandbox_guidance
+    return Storage(
+        backend, SandboxSyncMiddleware(backend, Path(output_dir)), sandbox_guidance
+    )
+
+
+class MongoConfig(NamedTuple):
+    """Connection details every Mongo-backed subsystem shares."""
+
+    uri: str
+    db: str
+    embed_model: str
+
+
+def _storage_config() -> MongoConfig:
+    """Read the MongoDB/embedding settings from the environment."""
+    # EMBED_MODEL takes precedence; fall back to legacy OLLAMA_EMBED_MODEL.
+    ollama_fallback = (
+        f"ollama:{os.environ.get('OLLAMA_EMBED_MODEL', 'nomic-embed-text')}"
+    )
+    return MongoConfig(
+        uri=os.environ.get("MONGODB_URI", "mongodb://localhost:27017"),
+        db=os.environ.get("MONGODB_DB", "checkpointing_db"),
+        embed_model=os.environ.get("EMBED_MODEL", ollama_fallback),
+    )
+
+
+def _build_shared_middleware(
+    *,
+    storage: Storage,
+    resolve_model: Any,
+    cache_mw: Any,
+    async_mw: Any,
+    summary_model: Any,
+) -> list[Any]:
+    """Middleware shared by all three graphs, in wrapping order.
+
+    Built once so the normal, plan-mode, and ask-mode agents cannot drift apart
+    in behaviour — they are meant to differ only in prompt, tools, and delegates.
+    """
+    return [
+        # Sandbox file sync (first): its before_agent seeds the sandbox from
+        # AGENT_OUTPUT_DIR and its after_agent syncs changed files back, so these
+        # hooks bracket every other middleware. Absent when not sandboxed.
+        *([storage.sync_middleware] if storage.sync_middleware else []),
+        # Model-call resilience (outermost): provider fallback wraps
+        # transient-error retry of the primary model.
+        *build_model_resilience_middleware(resolve_model),
+        # Tool calls: validate args (reject bad calls without retry), serve
+        # immutable reads from cache, resolve async task stubs (inside the cache
+        # so resolved results are what gets cached), then retry transient I/O.
+        create_argument_validation_middleware(),
+        *([cache_mw] if cache_mw is not None else []),
+        *([async_mw] if async_mw is not None else []),
+        build_tool_retry_middleware(),
+        create_forced_summarization_tool_middleware(summary_model, storage.backend),
+    ]
+
+
+class Graphs(NamedTuple):
+    """The three coordinator graphs the TUI switches between."""
+
+    main: Any
+    # Read-only planner: no mutating tools, delegates only to read-only sub-agents.
+    plan: Any
+    # Read-only question-answerer: full coordinator tool set minus Ghidra writes.
+    ask: Any
+
+
+def _build_graphs(
+    *,
+    built_model: Any,
+    agents_md: str,
+    storage: Storage,
+    checkpointer: Any,
+    middleware: list[Any],
+    app_name: str,
+    main_tools: Sequence[Any],
+    plan_tools: Sequence[Any],
+    subagents: Sequence[Any],
+    plan_mode_subagents: Sequence[Any],
+    ask_mode_subagents: Sequence[Any],
+) -> Graphs:
+    """Build the three graphs, which differ only in prompt, tools, and delegates.
+
+    Everything else is held identical on purpose: they share one checkpointer
+    thread and backend, so conversation history and the plan file carry over when
+    the human approves a plan.
+    """
+
+    def build(
+        system_prompt: str, tools: Sequence[Any], graph_subagents: Sequence[Any]
+    ) -> Any:
+        return create_deep_agent(
+            model=built_model,
+            tools=list(tools),
+            system_prompt=system_prompt
+            + format_agent_memory(agents_md)
+            + storage.prompt_guidance,
+            checkpointer=checkpointer,
+            middleware=middleware,
+            subagents=list(graph_subagents),
+            backend=storage.backend,
+            name=app_name,
+        )
+
+    return Graphs(
+        main=build(SYSTEM_PROMPT, main_tools, subagents),
+        plan=build(PLAN_MODE_SYSTEM_PROMPT, plan_tools, plan_mode_subagents),
+        ask=build(ASK_MODE_SYSTEM_PROMPT, main_tools, ask_mode_subagents),
+    )
 
 
 async def main() -> None:
@@ -292,14 +425,8 @@ async def main() -> None:
     agents_md = _load_agents_md()
     tools = await _connect_mcp(mcp_config)
 
-    mongodb_uri = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
-    mongodb_db = os.environ.get("MONGODB_DB", "checkpointing_db")
-
-    # EMBED_MODEL takes precedence; fall back to legacy OLLAMA_EMBED_MODEL.
-    _ollama_fallback = (
-        f"ollama:{os.environ.get('OLLAMA_EMBED_MODEL', 'nomic-embed-text')}"
-    )
-    embed_string = os.environ.get("EMBED_MODEL", _ollama_fallback)
+    storage_cfg = _storage_config()
+    mongodb_uri, mongodb_db = storage_cfg.uri, storage_cfg.db
 
     binary_name_override = args.binary_name or os.environ.get("BINARY_NAME")
     try:
@@ -315,7 +442,9 @@ async def main() -> None:
     if session_store is not None:
         session_store.record_start(session_id, binary_name)
 
-    all_tools = _build_tools(tools, mongodb_uri, mongodb_db, embed_string, binary_name)
+    all_tools, knowledge_ok = _build_tools(
+        tools, mongodb_uri, mongodb_db, storage_cfg.embed_model, binary_name
+    )
     built_model = resolve_model(agent_config.main_model)
     main_model_spec = resolve_model_spec(agent_config.main_model, agent_config)
     main_tools = build_main_tools(all_tools, agent_config)
@@ -343,7 +472,7 @@ async def main() -> None:
             f"{resolve_model_spec(sub_cfg.model, agent_config)}"
         )
 
-    recursion_limit = int(os.environ.get("RECURSION_LIMIT", "10000"))
+    recursion_limit = env_int("RECURSION_LIMIT", DEFAULT_RECURSION_LIMIT)
     # Name each top-level graph so LangSmith traces show the app instead of the
     # langgraph library default ("LangGraph").
     app_name = os.environ.get("APP_NAME", "ghidra-deep-agent")
@@ -356,7 +485,7 @@ async def main() -> None:
 
     stack = contextlib.AsyncExitStack()
     try:
-        backend, sandbox_sync_mw, sandbox_guidance = await _open_backend(stack)
+        storage = await _open_backend(stack)
 
         with MongoDBSaver.from_conn_string(
             mongodb_uri, db_name=mongodb_db
@@ -365,7 +494,13 @@ async def main() -> None:
             # smaller/cheaper model; unset keeps the prior behavior of summarizing
             # with the main model.
             summary_spec = os.environ.get("SUMMARY_MODEL")
-            summary_model = resolve_model(summary_spec) if summary_spec else built_model
+            # None when unset, which `install_tuned_summarization` reads as "use
+            # the agent's own model".
+            summary_override = resolve_model(summary_spec) if summary_spec else None
+            # Resolved eagerly: the TUI calls `.ainvoke` on this to summarize prior
+            # context when entering plan/ask mode, and `build_model` hands back a
+            # bare string for any provider it doesn't special-case.
+            summary_model = ensure_chat_model(summary_override or built_model)
 
             # Tune the auto-summarizer create_deep_agent wires internally.
             # Sub-agents compact aggressively by default (they never reached
@@ -373,91 +508,50 @@ async def main() -> None:
             # by its model — keeps stock thresholds. COMPACT_* / COMPACT_MAIN_*
             # env knobs override either scope, and SUMMARY_MODEL routes the
             # auto summary too, not just /compact.
-            install_tuned_summarization(
-                resolve_model(summary_spec) if summary_spec else None,
-                main_model=built_model,
+            install_tuned_summarization(summary_override, main_model=built_model)
+
+            shared_middleware = _build_shared_middleware(
+                storage=storage,
+                resolve_model=resolve_model,
+                cache_mw=cache_mw,
+                async_mw=async_mw,
+                summary_model=summary_model,
             )
 
-            # Shared by both graphs (normal + plan mode). Built once so the two
-            # agents carry identical middleware behavior.
-            shared_middleware: list[Any] = [
-                # Sandbox file sync (first): its before_agent seeds the sandbox
-                # from AGENT_OUTPUT_DIR and its after_agent syncs changed files
-                # back, so these hooks bracket every other middleware. Absent
-                # (None filtered out) when not sandboxed.
-                *([sandbox_sync_mw] if sandbox_sync_mw is not None else []),
-                # Model-call resilience (outermost): provider fallback wraps
-                # transient-error retry of the primary model.
-                *build_model_resilience_middleware(resolve_model),
-                # Tool calls: validate args (reject bad calls without retry),
-                # serve immutable reads from cache, resolve async task stubs
-                # (inside the cache so resolved results are what gets cached),
-                # then retry transient I/O.
-                create_argument_validation_middleware(),
-                *([cache_mw] if cache_mw is not None else []),
-                *([async_mw] if async_mw is not None else []),
-                build_tool_retry_middleware(),
-                create_forced_summarization_tool_middleware(summary_model, backend),
-            ]
-
-            # The three graphs differ only in prompt, tools, and delegates;
-            # everything else must stay identical so they behave the same and
-            # share history through one checkpointer thread and backend.
-            def build_graph(
-                system_prompt: str,
-                tools: Sequence[Any],
-                graph_subagents: Sequence[Any],
-            ) -> Any:
-                return create_deep_agent(
-                    model=built_model,
-                    tools=list(tools),
-                    system_prompt=system_prompt
-                    + format_agent_memory(agents_md)
-                    + sandbox_guidance,
-                    checkpointer=checkpointer,
-                    middleware=shared_middleware,
-                    subagents=list(graph_subagents),
-                    backend=backend,
-                    name=app_name,
-                )
-
-            agent = build_graph(SYSTEM_PROMPT, main_tools, subagents)
-
-            # Plan-mode graph: read-only coordinator (no mutating tools) whose
-            # only delegate is the read-only `research` sub-agent. Shares the
-            # checkpointer thread_id and backend with `agent`, so conversation
-            # history and the plan file carry over when the human approves.
-            plan_agent = build_graph(
-                PLAN_MODE_SYSTEM_PROMPT,
-                build_plan_mode_main_tools(all_tools, agent_config),
-                plan_mode_subagents,
+            graphs = _build_graphs(
+                built_model=built_model,
+                agents_md=agents_md,
+                storage=storage,
+                checkpointer=checkpointer,
+                middleware=shared_middleware,
+                app_name=app_name,
+                main_tools=main_tools,
+                plan_tools=build_plan_mode_main_tools(all_tools, agent_config),
+                subagents=subagents,
+                plan_mode_subagents=plan_mode_subagents,
+                ask_mode_subagents=ask_mode_subagents,
             )
 
-            # Ask-mode graph: read-only question-answering coordinator. Keeps the
-            # full coordinator tool set (all knowledge tools + read-only
-            # navigation/search — no Ghidra mutations) so it can record durable
-            # findings, and delegates investigation to the read-only sub-agents
-            # picked by `_read_only_delegates`. Shares the checkpointer/backend;
-            # runs on its own ephemeral thread minted by the TUI.
-            ask_agent = build_graph(
-                ASK_MODE_SYSTEM_PROMPT, main_tools, ask_mode_subagents
-            )
-
-            profile = getattr(built_model, "profile", None) or {}
-            ctx_max = profile.get("max_input_tokens") or int(
-                os.environ.get("MAX_CONTEXT_TOKENS", "200000")
+            # Probe the *resolved* model: `build_model` returns a bare string for
+            # providers it doesn't special-case, and a string has no `.profile`,
+            # which silently pinned the gauge to the fallback for those models.
+            profile = getattr(ensure_chat_model(built_model), "profile", None) or {}
+            ctx_max = profile.get("max_input_tokens") or env_int(
+                "MAX_CONTEXT_TOKENS", DEFAULT_MAX_CONTEXT_TOKENS
             )
 
             app = GhidraAgentApp(
-                agent=agent,
-                plan_agent=plan_agent,
-                ask_agent=ask_agent,
+                agent=graphs.main,
+                plan_agent=graphs.plan,
+                ask_agent=graphs.ask,
                 summary_model=summary_model,
                 config=config,
                 model=main_model_spec,
                 session_id=session_id,
-                mcp_ok=True,
-                db_ok=True,
+                # `_connect_mcp` exits on a failed connection, so reaching here means
+                # the server answered — but it can still answer with zero tools.
+                mcp_ok=bool(tools),
+                db_ok=knowledge_ok,
                 max_context_tokens=ctx_max,
                 session_store=session_store,
                 binary_name=binary_name,
@@ -472,6 +566,10 @@ async def main() -> None:
     finally:
         # Tears down the OpenShell sandbox if one was created; a no-op otherwise.
         await stack.aclose()
+        # The knowledge base, session registry, and read cache share one client
+        # per URI (mongo_util); close it so the connection pool doesn't outlive
+        # the process's useful life. The checkpointer manages its own.
+        close_mongo_clients()
 
     print(f"Session ID: {session_id}")
 

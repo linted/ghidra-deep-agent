@@ -7,7 +7,7 @@
   `build_research_subagent` builds a shared read-only `research` sub-agent (full tool
   set minus the denylist) used by **both** the normal coordinator (delegate
   investigation without applying changes) and a new plan-mode coordinator graph
-  (`build_plan_mode_main_tools` + `PLAN_MODE_SYSTEM_PROMPT`), built in main.py and
+  (`build_plan_mode_main_tools` + `PLAN_MODE_SYSTEM_PROMPT`), built in cli.py and
   passed to the TUI. Both graphs share the checkpointer `thread_id`/backend so
   history + the plan file carry over. TUI (`tui/app.py`): `/plan [goal]` mints a
   fresh timestamped `plans/<ts>-<slug>.md`, flips a magenta **PLAN** status chip, and
@@ -19,7 +19,7 @@
 - [x] **`/resume` — list & resume previous sessions** — implemented: a dedicated
   `sessions` collection (`sessions.py`, `SessionStore`/`build_session_store`,
   `MONGODB_SESSIONS_COLLECTION`) records `{session_id, binary_name, created_at,
-  last_active_at, title}` on session start (main.py) and on each turn (TUI
+  last_active_at, title}` on session start (cli.py) and on each turn (TUI
   `_touch_session`). The `/resume` TUI command opens a `SessionSelectScreen`
   modal (`tui/session_select.py`) listing sessions most-recent-first, scoped to
   the open binary by default with an 'a' key to toggle all binaries; picking one
@@ -47,7 +47,7 @@ Cost
 
 Errors
 - [x] **Harden `update_knowledge`** — retries + backoff, entity-exists guard, return structured warning instead of raising (highest per-tool error rate, 5.6%). Also applied to `save_knowledge` (sibling write tool).
-- [x] **Add tool-call retry for transient failures** — implemented in `resilience.py` (`build_tool_retry_middleware`): stock `ToolRetryMiddleware` scoped to the idempotent filesystem tools (`write_file`/`edit_file`/`read_file`), `retry_on=(OSError,)`, `on_failure="continue"`. Wired into the main agent (main.py) and every sub-agent (subagents.py). `TOOL_MAX_RETRIES` env (default 3). (Merged with the 2026-06-29 enrichment note below.)
+- [x] **Add tool-call retry for transient failures** — implemented in `resilience.py` (`build_tool_retry_middleware`): stock `ToolRetryMiddleware` scoped to the idempotent filesystem tools (`write_file`/`edit_file`/`read_file`), `retry_on=(OSError,)`, `on_failure="continue"`. Wired into the main agent (cli.py) and every sub-agent (subagents.py). `TOOL_MAX_RETRIES` env (default 3). (Merged with the 2026-06-29 enrichment note below.)
 - [x] **Pydantic argument-validation shim** before tool execution — return `{"validation_error": ...}` for self-correction. Implemented as `ArgumentValidationMiddleware` (validation.py); validates dict-schema MCP tools client-side via jsonschema (pydantic-schema tools already validated by the framework).
 
 Latency
@@ -56,7 +56,7 @@ Latency
 - [ ] **Route routine/structured-output LLM calls to a smaller, faster model** (model-router at middleware layer)
 - [x] **Batch independent read-only tool calls** — prompt the agent to call independent read-only tools simultaneously. Added "Batch independent tool calls" section to SYSTEM_PROMPT (prompt.py).
 
-Sub-agent design — implemented in `src/ghidra_deep_agent/subagents.py` (`build_subagents`), wired via `subagents=` in main.py, delegation guidance in prompt.py. Sub-agents run on `SUBAGENT_MODEL` (defaults to main `MODEL`).
+Sub-agent design — implemented in `src/ghidra_deep_agent/subagents.py` (`build_subagents`), wired via `subagents=` in cli.py, delegation guidance in prompt.py. Sub-agents run on `SUBAGENT_MODEL` (defaults to main `MODEL`).
 - [x] **`function-analyst` sub-agent (build first)** — full per-function loop: decompile/xref/analysis + applies renames/retypes/comments/prototype + saves findings; returns a compact summary.
 - [x] **`program-recon` sub-agent (quick win)** — read-only "what binary is this" delegation returning a compact brief.
 - [x] **`threat-hunter` sub-agent (latency isolation)** — isolates the heavy threat-analysis tools off the main critical path; writes findings to the KB, returns a compact summary.
@@ -90,7 +90,7 @@ Sub-agent design — implemented in `src/ghidra_deep_agent/subagents.py` (`build
   can't reach host/Atlas Mongo, so local mode runs the existing `mongodb/` compose
   stack *inside* the sandbox's own Docker daemon (loopback bypasses the proxy);
   external/Atlas mode is kept but experimental until empirically tested. Zero Python
-  changes needed (`main.py` `load_dotenv()` doesn't override exported env). Full
+  changes needed (`cli.py` `load_dotenv()` doesn't override exported env). Full
   design — three `scripts/sbx-*.sh` scripts, `.env.sandbox.example`, README section,
   exact policy rules, verification steps — in
   `~/.claude/plans/are-we-able-to-vectorized-floyd.md`; start there.
@@ -137,17 +137,51 @@ Sub-agent design — implemented in `src/ghidra_deep_agent/subagents.py` (`build
   "surface decompile failures" change on purpose.
 
 #### From the repo audit (2026-07-24)
-- [ ] **Dispatch-table `handle_event` / split `_run_agent`** — deliberately left
-  during the audit's TUI dedup pass. `tui/events.py:handle_event` is a ~134-line
-  six-branch `if/elif` on `event["event"]`, and `tui/app.py:_run_agent` is ~119
-  lines (mode selection, input seeding, prompt decoration, stream loop, three
-  exception handlers). Both read fine as linear routers, and both branch sets
-  share locals (`run_id`/`metadata`/`checkpoint_ns`/`is_compaction` in the first,
-  the captured mode/config pair in the second) that a table would have to thread
-  through a context object — roughly as much scaffolding as it removes. Revisit
-  if either grows another branch. The genuinely duplicated parts (the seven-times
-  copy-pasted busy guard, the twice-duplicated side-mode thread config, the
-  hardcoded recursion/context defaults) were already collapsed.
+- [~] **Dispatch-table `handle_event` / split `_run_agent`** — the *state* half is
+  done (2026-07-25): `handle_event`'s bookkeeping moved into a `RunState`
+  (`tui/run_state.py`) the app replaces per turn, which ended its eleven reaches
+  into app privates and fixed the leak where a cancelled turn left in-flight
+  run_ids behind forever. `_run_agent`'s mode selection collapsed into `SideMode`
+  (`tui/side_mode.py`). The **branch tables themselves are still deliberately
+  not built**: both read fine as linear routers, and the branch sets share locals
+  (`run_id`/`metadata`/`checkpoint_ns`/`is_compaction` in the first) that a table
+  would have to thread through a context object — roughly as much scaffolding as
+  it removes. Revisit if either grows another branch.
+
+#### From the repo health pass (2026-07-25)
+
+Closed a set of defects that were invisible to ruff and mypy --strict, hence
+survived a green CI — see the commits for detail. Notable ones worth remembering
+as *classes* of bug rather than one-offs:
+
+- `build_model` returns a `str` for any provider it doesn't special-case, so
+  anything that *uses* the model object (`.ainvoke`, `.profile`) silently fails
+  on most models. `ensure_chat_model` now resolves at the two call sites that
+  need it, but the `BaseChatModel | str` union is still the root cause and will
+  keep producing this. Narrowing it is the real fix.
+- A tool added to a factory must also be added to `mcp_cache._MUTATING_TOOLS` if
+  it mutates Ghidra; `deobfuscate_cff` (#40) wasn't, and served stale
+  decompilation for a full TTL. That set is still hand-maintained against
+  `subagents.toml` with nothing enforcing the correspondence — a cross-check
+  would close the class.
+- Textual `@work(exclusive=True)` cancels the whole *group*, so any fire-and-
+  forget worker sharing the default group with `_run_agent` dies. Give new
+  workers an explicit `group=`.
+
+Still open from that pass:
+- [ ] **Share the embedded Java helper preamble** — ~160-180 of ~1,056 non-OLLVM
+  Java lines are mechanical copies across the four `*_script.py` modules: `js()`
+  (3 verbatim + 1 degenerate `jsonEsc`), `firstLine()`, `addrString()`,
+  `appendObj()`, the marker/emit block, and ~30 lines of
+  `ChunkingParallelDecompiler` scaffolding duplicated between `find` and
+  `recover`. Extract a shared Python constant holding the common preamble,
+  concatenated into each `SCRIPT_SOURCE`. **Preserve the args-not-interpolation
+  rule** — nothing may be `.format()`ed into the source, which is why there is no
+  escaping bug today. Deferred as the largest-diff, lowest-urgency item; the
+  compile check (`-m integration`) is what verifies it.
+- [ ] **Delete `src/ghidra_deep_agent/web/__pycache__/`** — 33 KB of orphaned
+  bytecode for a web subpackage that was never tracked and no longer has any
+  source. Local to the primary checkout, invisible to `git status` (ignored).
 
 #### From dependency review (2026-07-20)
 - [ ] **Adopt `ToolErrorMiddleware` (langchain 1.3.14)** — evaluate folding the new
@@ -182,7 +216,7 @@ New
   `resilience.py` (`build_model_resilience_middleware`): stock `ModelRetryMiddleware` (transient-only
   via an `_is_transient` predicate: 5xx/429/timeouts, not deterministic 4xx) plus an optional
   `ModelFallbackMiddleware` (outermost) driven by `MODEL_FALLBACK` (comma-separated `provider:model`).
-  Wired into the main agent (main.py) and every sub-agent (subagents.py). Env: `MODEL_MAX_RETRIES`
+  Wired into the main agent (cli.py) and every sub-agent (subagents.py). Env: `MODEL_MAX_RETRIES`
   (default 3), `MODEL_FALLBACK`.
 - [x] **Cache immutable read-only MCP tools in MongoDB** (report Latency #1) — implemented as
   `MCPReadCacheMiddleware` (mcp_cache.py): a `wrap_tool_call`/`awrap_tool_call` cache keyed on
@@ -285,7 +319,7 @@ Design thoughts (from how plan mode works):
 - **Phased flow:** (1) explore/understand the problem, (2) design an approach,
   (3) write the plan, (4) hand back to the human for approval before execution.
 - **Persist the plan to disk** via the existing `FilesystemBackend`
-  (see AGENT_OUTPUT_DIR handling in main.py) — e.g. a `plans/` subdirectory —
+  (see AGENT_OUTPUT_DIR handling in cli.py) — e.g. a `plans/` subdirectory —
   so plans survive across sessions like other artifacts.
 - **Ask for feedback / approval gate:** end the planning turn by returning the
   markdown and waiting for the human, rather than charging ahead.
@@ -295,20 +329,20 @@ Design thoughts (from how plan mode works):
   - Either a dedicated planning subagent (deepagents `task` mechanism,
     constrained to read-only Ghidra tools + knowledge query tools) or a
     plan-specific system-prompt variant alongside src/ghidra_deep_agent/prompt.py.
-  - Reuse the FilesystemBackend already wired up in main.py for writing the
+  - Reuse the FilesystemBackend already wired up in cli.py for writing the
     plan file.
 
 ## `/resume` — list & resume previous sessions
 Add a `/resume` slash command (TUI dispatcher in src/ghidra_deep_agent/tui/app.py)
 that lists previous sessions sorted most-recent-first and lets the human pick one
 to continue. Today sessions can only be resumed by passing an explicit
-`--session-id` (main.py:48), with no way to discover what prior session IDs exist
+`--session-id` (cli.py `_parse_args`), with no way to discover what prior session IDs exist
 — `/resume` should surface that list interactively.
 
 Design thoughts:
 - **Where the data lives.** Sessions are persisted as LangGraph checkpoints via
-  `MongoDBSaver` (main.py:120 `MongoDBSaver`, `MONGODB_DB` default
-  `checkpointing_db`), keyed by `thread_id` (= our `session_id`, main.py:57).
+  `MongoDBSaver` (cli.py `MongoDBSaver.from_conn_string`, `MONGODB_DB` default
+  `checkpointing_db`), keyed by `thread_id` (= our `session_id`, cli.py `config`).
 - **Sorting by recency may need a new collection.** The checkpoint documents are
   not obviously timestamped in a way that's cheap to sort/query by "most recent",
   and the saver's schema is an implementation detail we shouldn't depend on. We
@@ -319,12 +353,12 @@ Design thoughts:
   already carry a usable timestamp before adding the collection.)
 - **Filter by open binary.** A `/resume` list is most useful scoped to the
   binary currently open in Ghidra (we already track `binary_name` for knowledge
-  isolation — main.py:129 `binary_name_override`, `BINARY_NAME`). Default to
+  isolation — cli.py `binary_name_override`, `BINARY_NAME`). Default to
   filtering the list to the current binary, and offer an option to show all
   sessions across binaries.
 - **Plug-in points:** the `/resume` command in the TUI dispatcher
   (src/ghidra_deep_agent/tui/app.py); session-record writes wired alongside the
-  `MongoDBSaver`/`binary_name` setup in main.py; reuse the existing `session_id`
+  `MongoDBSaver`/`binary_name` setup in cli.py; reuse the existing `session_id`
   / `thread_id` plumbing to actually re-attach to the chosen checkpoint thread.
 
 ## Dynamic subagents — split `research` into planner → workers → synthesizer

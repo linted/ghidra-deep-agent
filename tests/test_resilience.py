@@ -5,32 +5,21 @@ Focus: an exhausted usage/rate limit must halt cleanly (raise UsageLimitError)
 so the run stays resumable, while any other exhausted error keeps the stock
 "continue" behavior (return a string that becomes the AIMessage content).
 
-Run:  uv run pytest test_resilience.py -v
+Run:  uv run pytest tests/test_resilience.py -v
 """
 
 from __future__ import annotations
-
-from collections.abc import Generator
 
 import pytest
 
 from ghidra_deep_agent.resilience import (
     UsageLimitError,
     _is_out_of_credits,
+    _is_transient,
     _is_usage_limit,
     _on_model_retries_exhausted,
 )
-from ghidra_deep_agent.toasts import ToastRequest, register_toast_sink
-
-
-@pytest.fixture(autouse=True)
-def _clear_sinks() -> Generator[None, None, None]:
-    """Toast sinks are module-global; reset between tests to avoid cross-talk."""
-    import ghidra_deep_agent.toasts as toasts
-
-    toasts._sinks.clear()
-    yield
-    toasts._sinks.clear()
+from ghidra_deep_agent.toasts import ToastRequest
 
 
 class _StatusError(Exception):
@@ -50,13 +39,24 @@ def test_429_status_is_a_usage_limit() -> None:
     [
         "Rate limit exceeded",
         "429 too many requests",
-        "model is overloaded, please retry",
         "you have exceeded your monthly quota",
         "usage limit reached for this window",
     ],
 )
 def test_limit_markers_are_usage_limits(text: str) -> None:
     assert _is_usage_limit(Exception(text)) is True
+
+
+def test_overloaded_is_transient_not_a_usage_limit() -> None:
+    """Provider-at-capacity is a blip, not a quota block.
+
+    It must stay retryable *and* must not escalate to UsageLimitError when the
+    retries are spent — that would halt the turn for a condition that typically
+    clears in seconds.
+    """
+    exc = Exception("model is overloaded, please retry")
+    assert _is_transient(exc) is True
+    assert _is_usage_limit(exc) is False
 
 
 @pytest.mark.parametrize(
@@ -112,9 +112,10 @@ def test_non_credit_errors_are_not_out_of_credits(exc: Exception) -> None:
     assert _is_out_of_credits(exc) is False
 
 
-def test_on_failure_toasts_and_pauses_on_credits_error() -> None:
-    received: list[ToastRequest] = []
-    register_toast_sink(received.append)
+def test_on_failure_toasts_and_pauses_on_credits_error(
+    captured_toasts: list[ToastRequest],
+) -> None:
+    received = captured_toasts
 
     original = _StatusError(
         "This request requires more credits, or fewer max_tokens.", 402
@@ -128,9 +129,10 @@ def test_on_failure_toasts_and_pauses_on_credits_error() -> None:
     assert "credits" in received[0].message
 
 
-def test_on_failure_toasts_on_generic_terminal_error() -> None:
-    received: list[ToastRequest] = []
-    register_toast_sink(received.append)
+def test_on_failure_toasts_on_generic_terminal_error(
+    captured_toasts: list[ToastRequest],
+) -> None:
+    received = captured_toasts
 
     result = _on_model_retries_exhausted(Exception("connection reset by peer"))
 
@@ -141,11 +143,12 @@ def test_on_failure_toasts_on_generic_terminal_error() -> None:
     assert "connection reset by peer" not in received[0].message
 
 
-def test_on_failure_does_not_toast_on_usage_limit() -> None:
+def test_on_failure_does_not_toast_on_usage_limit(
+    captured_toasts: list[ToastRequest],
+) -> None:
     # The TUI already renders a dedicated pause banner for usage limits; a toast
     # there would be duplicate noise.
-    received: list[ToastRequest] = []
-    register_toast_sink(received.append)
+    received = captured_toasts
 
     with pytest.raises(UsageLimitError):
         _on_model_retries_exhausted(_StatusError("rate limit exceeded", 429))

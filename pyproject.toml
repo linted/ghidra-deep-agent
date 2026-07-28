@@ -72,28 +72,13 @@ ignore = ["B009", "B010"]
 "src/ghidra_deep_agent/ollvm_deobfuscate_script.py" = ["E501"]
 
 [tool.pytest.ini_options]
-testpaths = ["."]
-# Setting norecursedirs REPLACES pytest's defaults rather than extending them,
-# so the built-in patterns have to be repeated here — without the leading `.*`,
-# collection walks into `.claude/worktrees/**` and picks up a full copy of the
-# suite from every active worktree.
-norecursedirs = [
-    # pytest's defaults, restated:
-    "*.egg",
-    ".*",
-    "_darcs",
-    "build",
-    "CVS",
-    "dist",
-    "node_modules",
-    "venv",
-    "{arch}",
-    # ours: agent run artifacts at the repo root, which can contain .py files.
-    "agent_output*",
-    "external_analysis",
-    "mongodb",
-    "scripts",
-]
+# Scoping collection to `tests/` is what keeps it out of everything else at the
+# repo root — agent run artifacts (`agent_output*`, `external_analysis/`), which
+# contain .py files, and `.claude/worktrees/**`, which holds a full copy of the
+# suite per active worktree. That previously needed a hand-maintained
+# `norecursedirs` restating pytest's own defaults, since setting it replaces
+# them rather than extending them.
+testpaths = ["tests"]
 markers = [
     "integration: needs live services (MongoDB with vector search, an embedding model)",
 ]

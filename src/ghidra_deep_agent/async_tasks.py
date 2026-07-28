@@ -20,7 +20,6 @@ the model gets an explicit "did not complete" message rather than a dangling
 """
 
 import asyncio
-import os
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -33,6 +32,8 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.types import Command
 
+from ghidra_deep_agent.defaults import env_float
+
 # The submission stubs are very specific; require a marker phrase plus an id to
 # avoid ever mistaking real tool output (decompilation, disassembly) for a stub.
 # Two known shapes: the generic async-tool stub ("Task submitted for async
@@ -40,8 +41,12 @@ from langgraph.types import Command
 # submitted: <id> ...").
 _STUB_MARKERS = ("Task submitted for async execution", "Script task submitted")
 _TASK_ID_RE = re.compile(r"(?:Task ID:|Script task submitted:)\s*([0-9A-Za-z._-]{6,})")
-# A poll response still in flight.
-_IN_FLIGHT = ("Status: RUNNING", "Status: PENDING")
+# A poll response still in flight. Anchored to the start of a line: a *finished*
+# task's result text is what get_task_status returns, and for an RE tool that text
+# is attacker-controlled binary content — `search_strings` can easily surface a
+# literal "Status: RUNNING". A bare substring test would then keep polling a task
+# that already completed, and throw away the result we were handed.
+_IN_FLIGHT_RE = re.compile(r"^[ \t]*Status:[ \t]*(?:RUNNING|PENDING)\b", re.MULTILINE)
 
 # Custom event this middleware dispatches once an async task finishes (resolved
 # or timed out), carrying ``{"task_id": ...}``. The TUI uses it to defer the
@@ -89,7 +94,7 @@ def _task_id(content: str) -> str | None:
 
 
 def _is_in_flight(content: str) -> bool:
-    return any(flag in content for flag in _IN_FLIGHT)
+    return _IN_FLIGHT_RE.search(content) is not None
 
 
 def _timeout_text(timeout_s: float) -> str:
@@ -274,10 +279,12 @@ def build_async_task_middleware(
     status_tool = next((t for t in tools if t.name == "get_task_status"), None)
     if status_tool is None:
         return None
-    timeout_s = float(os.environ.get("GHIDRA_ASYNC_TIMEOUT", "180"))
-    initial_s = float(os.environ.get("GHIDRA_ASYNC_POLL_INTERVAL", "0.25"))
-    factor = float(os.environ.get("GHIDRA_ASYNC_POLL_FACTOR", "1.6"))
-    max_s = float(os.environ.get("GHIDRA_ASYNC_POLL_MAX", "2.0"))
+    timeout_s = env_float("GHIDRA_ASYNC_TIMEOUT", 180.0)
+    initial_s = env_float("GHIDRA_ASYNC_POLL_INTERVAL", 0.25)
+    # A factor <= 1 would never back off (and < 1 would poll ever faster),
+    # so the floor is 1.0 rather than merely "positive".
+    factor = max(1.0, env_float("GHIDRA_ASYNC_POLL_FACTOR", 1.6))
+    max_s = env_float("GHIDRA_ASYNC_POLL_MAX", 2.0)
     return AsyncTaskMiddleware(
         status_tool,
         timeout_s=timeout_s,

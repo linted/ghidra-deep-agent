@@ -6,21 +6,9 @@ from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
-_HELP_TEXT = """\
-[bold]Slash commands[/bold]
-  /clear    clear the response log and activity tree
-  /yank     copy the last response to the clipboard
-  /compact  compact the conversation history
-  /resume   list & resume a previous session
-  /continue continue after a usage-limit pause (main, plan, or ask mode)
-  /plan [goal]  enter read-only plan mode (investigate & draft a plan)
-  /approve  approve the current plan and execute it
-  /plan-cancel  leave plan mode without executing
-  /ask [question(s)]  enter read-only ask mode (answer questions, no changes)
-  /ask-cancel  leave ask mode
-  /help     show this help
-  /quit     exit
+from ghidra_deep_agent.tui.commands import help_lines
 
+_KEYS_TEXT = """\
 [bold]Keys[/bold]
   ↑ / ↓          walk input history
   Escape         cancel a running agent · close this help
@@ -41,9 +29,12 @@ class HelpScreen(ModalScreen[None]):
     ]
 
     def compose(self) -> ComposeResult:
+        # Command help is generated from the command table, so a command can
+        # never be dispatchable but undocumented (or vice versa).
+        commands = "\n".join(["[bold]Slash commands[/bold]", *help_lines()])
         with Vertical(id="help-box"):
             yield Static("Ghidra Agent — help", id="help-title")
-            yield Static(_HELP_TEXT)
+            yield Static(f"{commands}\n\n{_KEYS_TEXT}")
 
     def action_close(self) -> None:
         self.dismiss()

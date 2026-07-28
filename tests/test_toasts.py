@@ -1,26 +1,12 @@
 """
 Unit tests for the toast notification pub/sub bus.
 
-Run:  uv run pytest test_toasts.py -v
+Run:  uv run pytest tests/test_toasts.py -v
 """
 
 from __future__ import annotations
 
-from collections.abc import Generator
-
-import pytest
-
 from ghidra_deep_agent.toasts import ToastRequest, notify_toast, register_toast_sink
-
-
-@pytest.fixture(autouse=True)
-def _clear_sinks() -> Generator[None, None, None]:
-    """Toast sinks are module-global; reset between tests to avoid cross-talk."""
-    import ghidra_deep_agent.toasts as toasts
-
-    toasts._sinks.clear()
-    yield
-    toasts._sinks.clear()
 
 
 def test_notify_toast_with_no_sinks_is_a_noop() -> None:

@@ -91,6 +91,10 @@ def _format_summary(payload: dict[str, Any]) -> str:
                     reason=e.get("reason", "?"),
                 )
             )
+        if payload.get("escalate_truncated"):
+            lines.append(
+                "  (list truncated; the needs_review count above is the true total)"
+            )
     else:
         lines.append("No new functions need manual review.")
     if failed:

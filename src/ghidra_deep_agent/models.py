@@ -9,6 +9,8 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_deepseek import ChatDeepSeek
 
+from ghidra_deep_agent.defaults import config_path
+
 
 class _ChatDeepSeekFixed(ChatDeepSeek):
     """ChatDeepSeek that round-trips reasoning_content back to the API.
@@ -90,11 +92,7 @@ _openrouter_presets_cache: dict[str, dict[str, Any]] | None = None
 
 def _openrouter_config_path() -> Path:
     """Resolve presets path: ``OPENROUTER_CONFIG`` env, else repo-root TOML."""
-    env = os.environ.get("OPENROUTER_CONFIG")
-    if env:
-        return Path(env).expanduser()
-    # models.py -> ghidra_deep_agent -> src -> <repo root>
-    return Path(__file__).resolve().parents[2] / _OPENROUTER_CONFIG_FILENAME
+    return config_path("OPENROUTER_CONFIG", _OPENROUTER_CONFIG_FILENAME)
 
 
 def _load_openrouter_presets() -> dict[str, dict[str, Any]]:
@@ -162,3 +160,21 @@ def build_model(model_string: str) -> BaseChatModel | str:
 
             return ChatOpenRouter(model=model_id, openrouter_provider=prefs)
     return model_string
+
+
+def ensure_chat_model(model: str | BaseChatModel) -> BaseChatModel:
+    """Resolve a model *string* into a real chat model.
+
+    ``build_model`` deliberately returns the string unchanged for every provider
+    it doesn't special-case, leaving resolution to deepagents/``init_chat_model``.
+    That is fine for handing to ``create_deep_agent``, but callers that *use* the
+    model directly need the object: ``.ainvoke`` for the plan/ask context summary
+    and ``.profile`` for the context gauge both silently fail on a bare ``str``.
+    ``compaction.py`` already guards its own call site this way.
+    """
+    if isinstance(model, str):
+        from deepagents._models import resolve_model
+
+        resolved: BaseChatModel = resolve_model(model)
+        return resolved
+    return model

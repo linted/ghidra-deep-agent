@@ -32,6 +32,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
 
+from ghidra_deep_agent.defaults import config_path
 from ghidra_deep_agent.models import build_model
 from ghidra_deep_agent.resilience import (
     build_model_resilience_middleware,
@@ -100,7 +101,7 @@ READ_ONLY_WRITE_ACTIONS: dict[str, frozenset[str]] = {
     "bookmarks": frozenset({"set", "remove"}),
 }
 # Tools withheld from every agent. Filtered out of the full tool set once at
-# startup (main.py), before any per-agent selection — the only reliable block,
+# startup (cli.py), before any per-agent selection — the only reliable block,
 # since `tools = "*"` agents and the read-only research sub-agent would otherwise
 # still receive them.
 #   ``analyze_program`` runs full Ghidra Auto Analysis over the whole program; the
@@ -111,7 +112,7 @@ READ_ONLY_WRITE_ACTIONS: dict[str, frozenset[str]] = {
 #     receive it as a callable tool, or it starts manual polling — the very
 #     context-bloating spin-loop the middleware exists to prevent. Withholding is
 #     safe because the middleware and ``recover_prototypes`` look the tool up in
-#     the *raw* MCP tool list (main.py), upstream of this filter.
+#     the *raw* MCP tool list (cli.py), upstream of this filter.
 WITHHELD_TOOLS = frozenset(
     {
         "analyze_program",
@@ -154,11 +155,7 @@ class AgentConfig:
 
 def _default_config_path() -> Path:
     """Resolve the config path: ``AGENT_CONFIG`` env, else repo-root TOML."""
-    env = os.environ.get("AGENT_CONFIG")
-    if env:
-        return Path(env).expanduser()
-    # subagents.py -> ghidra_deep_agent -> src -> <repo root>
-    return Path(__file__).resolve().parents[2] / _CONFIG_FILENAME
+    return config_path("AGENT_CONFIG", _CONFIG_FILENAME)
 
 
 def _req_str(table: Mapping[str, Any], key: str, where: str) -> str:
@@ -331,7 +328,7 @@ def _select(
 
 
 def filter_withheld_tools(all_tools: Sequence[BaseTool]) -> list[BaseTool]:
-    """Drop globally-withheld tools from the full tool set (see main.py)."""
+    """Drop globally-withheld tools from the full tool set (see cli.py)."""
     return [tool for tool in all_tools if tool.name not in WITHHELD_TOOLS]
 
 

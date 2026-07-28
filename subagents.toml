@@ -636,7 +636,11 @@ into direct branches so the flow decompiles. ALWAYS call it dry-run first
 they look sane, THEN re-run with `apply=True`. Leave `force=False` unless a dry
 run shows the skipped overlaps are spurious (they are usually shared dispatch
 tails, where forcing writes a wrong target). This is one function per call, not a
-whole-program pass.
+whole-program pass. `deobfuscate_cff` is **AArch64 only** — its dispatch
+detection, address recovery, and opaque-predicate folding are all ARM64-specific.
+On any other architecture it refuses and returns `unsupported_arch` having done
+nothing; do not retry it, and treat that function as a manual dead end (bookmark
+it as below).
 
 DEAD ENDS: some jumps are genuinely unrecoverable — a truly dynamic target, a hard
 decompiler limitation not helped by `deobfuscate_cff`, or the bytes are NOT a

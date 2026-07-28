@@ -7,7 +7,7 @@ message rather than a dangling ``Status: RUNNING`` stub, and (3) never expose
 ``get_task_status`` to any agent (it is withheld, so the model can't reintroduce
 manual polling).
 
-Run:  uv run pytest test_async_tasks.py -v
+Run:  uv run pytest tests/test_async_tasks.py -v
 """
 
 from __future__ import annotations

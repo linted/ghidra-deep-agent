@@ -73,6 +73,13 @@ _OLLVM_JSON_RE = manifest_pattern(OLLVM_MARK_START, OLLVM_MARK_END)
 # readable phase report the agent sees bounded.
 _OLLVM_REPORT_CAP = 6000
 
+# Strides Ghidra can actually read a jump-table entry at. Anything else makes the
+# script throw once per entry and report a misleading "no valid destinations".
+_VALID_ELEMENT_SIZES = frozenset({1, 2, 4, 8})
+# Sanity ceiling on table entries. Real switch tables are far smaller; this only
+# exists so a hallucinated `count` can't spin the script for millions of rounds.
+_MAX_TABLE_ENTRIES = 4096
+
 
 def _format_find_summary(payload: dict[str, Any]) -> str:
     counts = payload.get("counts", {})
@@ -125,6 +132,10 @@ def _format_find_summary(payload: dict[str, Any]) -> str:
                     error=f.get("error", "?"),
                 )
             )
+        # The script caps this list and flags when it did; without the flag the
+        # listing silently under-reports on a binary with many failures.
+        if payload.get("failed_truncated"):
+            lines.append("  (list truncated; decompile_failed above is the true total)")
     return "\n".join(lines)
 
 
@@ -168,6 +179,13 @@ def _format_ollvm_summary(payload: dict[str, Any], report: str) -> str:
     fn = payload.get("function")
     entry = payload.get("entry")
     where = f"{fn} @ {entry}" if fn else f"@ {entry or '?'}"
+    if status == "unsupported_arch":
+        return (
+            "deobfuscate_cff: this pass supports AArch64 only, and the open "
+            f"program is {payload.get('processor', 'a different architecture')}. "
+            "Nothing was analyzed or patched — recover the flattened control flow "
+            "by hand instead of retrying."
+        )
     if status == "no_function":
         return (
             "deobfuscate_cff: no target function resolved from that argument. "
@@ -305,6 +323,21 @@ def build_switch_tools(mcp_tools: list[BaseTool]) -> list[BaseTool]:
                 "apply_switch_override: the table-decode form needs "
                 "`table_address`, `element_size`, and `count`."
             )
+        # Bounds checked here rather than script-side: the Java loop turns a bad
+        # stride into one note per entry plus a misleading "no valid destination
+        # addresses were produced", and an unbounded `count` into millions of
+        # iterations. A precise message up front is what lets the model correct.
+        if has_table:
+            if element_size not in _VALID_ELEMENT_SIZES:
+                return (
+                    f"apply_switch_override: `element_size` must be one of "
+                    f"{sorted(_VALID_ELEMENT_SIZES)} (got {element_size})."
+                )
+            if not 0 < (count or 0) <= _MAX_TABLE_ENTRIES:
+                return (
+                    f"apply_switch_override: `count` must be between 1 and "
+                    f"{_MAX_TABLE_ENTRIES} (got {count})."
+                )
         payload: dict[str, Any] = {"jump_address": jump_address}
         if has_dests:
             payload["destinations"] = destinations
@@ -336,7 +369,11 @@ def build_switch_tools(mcp_tools: list[BaseTool]) -> list[BaseTool]:
         force: bool = False,
     ) -> str:
         """Deobfuscate ONE OLLVM control-flow-flattened (CFF) function by rewriting
-        its dispatcher into direct branches.
+        its dispatcher into direct branches. **AArch64 (ARM64) binaries only.**
+
+        The dispatch detection, address recovery, and opaque-predicate folding are
+        all AArch64-specific. On any other architecture the tool refuses and does
+        nothing — do not retry it there; recover the flattened flow by hand.
 
         Use this for the *other* kind of unrecovered indirect jump: an OLLVM CFF
         *dispatcher* (`br` on a state index loaded from a jump table) that

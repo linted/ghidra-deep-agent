@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 
 from ghidra_deep_agent.resilience import UsageLimitError
 from ghidra_deep_agent.tui import GhidraAgentApp
+from ghidra_deep_agent.tui.commands import COMMANDS, help_lines
 from ghidra_deep_agent.tui.events import handle_event, parse_checkpoint_ns
 from ghidra_deep_agent.tui.help_screen import HelpScreen
 from ghidra_deep_agent.tui.messages import SubagentReport
 from ghidra_deep_agent.tui.report_screen import SubagentReportScreen
+from ghidra_deep_agent.tui.side_mode import SideMode
 from ghidra_deep_agent.tui.widgets import (
     ActivityTree,
     CommandInput,
@@ -19,6 +21,7 @@ from ghidra_deep_agent.tui.widgets import (
     StatusBar,
     ThinkingPanel,
 )
+from ghidra_deep_agent.tui.widgets.command_input import SLASH_COMMANDS
 
 
 class _Chunk:
@@ -178,7 +181,7 @@ def test_nested_tool_calls_are_hidden() -> None:
             await pilot.pause()
             assert "outer" in activity._run_map
             assert "inner" not in activity._run_map
-            assert "inner" in app._hidden_tool_runs
+            assert "inner" in app.run_state.hidden_tool_runs
             assert len(activity.root.children) == 1
 
             # The hidden run ends with an async submission stub; it must not
@@ -192,8 +195,8 @@ def test_nested_tool_calls_are_hidden() -> None:
                     "data": {"output": "Script task submitted: abc123"},
                 }
             )
-            assert app._pending_async == {}
-            assert "inner" not in app._hidden_tool_runs
+            assert app.run_state.pending_async == {}
+            assert "inner" not in app.run_state.hidden_tool_runs
 
             emit(
                 {
@@ -204,7 +207,7 @@ def test_nested_tool_calls_are_hidden() -> None:
                 }
             )
             await pilot.pause()
-            assert app._active_tool_runs == set()
+            assert app.run_state.active_tool_runs == set()
             assert "✓" in str(activity._run_map["outer"][0].label)
 
     asyncio.run(run())
@@ -245,7 +248,7 @@ def test_subagent_inner_tools_stay_visible() -> None:
                 }
             )
             await pilot.pause()
-            assert "sub_tool" not in app._hidden_tool_runs
+            assert "sub_tool" not in app.run_state.hidden_tool_runs
             assert "sub_tool" in activity._run_map
 
     asyncio.run(run())
@@ -350,7 +353,7 @@ def test_subagent_report_captured() -> None:
                 }
             )
             await pilot.pause()
-            assert app._subagent_meta == {}
+            assert app.run_state.subagent_meta == {}
             [report] = app._subagent_reports
             assert report.run_id == "task1"
             assert report.description == description  # untruncated
@@ -386,7 +389,7 @@ def test_subagent_report_skips_async_stub_detection() -> None:
                 }
             )
             await pilot.pause()
-            assert app._pending_async == {}
+            assert app.run_state.pending_async == {}
             [report] = app._subagent_reports
             assert report.text == text
             assert "✓" in str(activity._run_map["task1"][0].label)
@@ -476,6 +479,68 @@ def test_report_screen_copy() -> None:
     asyncio.run(run())
 
 
+def test_session_touch_is_not_cancelled_by_the_agent_run() -> None:
+    """`_run_agent` is exclusive, so a shared worker group would kill the touch.
+
+    Textual cancels every worker in an exclusive worker's group on the same node.
+    Both used to default to "default", so `_start_run` killed the touch worker it
+    had just launched — no session ever recorded a title or a fresh
+    `last_active_at`, and `/resume` listed everything as "(no title)".
+    """
+    touched: list[tuple[str, str | None]] = []
+
+    class RecordingStore:
+        async def atouch(
+            self, session_id: str, first_prompt: str | None = None
+        ) -> None:
+            touched.append((session_id, first_prompt))
+
+        async def arecord_start(self, session_id: str, binary_name: str) -> None:
+            pass
+
+    async def run() -> None:
+        app = _make_app(StubAgent())
+        app._session_store = cast(Any, RecordingStore())
+        async with app.run_test() as pilot:
+            app.query_one(CommandInput).value = "analyze the entry point"
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+    asyncio.run(run())
+
+    assert touched == [("abc", "analyze the entry point")]
+
+
+def test_cancelled_run_leaves_no_active_tool_count() -> None:
+    """A cancelled turn never delivers on_tool_end for what was in flight.
+
+    Without a reset the app-side bookkeeping keeps those run_ids forever and the
+    status bar's "⚙ N active" never returns to zero for the rest of the session.
+    """
+
+    async def run() -> None:
+        app = _make_app()
+        async with app.run_test() as pilot:
+            # Tools that started and will never report completion, as after an
+            # Escape-cancel or an exception mid-stream.
+            app.run_state.active_tool_runs.add("run-1")
+            app.run_state.hidden_tool_runs.add("run-2")
+            app.run_state.pending_async["task-1"] = "run-3"
+            app.run_state.subagent_meta["run-4"] = ("recon", 0.0)
+            app.query_one(StatusBar).active_tools = 3
+            await pilot.pause()
+
+            app._reset_run_bookkeeping()
+
+            assert app.run_state.active_tool_runs == set()
+            assert app.run_state.hidden_tool_runs == set()
+            assert app.run_state.pending_async == {}
+            assert app.run_state.subagent_meta == {}
+            assert app.query_one(StatusBar).active_tools == 0
+
+    asyncio.run(run())
+
+
 def test_escape_cancels_running_agent() -> None:
     async def run() -> None:
         app = _make_app(StubAgent(delay=5.0))
@@ -523,26 +588,52 @@ def test_continue_resumes_active_side_mode() -> None:
     asyncio.run(run())
 
 
-def test_continue_in_side_mode_without_thread_is_a_noop() -> None:
-    """A side-mode flag set with no minted thread flashes instead of resuming."""
+def test_entering_a_side_mode_always_mints_a_thread() -> None:
+    """ "Mode on, no thread" used to need a runtime guard on every path.
+
+    A side-mode turn must never fall back to the main session's thread, and the
+    flags previously allowed a state where it could. SideMode carries its config,
+    so the invalid state is unrepresentable and `/continue` is always safe.
+    """
 
     async def run() -> None:
-        for flag, cfg_attr in (
-            ("_plan_mode", "_plan_config"),
-            ("_ask_mode", "_ask_config"),
-        ):
+        for kind in ("plan", "ask"):
             app = _make_app()
             async with app.run_test() as pilot:
-                called: list[bool] = []
-                # Bind `called` per iteration; it is rebound by the enclosing loop.
-                setattr(app, "_resume_run", lambda c=called: c.append(True))
-                setattr(app, flag, True)
-                setattr(app, cfg_attr, None)
-                app._dispatch_slash("/continue")
+                app._start_run = lambda *a: None  # type: ignore[method-assign]
+                app._enter_side_mode(kind, "something")
+                assert app._side is not None, kind
+                thread = app._side.config["configurable"]["thread_id"]
+                assert thread.startswith(f"{app._session_id}::{kind}::"), kind
                 await pilot.pause()
-                assert called == [], flag
 
     asyncio.run(run())
+
+
+def test_every_command_is_dispatchable_documented_and_autocompleted() -> None:
+    """The three views of a command are generated from one table.
+
+    They used to be written out separately, so a command could be dispatchable
+    but missing from autocomplete, or documented but no longer handled.
+    """
+    app = _make_app()
+    handlers = set(app._slash_handlers())
+    declared = {c.name for c in COMMANDS}
+
+    assert handlers == declared, "handler map and command table disagree"
+    assert set(SLASH_COMMANDS) == declared, "autocomplete list is out of sync"
+    documented = "\n".join(help_lines())
+    for name in declared:
+        assert name in documented, f"{name} is undocumented"
+
+
+def test_run_starting_commands_are_marked_needs_idle() -> None:
+    """The busy guard is now a table flag, not seven copy-pasted branches."""
+    by_name = {c.name: c for c in COMMANDS}
+    for name in ("/compact", "/resume", "/continue", "/plan", "/ask", "/approve"):
+        assert by_name[name].needs_idle, f"{name} could interleave two runs"
+    for name in ("/clear", "/yank", "/help", "/quit"):
+        assert not by_name[name].needs_idle
 
 
 def test_commands_that_start_a_run_are_refused_while_busy() -> None:
@@ -575,18 +666,19 @@ def test_side_modes_mint_one_thread_and_reuse_it() -> None:
         async with app.run_test() as pilot:
             app._start_run = lambda *a: None  # type: ignore[method-assign]
 
-            app._enter_plan_mode("first goal")
-            first_config = app._plan_config
-            first_path = app._plan_path
-            assert first_config is not None
-            assert app._plan_needs_seed is True
+            app._enter_side_mode("plan", "first goal")
+            assert app._side is not None
+            first_config = app._side.config
+            first_path = app._side.plan_path
+            assert app._side.needs_seed is True
 
             # Already in plan mode: the same plan file and thread keep being revised.
-            app._plan_needs_seed = False
-            app._enter_plan_mode("second goal")
-            assert app._plan_config == first_config
-            assert app._plan_path == first_path
-            assert app._plan_needs_seed is False
+            app._side.needs_seed = False
+            app._enter_side_mode("plan", "second goal")
+            assert app._side is not None
+            assert app._side.config == first_config
+            assert app._side.plan_path == first_path
+            assert app._side.needs_seed is False
 
             # The thread is this session's, namespaced by mode.
             thread_id = first_config["configurable"]["thread_id"]
@@ -604,20 +696,19 @@ def test_plan_and_ask_are_mutually_exclusive() -> None:
         async with app.run_test() as pilot:
             app._start_run = lambda *a: None  # type: ignore[method-assign]
 
-            app._enter_plan_mode("goal")
-            assert app._plan_mode is True
+            app._enter_side_mode("plan", "goal")
+            assert app._side is not None and app._side.is_plan
 
-            app._enter_ask_mode("question")
-            assert app._ask_mode is True
-            assert app._plan_mode is False
-            assert app._plan_config is None
-            assert app._ask_config is not None
-            assert "::ask::" in app._ask_config["configurable"]["thread_id"]
+            app._enter_side_mode("ask", "question")
+            assert app._side is not None
+            assert app._side.is_ask and not app._side.is_plan
+            assert app._side.plan_path is None
+            assert "::ask::" in app._side.config["configurable"]["thread_id"]
 
-            app._enter_plan_mode("goal again")
-            assert app._plan_mode is True
-            assert app._ask_mode is False
-            assert app._ask_config is None
+            app._enter_side_mode("plan", "goal again")
+            assert app._side is not None
+            assert app._side.is_plan and not app._side.is_ask
+            assert "::plan::" in app._side.config["configurable"]["thread_id"]
 
             await pilot.pause()
 
@@ -642,8 +733,11 @@ def test_usage_limit_banner_in_plan_mode_omits_relaunch() -> None:
                 return orig_write(content, *args, **kwargs)
 
             log.write = capture  # type: ignore[method-assign]
-            app._plan_mode = True
-            app._plan_config = {"configurable": {"thread_id": "abc::plan::x"}}
+            app._side = SideMode(
+                kind="plan",
+                config={"configurable": {"thread_id": "abc::plan::x"}},
+                plan_path="plans/x.md",
+            )
             app._start_run("plan turn", "hi")
             await pilot.pause(0.3)
             joined = "\n".join(writes)

@@ -15,7 +15,7 @@ These are integration tests: they need a reachable MongoDB (with vector search)
 and a working embedding model. They are marked ``integration`` and skip cleanly
 when either is unavailable, so CI runs ``pytest -m "not integration"``.
 
-Run:  uv run pytest test_knowledge.py -v
+Run:  uv run pytest tests/test_knowledge.py -v
 """
 
 from __future__ import annotations

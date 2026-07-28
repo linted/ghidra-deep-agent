@@ -283,3 +283,31 @@ To continue once your limit resets:
   then type `/continue`.
 
 `/continue` targets the main session. Plan mode (`/plan`) and ask mode (`/ask`) run on throwaway threads, so continue those by re-issuing the request. Recovery is provider-agnostic — it works the same whether the primary model is Anthropic, OpenRouter, DeepSeek, or Ollama, and across any configured `MODEL_FALLBACK`.
+
+## Development
+
+The three checks CI runs, in order:
+
+```bash
+./scripts/lint.sh       # ruff format + check (CI uses --check, which reports rather than rewrites)
+./scripts/typecheck.sh  # mypy --strict
+./scripts/test.sh       # pytest, excluding the integration tests
+```
+
+Tests live in `tests/`. `./scripts/test.sh` deselects the `integration` marker,
+which covers the tests that need live tooling:
+
+- `tests/test_knowledge.py` — a MongoDB with vector search plus an embedding model.
+- `tests/test_switch_scripts_compile.py` — a local Ghidra install and a JDK, to
+  compile the embedded Java GhidraScripts. **Run this after editing any
+  `*_script.py`**: the Java is compiled inside Ghidra at runtime, so an API
+  mismatch is invisible to every other test and surfaces only as a "no JSON
+  manifest found" failure against a live server.
+
+```bash
+uv run pytest -m integration
+```
+
+CI (`.github/workflows/ci.yml`) runs the same three scripts across Python 3.12
+(the floor declared in `pyproject.toml`) and 3.14 (what `.python-version` pins
+locally), so the floor can't silently rot.

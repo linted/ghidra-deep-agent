@@ -38,7 +38,7 @@ jobs:
       - name: Typecheck
         run: ./scripts/typecheck.sh
 
-      # Integration tests (test_knowledge.py) need a live MongoDB with vector
+      # Integration tests (tests/test_knowledge.py) need a live MongoDB with vector
       # search plus an embedding model, so they are deselected here.
       - name: Test
         run: ./scripts/test.sh

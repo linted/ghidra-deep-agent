@@ -92,8 +92,8 @@ public class gda_recover_prototypes extends GhidraScript {
     static final String MARK_END = "<<<END_RECOVER_PROTOTYPES_JSON>>>";
     static final String REVIEW_CATEGORY = "proto-review";
     static final int DECOMP_TIMEOUT = 60;   // seconds per function
-    static final int FIXED_DETAIL_CAP = 200;
     static final int FAILED_DETAIL_CAP = 200;
+    static final int ESCALATE_DETAIL_CAP = 200;
     static final int CHUNK_SIZE = 64;       // bounds live HighFunctions per chunk
 
     // Worker threads only decompile and classify (read-only); every program-DB
@@ -115,8 +115,7 @@ public class gda_recover_prototypes extends GhidraScript {
     private boolean dryRun = false;
     private int scanned = 0, alreadyCorrect = 0, fixed = 0;
     private int escalate = 0, escalateKnown = 0, decompFailed = 0;
-    private int fixedDetail = 0, failedDetail = 0;
-    private StringBuilder fixedJson = new StringBuilder();
+    private int failedDetail = 0, escalateDetail = 0;
     private StringBuilder escJson = new StringBuilder();
     private StringBuilder failJson = new StringBuilder();
 
@@ -338,13 +337,6 @@ public class gda_recover_prototypes extends GhidraScript {
             r.hf = null;
             if (committed) {
                 fixed++;
-                if (fixedDetail < FIXED_DETAIL_CAP) {
-                    appendObj(fixedJson,
-                        "{\"addr\":\"" + js(r.addrS) + "\",\"name\":\"" + js(r.nameS)
-                        + "\",\"old\":\"" + js(r.comS) + "\",\"new\":\"" + js(r.recS)
-                        + "\"}");
-                    fixedDetail++;
-                }
                 return;
             }
             escalateResult(r, "decompiler recovery could not be committed");
@@ -360,10 +352,16 @@ public class gda_recover_prototypes extends GhidraScript {
             setReviewBookmark(r.func.getEntryPoint(), reason);
         }
         escalate++;
-        appendObj(escJson,
-            "{\"addr\":\"" + js(r.addrS) + "\",\"name\":\"" + js(r.nameS)
-            + "\",\"committed\":\"" + js(r.comS) + "\",\"recovered\":\"" + js(r.recS)
-            + "\",\"reason\":\"" + js(reason) + "\"}");
+        // Capped like the failed list: a binary with thousands of ambiguous
+        // prototypes would otherwise emit an unbounded manifest straight into
+        // the model's context.
+        if (escalateDetail < ESCALATE_DETAIL_CAP) {
+            appendObj(escJson,
+                "{\"addr\":\"" + js(r.addrS) + "\",\"name\":\"" + js(r.nameS)
+                + "\",\"committed\":\"" + js(r.comS) + "\",\"recovered\":\"" + js(r.recS)
+                + "\",\"reason\":\"" + js(reason) + "\"}");
+            escalateDetail++;
+        }
     }
 
     @Override
@@ -427,7 +425,7 @@ public class gda_recover_prototypes extends GhidraScript {
                     candidates.subList(i, Math.min(i + CHUNK_SIZE, candidates.size()));
                 List<ProtoResult> results = pd.decompileFunctions(chunk);
                 // Results arrive in completion order; sort by address so the
-                // JSON arrays and the FIXED_DETAIL_CAP cutoff stay deterministic.
+                // JSON arrays and the FAILED_DETAIL_CAP cutoff stay deterministic.
                 results.sort(Comparator.comparing(r -> r.func.getEntryPoint()));
                 for (ProtoResult r : results) {
                     applyResult(r);
@@ -450,9 +448,9 @@ public class gda_recover_prototypes extends GhidraScript {
            .append(",\"escalate\":").append(escalate)
            .append(",\"escalate_known\":").append(escalateKnown)
            .append(",\"decompile_failed\":").append(decompFailed)
-           .append("},\"fixed\":[").append(fixedJson).append("]")
-           .append(",\"fixed_truncated\":").append(fixed > fixedDetail ? "true" : "false")
-           .append(",\"escalate\":[").append(escJson).append("]")
+           .append("},\"escalate\":[").append(escJson).append("]")
+           .append(",\"escalate_truncated\":")
+           .append(escalate > escalateDetail ? "true" : "false")
            .append(",\"failed\":[").append(failJson).append("]")
            .append(",\"failed_truncated\":")
            .append(decompFailed > failedDetail ? "true" : "false")

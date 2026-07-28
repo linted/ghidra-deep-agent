@@ -6,23 +6,14 @@ from textual.binding import Binding
 from textual.suggester import SuggestFromList
 from textual.widgets import Input
 
+from ghidra_deep_agent.tui.commands import SLASH_COMMAND_NAMES
+
 PLACEHOLDER_IDLE = "Enter task (Ctrl+C quit · /help for commands)…"
 PLACEHOLDER_BUSY = "Agent is running… type ahead, Enter to queue"
 
-SLASH_COMMANDS = [
-    "/approve",
-    "/ask",
-    "/ask-cancel",
-    "/clear",
-    "/compact",
-    "/continue",
-    "/help",
-    "/plan",
-    "/plan-cancel",
-    "/quit",
-    "/resume",
-    "/yank",
-]
+# Derived from the one command table (tui/commands.py) so autocomplete can't
+# drift from what `_dispatch_slash` actually accepts.
+SLASH_COMMANDS = SLASH_COMMAND_NAMES
 
 
 class CommandInput(Input):

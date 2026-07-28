@@ -1,6 +1,23 @@
+"""MongoDB-backed knowledge base of findings about the binary under analysis.
+
+Exposes the ``save_knowledge`` / ``update_knowledge`` write tools and a family of
+read tools (by address, category, tags, or the whole listing) plus a semantic
+retriever. Findings are scoped by ``binary_name`` so one collection can hold
+several binaries' analyses.
+
+Every listing tool caps what it returns (``QUERY_RESULT_CAP``) and says so when
+it truncates: results go straight into the model's context, so an uncapped
+``find()`` would grow without bound as the base fills up.
+
+Configuration (env):
+  MONGODB_VECTOR_COLLECTION   collection name (default ``re_knowledge``)
+"""
+
 import os
 import re
+import sys
 from collections import Counter
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -10,10 +27,9 @@ from langchain_core.tools import tool
 from langchain_core.tools.retriever import create_retriever_tool
 from langchain_mongodb import MongoDBAtlasVectorSearch
 from langchain_mongodb.embeddings import AutoEmbeddings
-from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-from ghidra_deep_agent.mongo_util import mongo_write_with_retry
+from ghidra_deep_agent.mongo_util import get_mongo_client, mongo_write_with_retry
 
 # Caps applied when rendering the session-start summary so the result
 # stays predictable as the knowledge base grows.
@@ -30,6 +46,51 @@ LISTING_SNIPPET_CHARS = 100
 # base fills up. Callers report when the cap was hit so the model knows the
 # listing is partial.
 QUERY_RESULT_CAP = 100
+
+# Documents `get_knowledge_summary` will scan. It aggregates rather than listing,
+# so it can afford far more than QUERY_RESULT_CAP — but not an unbounded find():
+# this is the tool the prompt tells the agent to call at the start of every
+# session, and it would otherwise load the entire knowledge base into memory as
+# the base fills up. The headline total is counted separately so it stays exact.
+SUMMARY_SCAN_CAP = 1000
+
+
+# Fields every listing tool renders from. Kept as one projection because the
+# tools differ in how they *format* a finding, not in which fields they need —
+# four near-identical copies of this dict is how they drifted before.
+_FINDING_PROJECTION: dict[str, Any] = {
+    "text": 1,
+    "category": 1,
+    "address": 1,
+    "function_name": 1,
+    "confidence": 1,
+    "tags": 1,
+    "_id": 0,
+}
+
+
+def _find_findings(
+    collection: Any,
+    query: Mapping[str, Any],
+    *,
+    tags: list[str] | None = None,
+    sort_by: str | None = None,
+    projection: Mapping[str, Any] | None = None,
+    limit: int = QUERY_RESULT_CAP,
+) -> list[dict[str, Any]]:
+    """Run a capped findings query, optionally filtered by tags and sorted.
+
+    The four listing tools share this; only their rendering differs. ``tags``
+    matches a finding carrying *any* of the given tags.
+    """
+    filters = dict(query)
+    if tags:
+        filters["tags"] = {"$in": tags}
+    cursor = collection.find(filters, dict(projection or _FINDING_PROJECTION))
+    if sort_by:
+        cursor = cursor.sort(sort_by, 1)
+    docs: list[dict[str, Any]] = list(cursor.limit(limit))
+    return docs
 
 
 def _address_prefix_filter(address: str) -> dict[str, Any]:
@@ -52,8 +113,15 @@ def _cap_note(docs: list[dict[str, Any]]) -> str:
     )
 
 
-def _render_knowledge_summary(docs: list[dict[str, Any]], binary_name: str) -> str:
-    """Render the markdown summary string from already-fetched MongoDB docs."""
+def _render_knowledge_summary(
+    docs: list[dict[str, Any]], binary_name: str, total: int | None = None
+) -> str:
+    """Render the markdown summary string from already-fetched MongoDB docs.
+
+    ``total`` is the true document count when the caller capped its scan; the
+    breakdowns below are then over the scanned subset, which is called out in the
+    output so the model doesn't read them as exhaustive. Defaults to ``len(docs)``.
+    """
     header = f"# Knowledge summary for {binary_name}"
     if not docs:
         return (
@@ -88,10 +156,16 @@ def _render_knowledge_summary(docs: list[dict[str, Any]], binary_name: str) -> s
             tag_counter[t] += 1
     top_tags = tag_counter.most_common(SUMMARY_TAG_CAP)
 
+    scanned = len(docs)
+    reported_total = scanned if total is None else total
     lines: list[str] = [header, ""]
     lines.append(
-        f"Totals: {len(docs)} findings across {len(category_counts)} categories"
+        f"Totals: {reported_total} findings across {len(category_counts)} categories"
     )
+    if reported_total > scanned:
+        lines.append(
+            f"  (breakdowns below cover the {scanned} most recent findings scanned)"
+        )
     lines.append(
         "  "
         + "  ".join(f"{cat}: {n}" for cat, n in category_counts.most_common() if cat)
@@ -145,9 +219,8 @@ def _render_knowledge_summary(docs: list[dict[str, Any]], binary_name: str) -> s
 def build_knowledge_tools(
     mongodb_uri: str, mongodb_db: str, embeddings: Embeddings, binary_name: str
 ) -> list[Any]:
-    client: MongoClient[Any] = MongoClient(mongodb_uri)
     collection_name = os.environ.get("MONGODB_VECTOR_COLLECTION", "re_knowledge")
-    collection = client[mongodb_db][collection_name]
+    collection = get_mongo_client(mongodb_uri)[mongodb_db][collection_name]
 
     is_autoembedding = isinstance(embeddings, AutoEmbeddings)
     if is_autoembedding:
@@ -194,8 +267,8 @@ def build_knowledge_tools(
                 wait_until_complete=60,
             )
     except Exception as exc:
-        import sys
-
+        # stderr rather than a toast: this runs from `_build_tools` during
+        # startup, before the TUI exists to show one.
         print(
             f"Warning: vector search index setup failed ({exc});"
             " direct query tools still work",
@@ -313,25 +386,13 @@ def build_knowledge_tools(
             tags: Optional list of tags to filter by; returns findings that have
                 at least one matching tag, e.g. ['crypto', 'loop'].
         """
-        query: dict[str, Any] = {
-            "binary_name": binary_name,
-            "address": _address_prefix_filter(address),
-        }
-        if tags:
-            query["tags"] = {"$in": tags}
-        docs = list(
-            collection.find(
-                query,
-                {
-                    "text": 1,
-                    "category": 1,
-                    "address": 1,
-                    "function_name": 1,
-                    "confidence": 1,
-                    "tags": 1,
-                    "_id": 0,
-                },
-            ).limit(QUERY_RESULT_CAP)
+        docs = _find_findings(
+            collection,
+            {
+                "binary_name": binary_name,
+                "address": _address_prefix_filter(address),
+            },
+            tags=tags,
         )
         if not docs:
             return f"No findings for address '{address}'."
@@ -355,20 +416,10 @@ def build_knowledge_tools(
             tags: Optional list of tags to filter by; returns findings that have
                 at least one matching tag, e.g. ['crypto', 'loop'].
         """
-        query: dict[str, Any] = {"binary_name": binary_name, "category": category}
-        if tags:
-            query["tags"] = {"$in": tags}
-        docs = list(
-            collection.find(
-                query,
-                {
-                    "text": 1,
-                    "address": 1,
-                    "function_name": 1,
-                    "confidence": 1,
-                    "_id": 0,
-                },
-            ).limit(QUERY_RESULT_CAP)
+        docs = _find_findings(
+            collection,
+            {"binary_name": binary_name, "category": category},
+            tags=tags,
         )
         if not docs:
             return f"No findings for category '{category}'."
@@ -391,9 +442,11 @@ def build_knowledge_tools(
 
         For a complete listing of every finding (rare), use `list_all_knowledge`.
         """
+        query = {"binary_name": binary_name}
+        total = collection.count_documents(query)
         docs = list(
             collection.find(
-                {"binary_name": binary_name},
+                query,
                 {
                     "text": 1,
                     "category": 1,
@@ -403,9 +456,9 @@ def build_knowledge_tools(
                     "tags": 1,
                     "_id": 0,
                 },
-            )
+            ).limit(SUMMARY_SCAN_CAP)
         )
-        return _render_knowledge_summary(docs, binary_name)
+        return _render_knowledge_summary(docs, binary_name, total)
 
     @tool
     def list_all_knowledge(tags: list[str] | None = None) -> str:
@@ -418,25 +471,12 @@ def build_knowledge_tools(
             tags: Optional list of tags to filter by; returns findings that have
                 at least one matching tag, e.g. ['crypto', 'loop'].
         """
-        query: dict[str, Any] = {"binary_name": binary_name}
-        if tags:
-            query["tags"] = {"$in": tags}
-        docs = list(
-            collection.find(
-                query,
-                {
-                    "text": 1,
-                    "category": 1,
-                    "address": 1,
-                    "function_name": 1,
-                    "confidence": 1,
-                    "tags": 1,
-                    "saved_at": 1,
-                    "_id": 0,
-                },
-            )
-            .sort("category", 1)
-            .limit(QUERY_RESULT_CAP)
+        docs = _find_findings(
+            collection,
+            {"binary_name": binary_name},
+            tags=tags,
+            sort_by="category",
+            projection={**_FINDING_PROJECTION, "saved_at": 1},
         )
         if not docs:
             return f"Knowledge base is empty for '{binary_name}'."
@@ -471,21 +511,11 @@ def build_knowledge_tools(
             tags: One or more tags to search for, e.g. ['crypto', 'hash'].
                 Returns findings that match at least one tag.
         """
-        docs = list(
-            collection.find(
-                {"binary_name": binary_name, "tags": {"$in": tags}},
-                {
-                    "text": 1,
-                    "category": 1,
-                    "address": 1,
-                    "function_name": 1,
-                    "confidence": 1,
-                    "tags": 1,
-                    "_id": 0,
-                },
-            )
-            .sort("category", 1)
-            .limit(QUERY_RESULT_CAP)
+        docs = _find_findings(
+            collection,
+            {"binary_name": binary_name},
+            tags=tags,
+            sort_by="category",
         )
         if not docs:
             return f"No findings tagged with {tags}."
