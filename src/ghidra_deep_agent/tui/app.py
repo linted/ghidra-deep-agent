@@ -274,7 +274,8 @@ class GhidraAgentApp(App[None]):
         A run cancelled with Escape (or aborted by an exception) never delivers
         ``on_tool_end`` for whatever was in flight, so its run_ids would otherwise
         persist and the status bar's active-tool count would never return to zero.
-        ``ActivityTree.reset()`` clears the tree's own map; this is the app-side
+        The tree forgets its own in-flight runs in ``ActivityTree.reset()`` (a
+        fresh turn) or ``mark_resumed()`` (``/continue``); this is the app-side
         half of the same bookkeeping.
         """
         self.run_state = RunState()
@@ -297,11 +298,15 @@ class GhidraAgentApp(App[None]):
         limit (see ``UsageLimitError`` handling in ``_run_agent``). ``_run_agent``
         resolves the agent+config from the current mode flags, so this resumes
         the main, plan, or ask thread transparently.
+
+        The activity tree is carried across rather than cleared: this is the same
+        turn continuing, and the restored sub-agents emit no events, so wiping it
+        would lose that history for good.
         """
         self._set_busy(True)
         response = self.query_one(ResponseLog)
         response.write("[dim]↻ Continuing from the last checkpoint…[/dim]")
-        self.query_one(ActivityTree).reset()
+        self.query_one(ActivityTree).mark_resumed()
         self._reset_run_bookkeeping()
         self._touch_session("/continue")
         self._agent_worker = self._run_agent(None)
