@@ -588,6 +588,119 @@ def test_continue_resumes_active_side_mode() -> None:
     asyncio.run(run())
 
 
+def test_continue_keeps_the_activity_tree() -> None:
+    """`/continue` resumes the same turn, so its tree must survive.
+
+    It used to call `ActivityTree.reset()`, wiping the pane — and since the
+    sub-agents LangGraph restores from pending writes emit no events, that
+    history never came back. What was in flight when the pause hit is frozen
+    instead, because its `on_tool_end` will never arrive.
+    """
+
+    async def run() -> None:
+        app = _make_app()
+        async with app.run_test() as pilot:
+            activity = app.query_one(ActivityTree)
+            response = app.query_one(ResponseLog)
+            thinking = app.query_one(ThinkingPanel)
+            # Decorated with @work, so its bound type isn't a plain callable.
+            setattr(app, "_run_agent", lambda _q: None)
+
+            def emit(event: dict[str, Any]) -> None:
+                handle_event(app, event, activity, response, thinking)
+
+            emit(
+                {
+                    "event": "on_tool_start",
+                    "run_id": "done",
+                    "name": "get_code",
+                    "metadata": {},
+                    "parent_ids": [],
+                    "data": {"input": {"address": "0x1000"}},
+                }
+            )
+            emit(
+                {
+                    "event": "on_tool_end",
+                    "run_id": "done",
+                    "metadata": {},
+                    "data": {"output": "int main(void) {}"},
+                }
+            )
+            emit(
+                {
+                    "event": "on_tool_start",
+                    "run_id": "interrupted",
+                    "name": "decompile",
+                    "metadata": {},
+                    "parent_ids": [],
+                    "data": {"input": {"address": "0x2000"}},
+                }
+            )
+            await pilot.pause()
+            finished = activity._run_map["done"][0]
+            paused = activity._run_map["interrupted"][0]
+
+            app._resume_run()
+            await pilot.pause()
+
+            labels = [str(node.label) for node in activity.root.children]
+            assert "✓" in str(finished.label), "completed work was wiped"
+            assert "⏸ paused" in str(paused.label), "in-flight node still reads as live"
+            assert "interrupted" not in activity._run_map, "a run that can never end"
+            assert activity._pending_runs == set()
+            assert any("↻ continued" in label for label in labels)
+
+    asyncio.run(run())
+
+
+def test_resumed_subagent_reuses_its_node() -> None:
+    """A replayed task keeps its (deterministic) id, so it must not grow a twin."""
+
+    async def run() -> None:
+        app = _make_app()
+        async with app.run_test() as pilot:
+            activity = app.query_one(ActivityTree)
+            response = app.query_one(ResponseLog)
+            thinking = app.query_one(ThinkingPanel)
+            # Decorated with @work, so its bound type isn't a plain callable.
+            setattr(app, "_run_agent", lambda _q: None)
+
+            def start_subagent(run_id: str) -> None:
+                handle_event(
+                    app,
+                    {
+                        "event": "on_tool_start",
+                        "run_id": run_id,
+                        "name": "task",
+                        "metadata": {"langgraph_checkpoint_ns": "tools:abc"},
+                        "parent_ids": [],
+                        "data": {"input": {"description": "research"}},
+                    },
+                    activity,
+                    response,
+                    thinking,
+                )
+
+            start_subagent("task1")
+            await pilot.pause()
+            original = activity._ns_to_node[("tools:abc",)]
+            before = len(activity.root.children)
+
+            app._resume_run()
+            await pilot.pause()
+            start_subagent("task1-replayed")
+            await pilot.pause()
+
+            # Only the "↻ continued" marker was added.
+            assert len(activity.root.children) == before + 1
+            assert activity._ns_to_node[("tools:abc",)] is original
+            assert activity._run_map["task1-replayed"][0] is original
+            assert "●" in str(original.label), "the relit node still reads as paused"
+
+    asyncio.run(run())
+
+
 def test_entering_a_side_mode_always_mints_a_thread() -> None:
     """ "Mode on, no thread" used to need a runtime guard on every path.
 

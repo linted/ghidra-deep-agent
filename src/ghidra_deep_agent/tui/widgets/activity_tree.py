@@ -21,8 +21,12 @@ class ActivityTree(Tree[None]):
     def _reset(self) -> None:
         self.clear()
         self.root.expand()
-        # run_id -> (node, start_time, base_label, is_subagent)
+        # run_id -> (node, start_time, base_label, is_subagent). Entries outlive
+        # the run: `on_tool_ended` relabels the node but keeps the mapping.
         self._run_map: dict[str, tuple[TreeNode[None], float, str, bool]] = {}
+        # The subset of `_run_map` still showing the in-progress marker, so
+        # `mark_resumed` can freeze those without touching finished nodes.
+        self._pending_runs: set[str] = set()
         # checkpoint_ns segments -> sub-agent node, used to nest events
         # under sub-agents.
         self._ns_to_node: dict[tuple[str, ...], TreeNode[None]] = {}
@@ -31,6 +35,26 @@ class ActivityTree(Tree[None]):
 
     def reset(self) -> None:  # type: ignore[override]
         self._reset()
+
+    def mark_resumed(self) -> None:
+        """Freeze the interrupted turn's in-flight nodes and mark the boundary.
+
+        `/continue` keeps the tree rather than clearing it: the work already done
+        is still this run's history, and the sub-agents LangGraph restores from
+        pending writes never re-emit the events that would redraw them. What
+        *was* in flight when the pause hit will never deliver its `on_tool_end`
+        — the resumed stream carries fresh run_ids — so relabel those nodes
+        instead of leaving a `●` that reads as "still running".
+
+        `_ns_to_node` deliberately survives: it is what lets the resumed events
+        nest back under their original sub-agent nodes.
+        """
+        self._clear_thinking()
+        for run_id in self._pending_runs:
+            node, _start, base, _is_subagent = self._run_map.pop(run_id)
+            node.set_label(f"{base}  [dim]⏸ paused[/dim]")
+        self._pending_runs.clear()
+        self.root.add_leaf("[dim]↻ continued[/dim]")
 
     # -- tool tracking -------------------------------------------------------
 
@@ -43,8 +67,18 @@ class ActivityTree(Tree[None]):
             if preview:
                 base += f": [dim]{preview}[/dim]"
             label = f"{base}  [yellow]●[/yellow]"
-            node = parent_node.add(label, expand=True)
-            self._ns_to_node[parse_checkpoint_ns(msg.checkpoint_ns)] = node
+            ns = parse_checkpoint_ns(msg.checkpoint_ns)
+            node = self._ns_to_node.get(ns)
+            if node is None:
+                node = parent_node.add(label, expand=True)
+                self._ns_to_node[ns] = node
+            else:
+                # After `/continue` the re-run task replays with the same
+                # (deterministic) task id, so this sub-agent already has a node
+                # holding the work it did before the pause. Relight it rather
+                # than growing a twin alongside it.
+                node.set_label(label)
+                node.expand()
         else:
             base = f"⚙ {msg.name}"
             if preview:
@@ -57,8 +91,10 @@ class ActivityTree(Tree[None]):
             base,
             msg.is_subagent,
         )
+        self._pending_runs.add(msg.run_id)
 
     def on_tool_ended(self, msg: ToolEnded) -> None:
+        self._pending_runs.discard(msg.run_id)
         entry = self._run_map.get(msg.run_id)
         if entry is None:
             return
