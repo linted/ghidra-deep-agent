@@ -8,6 +8,9 @@ mongodb/firmware_pwfile
 mongodb/admin_pwfile
 mongodb/tls/
 openrouter.toml
+# Local agent config: point AGENT_CONFIG at this to override the committed
+# subagents.toml (per-agent models, tool allowlists) without dirtying it.
+subagents.toml.local
 
 # Analysis artifacts the agent writes about a target binary. These are findings
 # about someone else's software, not this project's source — keep them local.
