@@ -33,11 +33,19 @@
   Evidence (`agent_topology`): 80 LLM calls / 5.92M tokens across 2 invocations (~40 calls /
   ~2.96M tokens each, 84:1 prompt:completion). Expected: 40–60% token reduction and latency
   541s → ~120–180s per invocation. Effort: Med. *Caveat:* dynamic subagents were evaluated
-  2026-06-29 and parked because the QuickJS interpreter runtime is beta — prior design work in
-  `~/.claude/plans/langchain-came-out-with-ticklish-scone.md`; start there. *Update
-  (2026-07-30):* langchain-quickjs 0.3.5 shipped alongside deepagents 0.7 (which now has a
-  `quickjs` extra), but `CodeInterpreterMiddleware` is still marked experimental — stays
-  parked; re-check when deepagents 0.8 lands.
+  2026-06-29 and parked because the QuickJS interpreter runtime is beta. (The prior design
+  writeup, `~/.claude/plans/langchain-came-out-with-ticklish-scone.md`, no longer exists on
+  disk — the "Dynamic subagents — split `research`" section below is the surviving design
+  record.) *Update (2026-07-30):* langchain-quickjs 0.3.5 shipped alongside deepagents 0.7
+  (which now has a `quickjs` extra), but `CodeInterpreterMiddleware` is still marked
+  experimental — stays parked; re-check when deepagents 0.8 lands. *Update (2026-07-30,
+  OpenShell criterion):* evaluated whether the interpreter could run inside the
+  `SANDBOX=openshell` backend — it cannot: `CodeInterpreterMiddleware` embeds QuickJS in the
+  agent process via `quickjs-rs` (docs: "runs in an embedded QuickJS context, not a separate
+  VM or process"), exposes no executor/backend parameter, and its `task()`/PTC bridges are
+  in-process callbacks into the live agent loop that can't cross into a sandbox — the docs
+  treat interpreters and sandboxes as disjoint features. Stays parked until that changes (or
+  the in-process constraint is accepted); still beta as of langchain-quickjs 0.3.5.
 
 ### From the deepagents 0.7 upgrade (2026-07-30)
 
@@ -444,9 +452,10 @@ and use them to restructure the `research` sub-agent:
   fit for this project but **parked because the QuickJS interpreter runtime is beta** (runs
   in-process, and interpreter-dispatched runs break the TUI's `is_subagent = name == "task"`
   tracking). The full flag-gated design, TUI observability work, and open questions (5s eval
-  timeout, dispatched-run event shape) are written up in
-  `~/.claude/plans/langchain-came-out-with-ticklish-scone.md` — start there rather than
-  re-deriving. If QuickJS is still a blocker, the planner→workers→synthesizer shape can be
+  timeout, dispatched-run event shape) were written up in
+  `~/.claude/plans/langchain-came-out-with-ticklish-scone.md`, but that file no longer exists
+  on disk — this section is the surviving design record; the flag-gating and TUI observability
+  work would need re-deriving. If QuickJS is still a blocker, the planner→workers→synthesizer shape can be
   approximated with the existing static `task` tool (batched same-turn parallel `task` calls),
   at the cost of code-driven orchestration.
 
