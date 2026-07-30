@@ -58,12 +58,37 @@ default-agent turn's input tokens 65%). Follow-ups it unlocks:
   overridable directly (`FilesystemMiddleware(custom_tool_descriptions={...})`).
   0.7's own 43% tool-description trim may make further trimming moot — measure a
   live turn's token breakdown before doing anything.
-- [ ] **Evaluate harness profiles** (`deepagents/profiles/`) — per-model/provider
+- [x] **Evaluate harness profiles** (`deepagents/profiles/`) — per-model/provider
   config bundles (Anthropic, OpenAI Codex, NVIDIA Nemotron 3 Ultra, an OpenRouter
   provider profile) that `create_deep_agent` applies automatically, including
   per-profile middleware exclusion by name. Could replace some hand-rolled
   per-model config in `models.py` / `openrouter.toml`; also worth checking none
-  auto-apply unexpectedly to our model specs.
+  auto-apply unexpectedly to our model specs. *Evaluated 2026-07-30 — no action.*
+  Two orthogonal systems: `HarnessProfile` (runtime: prompt suffix, extra
+  middleware, tool-description overrides, exclusion by name; matched purely on
+  `provider:model`/`provider` strings, no `profile=` param or disable env,
+  unmatched models get an empty no-op) and `ProviderProfile` (construction
+  kwargs, string specs only). **Nothing auto-applies to our specs:** all 14
+  built-in harness profiles are per-model (no provider-wide `anthropic`/
+  `openrouter` keys), 2-colon specs like `openrouter:z-ai/glm-5.2:floor` are
+  rejected by the lookup, preset-backed models are pre-built instances whose
+  identifiers match nothing, and nothing is registered for `deepseek`. Only
+  latent match is subagents.py's last-resort `anthropic:claude-sonnet-4-6`
+  default → a benign 3-block prompt suffix. No shipped profile excludes any
+  middleware, so the replace-by-name compaction seam is unaffected. **Nothing
+  to migrate:** profiles carry no token/context/temperature/summarization
+  knobs; `openrouter.toml` is per-model *routing* a per-provider
+  `ProviderProfile` can't express; `_ChatDeepSeekFixed` is a wire-payload fix
+  with no profile hook. Caveats recorded, both currently harmless: (a)
+  pre-built `ChatOpenRouter` instances skip the `openrouter` ProviderProfile
+  (version floor moot — pyproject pins ≥0.2.6; app-attribution headers
+  cosmetic; the `ignore: ["azure"]` workaround moot while every preset pins
+  providers via `only` — revisit if a preset without `only`/`order` is added);
+  (b) **Nemotron footgun** — `openrouter:nvidia/nemotron-3-ultra-550b-a55b`
+  (+7 sibling keys) auto-applies 12 middlewares incl. hard budget caps
+  (16 model calls / 48 tool results) that would strangle our loops, for string
+  specs *and* pre-built instances; avoid Nemotron ids in subagents.toml
+  (registration is additive-merge, no unregister API).
 
 ### From optimization report (2026-06-28, 7d window)
 
