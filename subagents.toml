@@ -216,7 +216,7 @@ them into a plan. Do NOT paste raw decompiler or disassembly dumps.
 # unbounded (the full tool set) so the coordinator can hand it anything the
 # specialists don't cover, and so traces reveal what other specialists are worth
 # adding. `tools = "*"` means every available tool (Ghidra + knowledge);
-# filesystem and todo tools come from middleware automatically. `system_prompt`
+# filesystem tools come from middleware automatically. `system_prompt`
 # is omitted so it uses deepagents' stock general-purpose prompt.
 [[subagents]]
 name = "general-purpose"

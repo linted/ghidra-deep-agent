@@ -26,8 +26,8 @@ from pymongo.errors import ServerSelectionTimeoutError
 
 from ghidra_deep_agent.async_tasks import build_async_task_middleware
 from ghidra_deep_agent.compaction import (
+    build_tuned_summarization_middleware,
     create_forced_summarization_tool_middleware,
-    install_tuned_summarization,
 )
 from ghidra_deep_agent.defaults import (
     DEFAULT_MAX_CONTEXT_TOKENS,
@@ -328,6 +328,8 @@ def _build_shared_middleware(
     cache_mw: Any,
     async_mw: Any,
     summary_model: Any,
+    built_model: Any,
+    summary_override: Any,
 ) -> list[Any]:
     """Middleware shared by all three graphs, in wrapping order.
 
@@ -350,6 +352,12 @@ def _build_shared_middleware(
         *([async_mw] if async_mw is not None else []),
         build_tool_retry_middleware(),
         create_forced_summarization_tool_middleware(summary_model, storage.backend),
+        # Auto-summarizer for the coordinator: stock thresholds (COMPACT_MAIN_*
+        # overrides), summary routed per SUMMARY_MODEL. Replaces deepagents'
+        # stock SummarizationMiddleware by name (0.7 replace-by-name).
+        build_tuned_summarization_middleware(
+            built_model, storage.backend, summary_model=summary_override, scope="main"
+        ),
     ]
 
 
@@ -457,14 +465,6 @@ async def main() -> None:
     async_mw = build_async_task_middleware(tools)
     if async_mw is not None:
         print("Async task resolution enabled (polling get_task_status).")
-    subagents = build_subagents(
-        all_tools,
-        agent_config,
-        resolve_model,
-        cache_middleware=cache_mw,
-        async_middleware=async_mw,
-    )
-    plan_mode_subagents, ask_mode_subagents = _read_only_delegates(subagents)
     print(f"Main agent: {main_model_spec}  [{len(main_tools)} tool(s)]")
     for sub_cfg in agent_config.subagents:
         print(
@@ -494,21 +494,31 @@ async def main() -> None:
             # smaller/cheaper model; unset keeps the prior behavior of summarizing
             # with the main model.
             summary_spec = os.environ.get("SUMMARY_MODEL")
-            # None when unset, which `install_tuned_summarization` reads as "use
-            # the agent's own model".
+            # None when unset, which the tuned-summarization builder reads as
+            # "use the agent's own model".
             summary_override = resolve_model(summary_spec) if summary_spec else None
             # Resolved eagerly: the TUI calls `.ainvoke` on this to summarize prior
             # context when entering plan/ask mode, and `build_model` hands back a
             # bare string for any provider it doesn't special-case.
             summary_model = ensure_chat_model(summary_override or built_model)
 
-            # Tune the auto-summarizer create_deep_agent wires internally.
-            # Sub-agents compact aggressively by default (they never reached
-            # deepagents' 170k no-profile trigger); the main agent — identified
-            # by its model — keeps stock thresholds. COMPACT_* / COMPACT_MAIN_*
-            # env knobs override either scope, and SUMMARY_MODEL routes the
-            # auto summary too, not just /compact.
-            install_tuned_summarization(summary_override, main_model=built_model)
+            # Tuned auto-summarizers ride along as replace-by-name middleware:
+            # sub-agents compact aggressively by default (they never reached
+            # deepagents' 170k no-profile trigger); the main agent keeps stock
+            # thresholds. COMPACT_* / COMPACT_MAIN_* env knobs override either
+            # scope, and SUMMARY_MODEL routes the auto summary too, not just
+            # /compact. Built here because they offload evicted history to the
+            # session backend.
+            subagents = build_subagents(
+                all_tools,
+                agent_config,
+                resolve_model,
+                storage.backend,
+                cache_middleware=cache_mw,
+                async_middleware=async_mw,
+                summary_model=summary_override,
+            )
+            plan_mode_subagents, ask_mode_subagents = _read_only_delegates(subagents)
 
             shared_middleware = _build_shared_middleware(
                 storage=storage,
@@ -516,6 +526,8 @@ async def main() -> None:
                 cache_mw=cache_mw,
                 async_mw=async_mw,
                 summary_model=summary_model,
+                built_model=built_model,
+                summary_override=summary_override,
             )
 
             graphs = _build_graphs(

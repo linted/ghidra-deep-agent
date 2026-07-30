@@ -8,16 +8,17 @@ Two concerns live here:
    still comfortably within budget. We swap in a subclass that always treats
    manual compaction as eligible.
 
-2. **Tuning the *auto* summarizer.** ``create_deep_agent`` hard-wires
-   ``create_summarization_middleware(model, backend)`` for the main agent and
-   every sub-agent, with no parameter to lower the trigger or route the (cheap,
-   structured) summary call to a smaller model. deepagents' own
-   ``SummarizationMiddleware`` *does* accept ``trigger``/``keep``/``model``, so
-   ``install_tuned_summarization`` monkeypatches the factory symbol that
-   ``create_deep_agent`` calls, returning a tuned instance instead. This keeps
-   all of deepagents' summarization behavior (backend offload of evicted
-   history, pre-summarization tool-arg truncation, ``ContextOverflowError``
-   fallback) while letting us compact earlier and summarize on a cheaper model.
+2. **Tuning the *auto* summarizer.** ``create_deep_agent`` installs a stock
+   ``SummarizationMiddleware(model, backend)`` for the main agent and every
+   sub-agent, with no parameter to lower the trigger or route the (cheap,
+   structured) summary call to a smaller model. Since deepagents 0.7, a
+   ``middleware=`` (or sub-agent ``middleware``) entry whose ``.name`` matches a
+   built-in **replaces** that default in place, so
+   ``build_tuned_summarization_middleware`` builds a tuned
+   ``SummarizationMiddleware`` to pass there. This keeps all of deepagents'
+   summarization behavior (backend offload of evicted history,
+   pre-summarization tool-arg truncation, ``ContextOverflowError`` fallback)
+   while letting us compact earlier and summarize on a cheaper model.
 
    Tuning is **scope-aware**: sub-agents get aggressive built-in thresholds
    (they accumulate large decompiler dumps and, on models without a langchain
@@ -25,12 +26,13 @@ Two concerns live here:
    fires), while the main agent keeps stock defaults — its baseline prompt
    (system prompt + tool schemas, which the trigger counts) sits far above the
    sub-agent trigger, so a shared low threshold would fire on every call and
-   permanently squash its history.
+   permanently squash its history. Each scope is an explicit argument at the
+   construction site rather than inferred from the model.
 """
 
 import os
 import sys
-from typing import Any
+from typing import Any, Literal
 
 from deepagents.middleware.summarization import (
     SummarizationToolMiddleware,
@@ -131,39 +133,26 @@ def _keep_from_env(default: Any, *, has_profile: bool, prefix: str) -> Any:
     return default
 
 
-def _model_key(model: Any) -> str | None:
-    """Best-effort identifier for a model spec or instance.
-
-    Used only to tell the main agent's model apart from sub-agent models when
-    object identity doesn't hold (e.g. the spec string was passed instead of
-    the built instance). For ``provider:model`` spec strings the provider
-    prefix is dropped so a spec compares equal to the instance built from it.
-    """
-    if isinstance(model, str):
-        return model.split(":", 1)[-1]
-    for attr in ("model_name", "model"):
-        value = getattr(model, attr, None)
-        if isinstance(value, str) and value:
-            return value
-    return None
-
-
-def _tuned_auto_summarization(
+def build_tuned_summarization_middleware(
     model: str | BaseChatModel,
     backend: Any,
     *,
-    summary_model: str | BaseChatModel | None,
-    is_main: bool,
-    **_: Any,
+    summary_model: str | BaseChatModel | None = None,
+    scope: Literal["main", "subagent"],
 ) -> Any:
     """Build a deepagents ``SummarizationMiddleware`` with tuned thresholds.
 
-    Main-agent scope keeps deepagents' model-aware defaults, overridable via
-    ``COMPACT_MAIN_*`` env knobs. Sub-agent scope defaults to the aggressive
-    ``_SUBAGENT_DEFAULT_*`` thresholds, overridable via ``COMPACT_*`` knobs.
-    ``summary_model`` (when given) routes the summary call to a cheaper model
-    regardless of the agent's own model.
+    The instance's ``.name`` is ``"SummarizationMiddleware"``, so passing it in
+    ``create_deep_agent(middleware=...)`` (or a sub-agent's ``middleware``)
+    replaces deepagents' stock instance in place (0.7 replace-by-name).
+
+    ``scope="main"`` keeps deepagents' model-aware defaults, overridable via
+    ``COMPACT_MAIN_*`` env knobs. ``scope="subagent"`` defaults to the
+    aggressive ``_SUBAGENT_DEFAULT_*`` thresholds, overridable via ``COMPACT_*``
+    knobs. ``summary_model`` (when given) routes the summary call to a cheaper
+    model regardless of the agent's own model.
     """
+    is_main = scope == "main"
     from deepagents._models import resolve_model
     from deepagents.middleware.summarization import (
         DEEPAGENTS_DEFAULT_SUMMARY_PROMPT,
@@ -208,47 +197,3 @@ def _tuned_auto_summarization(
         truncate_args_settings=defaults["truncate_args_settings"],
         summary_prompt=DEEPAGENTS_DEFAULT_SUMMARY_PROMPT,
     )
-
-
-def install_tuned_summarization(
-    summary_model: str | BaseChatModel | None = None,
-    *,
-    main_model: str | BaseChatModel | None = None,
-) -> None:
-    """Patch the factory ``create_deep_agent`` uses for auto-summarization.
-
-    ``create_deep_agent`` calls ``deepagents.graph.create_summarization_middleware``
-    (a module-bound import) for the main agent and every sub-agent. Replacing that
-    name with our tuned factory is the only seam to lower the trigger or change the
-    summary model without forking deepagents — passing our own
-    ``SummarizationMiddleware`` in ``middleware=`` would instead add a *second*
-    instance and trip create_agent's duplicate-middleware assertion. Idempotent.
-
-    ``main_model`` identifies the coordinator's model so the patched factory can
-    scope thresholds: agents built with it keep stock defaults, everything else
-    gets the sub-agent thresholds. Matching is by object identity with a
-    model-name fallback, so a sub-agent explicitly configured with the main
-    agent's model inherits main-scope thresholds — acceptable, since its prompt
-    baseline is the concern being scoped around, not its name.
-    """
-    import deepagents.graph as graph
-
-    # The factory is a module-bound import, not in deepagents.graph's public
-    # exports, so reach it dynamically (keeps the type checker happy too).
-    current = getattr(graph, "create_summarization_middleware")
-    if getattr(current, "_ghidra_tuned", False):
-        return
-
-    main_key = _model_key(main_model) if main_model is not None else None
-
-    def patched(model: Any, backend: Any, **kwargs: Any) -> Any:
-        is_main = main_model is not None and (
-            model is main_model
-            or (main_key is not None and _model_key(model) == main_key)
-        )
-        return _tuned_auto_summarization(
-            model, backend, summary_model=summary_model, is_main=is_main, **kwargs
-        )
-
-    patched._ghidra_tuned = True  # type: ignore[attr-defined]
-    setattr(graph, "create_summarization_middleware", patched)

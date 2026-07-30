@@ -57,7 +57,7 @@ class UsageLimitError(Exception):
 # retry Ghidra MCP tools here: their transport already surfaces server errors as
 # structured messages (see ``handle_mcp_errors`` in cli.py), and many are not
 # idempotent.
-_RETRYABLE_FS_TOOLS = ("write_file", "edit_file", "read_file")
+_RETRYABLE_FS_TOOLS = ("write_file", "edit_file", "read_file", "delete")
 
 # HTTP status codes worth retrying: request timeout, conflict, rate limit, and
 # the 5xx family that providers return for transient overload.
