@@ -16,6 +16,8 @@ from typing import cast
 
 import pytest
 from deepagents import SubAgent
+from deepagents.backends import StateBackend
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.tools import BaseTool
 
 from ghidra_deep_agent.subagents import (
@@ -36,9 +38,13 @@ def _fake_tools() -> Sequence[BaseTool]:
     return cast("Sequence[BaseTool]", tools)
 
 
-def _resolver(spec: str | None) -> str:
-    """Stub model resolver: build_subagents only stores the returned value."""
-    return spec or "stub-model"
+def _resolver(spec: str | None) -> FakeListChatModel:
+    """Stub model resolver returning a real chat model instance.
+
+    ``build_subagents`` stores the result in the spec and hands it to the tuned
+    summarization middleware, which needs an actual ``BaseChatModel``.
+    """
+    return FakeListChatModel(responses=["ok"])
 
 
 def _write_config(tmp_path: Path, body: str) -> Path:
@@ -52,7 +58,7 @@ def _write_config(tmp_path: Path, body: str) -> Path:
 
 def _tool_names(spec: SubAgent) -> set[str]:
     # spec["tools"] is a union type; our stubs expose ``.name`` via getattr.
-    return {getattr(tool, "name") for tool in spec["tools"]}
+    return {getattr(tool, "name") for tool in spec["tools"]}  # noqa: B009
 
 
 def _validation_mw(spec: SubAgent) -> ArgumentValidationMiddleware:
@@ -63,7 +69,9 @@ def _validation_mw(spec: SubAgent) -> ArgumentValidationMiddleware:
 
 def _build(tmp_path: Path, body: str) -> dict[str, SubAgent]:
     config = load_agent_config(_write_config(tmp_path, body))
-    specs = build_subagents(_fake_tools(), config, resolve_model=_resolver)
+    specs = build_subagents(
+        _fake_tools(), config, resolve_model=_resolver, backend=StateBackend()
+    )
     return {spec["name"]: spec for spec in specs}
 
 

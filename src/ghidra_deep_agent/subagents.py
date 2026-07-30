@@ -32,6 +32,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
 
+from ghidra_deep_agent.compaction import build_tuned_summarization_middleware
 from ghidra_deep_agent.defaults import config_path
 from ghidra_deep_agent.models import build_model
 from ghidra_deep_agent.resilience import (
@@ -344,16 +345,23 @@ def build_subagents(
     all_tools: Sequence[BaseTool],
     config: AgentConfig,
     resolve_model: ModelResolver,
+    backend: Any,
     *,
     cache_middleware: AgentMiddleware | None = None,
     async_middleware: AgentMiddleware | None = None,
+    summary_model: str | BaseChatModel | None = None,
 ) -> list[SubAgent]:
     """Build ``SubAgent`` specs from config, filtered against the live tools.
 
     Each sub-agent gets its own middleware (sub-agent middleware does not inherit
     from the main agent): model resilience (retry + optional provider fallback),
     argument validation, the shared immutable-read cache (when enabled),
-    async-task resolution, and transient filesystem-tool retry. Plus its resolved
+    async-task resolution, transient filesystem-tool retry, and a tuned
+    auto-summarizer (aggressive sub-agent thresholds; replaces deepagents'
+    stock instance by ``.name``). Plus its resolved model.
+
+    ``backend`` is the shared filesystem backend the summarizer offloads evicted
+    history to; ``summary_model`` (when given) routes summary calls to a cheaper
     model.
     """
     by_name = {tool.name: tool for tool in all_tools}
@@ -377,12 +385,13 @@ def build_subagents(
             )
         else:
             validation_mw = create_argument_validation_middleware()
+        model = resolve_model(sub.model)
         spec: SubAgent = {
             "name": sub.name,
             "description": sub.description,
             "system_prompt": sub.system_prompt,
             "tools": tools,
-            "model": resolve_model(sub.model),
+            "model": model,
             "middleware": [
                 *build_model_resilience_middleware(resolve_model),
                 validation_mw,
@@ -390,6 +399,10 @@ def build_subagents(
                 # Inside the cache so resolved (not stub) results are cached.
                 *([async_middleware] if async_middleware is not None else []),
                 build_tool_retry_middleware(),
+                # Replaces deepagents' stock SummarizationMiddleware by name.
+                build_tuned_summarization_middleware(
+                    model, backend, summary_model=summary_model, scope="subagent"
+                ),
             ],
         }
         specs.append(spec)

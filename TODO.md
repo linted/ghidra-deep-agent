@@ -34,14 +34,43 @@
   ~2.96M tokens each, 84:1 prompt:completion). Expected: 40–60% token reduction and latency
   541s → ~120–180s per invocation. Effort: Med. *Caveat:* dynamic subagents were evaluated
   2026-06-29 and parked because the QuickJS interpreter runtime is beta — prior design work in
-  `~/.claude/plans/langchain-came-out-with-ticklish-scone.md`; start there.
+  `~/.claude/plans/langchain-came-out-with-ticklish-scone.md`; start there. *Update
+  (2026-07-30):* langchain-quickjs 0.3.5 shipped alongside deepagents 0.7 (which now has a
+  `quickjs` extra), but `CodeInterpreterMiddleware` is still marked experimental — stays
+  parked; re-check when deepagents 0.8 lands.
+
+### From the deepagents 0.7 upgrade (2026-07-30)
+
+deepagents 0.6.12 → 0.7.0 landed the seam this repo was missing: a `middleware=`
+(or sub-agent `middleware`) instance whose `.name` matches a built-in now
+**replaces** the default instead of tripping the duplicate assertion. The
+upgrade itself rewrote `compaction.py` onto that seam (monkeypatch deleted) and
+dropped `TodoListMiddleware` with the new lean defaults (0.7 cuts a
+default-agent turn's input tokens 65%). Follow-ups it unlocks:
+
+- [ ] **Spill large tool outputs — now unblocked** — pass
+  `FilesystemMiddleware(tool_token_limit_before_evict=N)` (default 20k tokens,
+  `filesystem.py:1337`) via replace-by-name `middleware=`; no fork or internal
+  patching. See the backlog entry above for the original evidence; wire it to an
+  env knob like the `COMPACT_*` family if a lower threshold proves out.
+- [ ] **Revisit the deferred prompt-trim sub-items** — the TodoListMiddleware
+  injection is gone as of this upgrade, and built-in tool descriptions are now
+  overridable directly (`FilesystemMiddleware(custom_tool_descriptions={...})`).
+  0.7's own 43% tool-description trim may make further trimming moot — measure a
+  live turn's token breakdown before doing anything.
+- [ ] **Evaluate harness profiles** (`deepagents/profiles/`) — per-model/provider
+  config bundles (Anthropic, OpenAI Codex, NVIDIA Nemotron 3 Ultra, an OpenRouter
+  provider profile) that `create_deep_agent` applies automatically, including
+  per-profile middleware exclusion by name. Could replace some hand-rolled
+  per-model config in `models.py` / `openrouter.toml`; also worth checking none
+  auto-apply unexpectedly to our model specs.
 
 ### From optimization report (2026-06-28, 7d window)
 
 Cost
 - [x] **Right-size subagent model & context** — agents are now defined declaratively in `subagents.toml` (per-agent model + tool allowlist), loaded by `subagents.py`; the coordinator is restricted to orchestration + navigation/search (analysis/mutation tools moved to sub-agents). Per-agent models leverage OpenRouter. "Task-specific artifacts, not full history" is already handled by deepagents' `task` isolation. (The *dynamic* per-call model-router is still the separate Latency item below.)
-- [x] **Tune forced compaction** — `create_deep_agent` hard-wires `create_summarization_middleware(model, backend)` with no trigger/model knob, so `compaction.py`'s `install_tuned_summarization` monkeypatches `deepagents.graph.create_summarization_middleware` to return a deepagents `SummarizationMiddleware` with env-tuned `trigger`/`keep` (`COMPACT_TRIGGER_FRACTION`/`_TOKENS`, `COMPACT_KEEP_MESSAGES`/`_FRACTION`; profile-aware — fractions fall back to tokens with a warning when the model has no context profile) and routes the summary call to `SUMMARY_MODEL`. Applies to the main agent and all sub-agents; no-env = deepagents defaults unchanged. Tool-*arg* truncation is already active via deepagents' `truncate_args_settings`; lowering the large-tool-*result* offload threshold remains the deferred backlog item ("Spill large tool outputs to a file").
-- [x] **Trim per-call prompt bloat** — audited & compressed `SYSTEM_PROMPT` (prompt.py) ~35% (6.2k→4.0k chars) by removing duplication: the verbose 7-step function-analyst loop (already verbatim in that sub-agent's prompt), the repeated recon/analyze/mutate Workflow section, and per-tool KB prose — every directive (trust-assembly, delegation, batching, KB usage, naming, param-names, never-guess) preserved. Remaining sub-items left for a later pass (lower payoff / need the same deepagents-internal patching deferred under the backlog): conditionally skipping FilesystemMiddleware's filesystem-tree and TodoListMiddleware injections when irrelevant, and overriding built-in tool descriptions (MCP tool descriptions are server-authored, not ours to compress).
+- [x] **Tune forced compaction** — a deepagents `SummarizationMiddleware` with env-tuned `trigger`/`keep` (`COMPACT_TRIGGER_FRACTION`/`_TOKENS`, `COMPACT_KEEP_MESSAGES`/`_FRACTION`; profile-aware — fractions fall back to tokens with a warning when the model has no context profile), summary call routed to `SUMMARY_MODEL`. Applies to the main agent and all sub-agents; no-env = deepagents defaults unchanged. *Reworked 2026-07-30:* originally a monkeypatch of `deepagents.graph.create_summarization_middleware` (0.6.x had no other seam); the 0.7 upgrade replaced it with `compaction.py`'s `build_tuned_summarization_middleware`, passed per scope via 0.7's replace-by-name `middleware=`. Tool-*arg* truncation is already active via deepagents' `truncate_args_settings`; lowering the large-tool-*result* offload threshold is now unblocked ("From the deepagents 0.7 upgrade" section).
+- [x] **Trim per-call prompt bloat** — audited & compressed `SYSTEM_PROMPT` (prompt.py) ~35% (6.2k→4.0k chars) by removing duplication: the verbose 7-step function-analyst loop (already verbatim in that sub-agent's prompt), the repeated recon/analyze/mutate Workflow section, and per-tool KB prose — every directive (trust-assembly, delegation, batching, KB usage, naming, param-names, never-guess) preserved. Remaining sub-items left for a later pass: *(2026-07-30: mostly overtaken by deepagents 0.7 — TodoListMiddleware is no longer wired at all, and tool-description overrides are now first-class; see "From the deepagents 0.7 upgrade" section)* conditionally skipping FilesystemMiddleware's filesystem-tree injection when irrelevant, and overriding built-in tool descriptions (MCP tool descriptions are server-authored, not ours to compress).
 - [x] **Conditionally disable `AnthropicPromptCachingMiddleware`** when running non-Anthropic providers (e.g. DeepSeek) — no-op: the middleware isn't wired into this codebase, and the library version already no-ops for non-Anthropic models (isinstance check). Nothing to do.
 - [x] **openrouter provider selection** — implemented: optional `openrouter.toml` (path overridable via `OPENROUTER_CONFIG`, see `openrouter.toml.example`) maps each OpenRouter model id to a provider-routing object (`order`/`allow_fallbacks`/`sort`/…). `build_model` (models.py) constructs `ChatOpenRouter(openrouter_provider=...)` when a preset exists, else resolves the string as before.
 
@@ -121,7 +150,7 @@ Sub-agent design — implemented in `src/ghidra_deep_agent/subagents.py` (`build
   command with an interactive popup or buttons to **Approve / Reject / Keep working**
   on the plan (modal in the `SessionSelectScreen` style, `tui/session_select.py`),
   instead of a typed command.
-- [ ] **Spill large tool outputs to a file instead of re-injecting** — *already implemented in deepagents:* `FilesystemMiddleware` offloads tool results over `tool_token_limit_before_evict` (default 20k tokens / ~80 KB) to `large_tool_results/`, leaving a preview + pointer. The hard part is lowering that threshold: `create_deep_agent` doesn't expose it, hardcodes `FilesystemMiddleware` in 3 places (graph.py:645/720/779), and the clean overrides are blocked — duplicate-instance assertion (factory.py:1080) and `_REQUIRED_MIDDLEWARE` blocks `excluded_middleware` (graph.py:230). Lowering it needs a monkeypatch (subclass + swap `deepagents.graph.FilesystemMiddleware`) or a custom offload middleware (~80 lines). Not worth it now for a non-urgent latency/cost win; revisit if deepagents exposes the knob or context bloat becomes a measured problem.
+- [ ] **Spill large tool outputs to a file instead of re-injecting** — *already implemented in deepagents:* `FilesystemMiddleware` offloads tool results over `tool_token_limit_before_evict` (default 20k tokens / ~80 KB) to `large_tool_results/`, leaving a preview + pointer. *Update (2026-07-30):* the blockers were 0.6.x-era — deepagents 0.7's replace-by-name middleware merge removed the duplicate-instance assertion, so a custom `FilesystemMiddleware(tool_token_limit_before_evict=N)` passed in `middleware=` now just works. Tracked as an unblocked item under "From the deepagents 0.7 upgrade" above; still a non-urgent latency/cost win — do it when context bloat is a measured problem.
 - [ ] **Add graph-level timeout & error boundary** to top-level LangGraph — wall-clock timeout (~20 min) / recursion limit with graceful early-exit returning partial findings
 - [ ] **Bound `task` sub-agents** — max tool-call rounds + wall-clock timeout, return partial results on expiry
 - [ ] **Give `prototype-fixer` a clear/undefine-function tool** — when `recover_prototypes`
@@ -184,7 +213,8 @@ Still open from that pass:
   source. Local to the primary checkout, invisible to `git status` (ignored).
 
 #### From dependency review (2026-07-20)
-- [ ] **Adopt `ToolErrorMiddleware` (langchain 1.3.14)** — evaluate folding the new
+- [ ] **Adopt `ToolErrorMiddleware` (langchain 1.3.14)** — *(version gate cleared:
+  the deepagents 0.7 upgrade, 2026-07-30, pulled langchain ≥1.3.14)* — evaluate folding the new
   `ToolErrorMiddleware` in alongside our existing `build_tool_retry_middleware`
   (`resilience.py`) and `ArgumentValidationMiddleware` (`validation.py`) for cleaner
   tool-error → self-correction handling. Note 1.3.14 also tightened
