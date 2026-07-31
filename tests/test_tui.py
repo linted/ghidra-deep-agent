@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
+
+from ghidra_deep_agent.compaction import ManualCompactionResult
 from ghidra_deep_agent.resilience import UsageLimitError
 from ghidra_deep_agent.tui import GhidraAgentApp
 from ghidra_deep_agent.tui.commands import COMMANDS, help_lines
@@ -63,10 +67,13 @@ class StubAgent:
         }
 
 
-def _make_app(agent: Any | None = None) -> GhidraAgentApp:
+def _make_app(
+    agent: Any | None = None, compaction_engine: Any | None = None
+) -> GhidraAgentApp:
     return GhidraAgentApp(
         agent=agent if agent is not None else StubAgent(),
         config={},
+        compaction_engine=compaction_engine,
         model="test-model",
         session_id="abc",
     )
@@ -767,6 +774,149 @@ def test_commands_that_start_a_run_are_refused_while_busy() -> None:
             await pilot.pause()
 
             assert started == []
+
+    asyncio.run(run())
+
+
+class _CompactStubAgent(StubAgent):
+    """StubAgent whose thread state can be read and written — never streamed.
+
+    ``/compact`` must run out-of-band: one state read, one state write, and no
+    agent turn at all. Streaming through this stub is therefore an error.
+    """
+
+    def __init__(self, messages: list[Any] | None = None, event: Any = None) -> None:
+        super().__init__()
+        self.messages = messages if messages is not None else []
+        self.event = event
+        self.updates: list[tuple[dict[str, Any], str | None]] = []
+
+    def astream_events(self, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("/compact must not start an agent stream")
+
+    async def aget_state(self, config: Any) -> Any:
+        return SimpleNamespace(
+            values={"messages": self.messages, "_summarization_event": self.event}
+        )
+
+    async def aupdate_state(
+        self, config: Any, values: dict[str, Any], as_node: str | None = None
+    ) -> None:
+        self.updates.append((values, as_node))
+
+
+def test_compact_persists_the_event_without_an_agent_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/compact drives the summarization engine directly: the only state change
+    is a `_summarization_event` written as the tools node."""
+
+    async def run() -> None:
+        agent = _CompactStubAgent(messages=["m"] * 20, event={"cutoff_index": 3})
+        app = _make_app(agent=agent, compaction_engine=object())
+        seen: list[tuple[Any, ...]] = []
+        result = ManualCompactionResult(
+            event={"cutoff_index": 14, "summary_message": "s", "file_path": "h.md"},
+            summarized_count=12,
+            file_path="h.md",
+        )
+
+        async def fake_compact(
+            engine: Any, messages: Any, prior: Any, *, thread_id: str
+        ) -> ManualCompactionResult:
+            seen.append((engine, list(messages), prior, thread_id))
+            return result
+
+        monkeypatch.setattr(
+            "ghidra_deep_agent.tui.app.compact_out_of_band", fake_compact
+        )
+        async with app.run_test() as pilot:
+            app._dispatch_slash("/compact")
+            await pilot.pause(0.2)
+            # The driver got the thread's real state, keyed by the session id.
+            assert seen == [
+                (app._compaction_engine, ["m"] * 20, {"cutoff_index": 3}, "abc")
+            ]
+            assert agent.updates == [({"_summarization_event": result.event}, "tools")]
+            assert app.query_one(ResponseLog).transcript == ["❯ /compact"]
+            assert not app._agent_running
+
+    asyncio.run(run())
+
+
+def test_compact_with_nothing_to_do_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        agent = _CompactStubAgent()
+        app = _make_app(agent=agent, compaction_engine=object())
+
+        async def fake_compact(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "ghidra_deep_agent.tui.app.compact_out_of_band", fake_compact
+        )
+        async with app.run_test() as pilot:
+            app._dispatch_slash("/compact")
+            await pilot.pause(0.2)
+            assert agent.updates == []
+            assert not app._agent_running
+
+    asyncio.run(run())
+
+
+def test_compact_failure_leaves_the_thread_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A summary-model failure must be reported, not persisted — and must not
+    leave the app stuck busy."""
+
+    async def run() -> None:
+        agent = _CompactStubAgent(messages=["m"] * 20)
+        app = _make_app(agent=agent, compaction_engine=object())
+
+        async def fake_compact(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("summary model down")
+
+        monkeypatch.setattr(
+            "ghidra_deep_agent.tui.app.compact_out_of_band", fake_compact
+        )
+        async with app.run_test() as pilot:
+            app._dispatch_slash("/compact")
+            await pilot.pause(0.2)
+            assert agent.updates == []
+            assert not app._agent_running
+
+    asyncio.run(run())
+
+
+def test_compact_is_refused_in_a_side_mode() -> None:
+    """Side-mode threads are ephemeral; /compact must neither touch them nor
+    silently reach around to the main thread."""
+
+    async def run() -> None:
+        agent = _CompactStubAgent(messages=["m"] * 20)
+        app = _make_app(agent=agent, compaction_engine=object())
+        async with app.run_test() as pilot:
+            app._side = SideMode(kind="plan", config={}, plan_path=None)
+            app._dispatch_slash("/compact")
+            await pilot.pause(0.2)
+            assert agent.updates == []
+            assert not app._agent_running
+
+    asyncio.run(run())
+
+
+def test_compact_without_an_engine_flashes_and_does_nothing() -> None:
+    async def run() -> None:
+        agent = _CompactStubAgent(messages=["m"] * 20)
+        app = _make_app(agent=agent)  # no compaction engine
+        async with app.run_test() as pilot:
+            app._dispatch_slash("/compact")
+            await pilot.pause(0.2)
+            assert agent.updates == []
+            assert not app._agent_running
 
     asyncio.run(run())
 

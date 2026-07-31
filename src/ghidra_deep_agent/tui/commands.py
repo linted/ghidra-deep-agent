@@ -39,7 +39,11 @@ class SlashCommand:
 COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("/clear", "clear the response log and activity tree"),
     SlashCommand("/yank", "copy the last response to the clipboard"),
-    SlashCommand("/compact", "compact the conversation history", needs_idle=True),
+    SlashCommand(
+        "/compact",
+        "summarize older history in place (runs the summary model directly)",
+        needs_idle=True,
+    ),
     SlashCommand("/resume", "list & resume a previous session", needs_idle=True),
     SlashCommand(
         "/continue",

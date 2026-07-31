@@ -18,6 +18,7 @@ from typing import Any, NamedTuple
 from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
 from deepagents.backends.filesystem import FilesystemBackend
+from deepagents.middleware.summarization import SummarizationToolMiddleware
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.interceptors import MCPToolCallRequest
@@ -27,7 +28,7 @@ from pymongo.errors import ServerSelectionTimeoutError
 from ghidra_deep_agent.async_tasks import build_async_task_middleware
 from ghidra_deep_agent.compaction import (
     build_tuned_summarization_middleware,
-    create_forced_summarization_tool_middleware,
+    create_manual_compaction_engine,
 )
 from ghidra_deep_agent.defaults import (
     DEFAULT_MAX_CONTEXT_TOKENS,
@@ -327,7 +328,7 @@ def _build_shared_middleware(
     resolve_model: Any,
     cache_mw: Any,
     async_mw: Any,
-    summary_model: Any,
+    compaction_engine: Any,
     built_model: Any,
     summary_override: Any,
 ) -> list[Any]:
@@ -351,7 +352,11 @@ def _build_shared_middleware(
         *([cache_mw] if cache_mw is not None else []),
         *([async_mw] if async_mw is not None else []),
         build_tool_retry_middleware(),
-        create_forced_summarization_tool_middleware(summary_model, storage.backend),
+        # The compact_conversation tool for the agent's own proactive use, on
+        # the stock ~50% eligibility gate (stops premature self-compaction).
+        # User-driven /compact no longer goes through it — the TUI drives the
+        # same engine directly via compact_out_of_band.
+        SummarizationToolMiddleware(compaction_engine),
         # Auto-summarizer for the coordinator: stock thresholds (COMPACT_MAIN_*
         # overrides), summary routed per SUMMARY_MODEL. Replaces deepagents'
         # stock SummarizationMiddleware by name (0.7 replace-by-name).
@@ -501,6 +506,13 @@ async def main() -> None:
             # context when entering plan/ask mode, and `build_model` hands back a
             # bare string for any provider it doesn't special-case.
             summary_model = ensure_chat_model(summary_override or built_model)
+            # One summarization engine shared by the agent-facing
+            # compact_conversation tool and the TUI's out-of-band /compact.
+            # Built inside the backend context: it offloads evicted history
+            # to the session backend.
+            compaction_engine = create_manual_compaction_engine(
+                summary_model, storage.backend
+            )
 
             # Tuned auto-summarizers ride along as replace-by-name middleware:
             # sub-agents compact aggressively by default (they never reached
@@ -525,7 +537,7 @@ async def main() -> None:
                 resolve_model=resolve_model,
                 cache_mw=cache_mw,
                 async_mw=async_mw,
-                summary_model=summary_model,
+                compaction_engine=compaction_engine,
                 built_model=built_model,
                 summary_override=summary_override,
             )
@@ -557,6 +569,7 @@ async def main() -> None:
                 plan_agent=graphs.plan,
                 ask_agent=graphs.ask,
                 summary_model=summary_model,
+                compaction_engine=compaction_engine,
                 config=config,
                 model=main_model_spec,
                 session_id=session_id,
