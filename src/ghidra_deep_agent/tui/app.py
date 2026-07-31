@@ -19,6 +19,7 @@ from textual.timer import Timer
 from textual.widgets import Footer, Header, Input
 from textual.worker import Worker, WorkerState
 
+from ghidra_deep_agent.compaction import compact_out_of_band
 from ghidra_deep_agent.defaults import (
     DEFAULT_MAX_CONTEXT_TOKENS,
     DEFAULT_RECURSION_LIMIT,
@@ -124,6 +125,7 @@ class GhidraAgentApp(App[None]):
         plan_agent: Any = None,
         ask_agent: Any = None,
         summary_model: BaseChatModel | None = None,
+        compaction_engine: Any = None,
         model: str = "",
         session_id: str = "",
         mcp_ok: bool = True,
@@ -137,6 +139,8 @@ class GhidraAgentApp(App[None]):
         self._plan_agent = plan_agent
         self._ask_agent = ask_agent
         self._summary_model = summary_model
+        # Summarization engine driven directly by /compact (no agent turn).
+        self._compaction_engine = compaction_engine
         # The active read-only side mode (`/plan` or `/ask`), or None for normal
         # operation. One object rather than two parallel sets of flags, so "both
         # modes on" and "mode on with no thread" are unrepresentable.
@@ -356,11 +360,77 @@ class GhidraAgentApp(App[None]):
         self.query_one(StatusBar).flash("[green]Cleared.[/green]")
 
     def _cmd_compact(self, _arg: str) -> None:
-        self._start_run(
-            "/compact",
-            "Call the `compact_conversation` tool now to compact the "
-            "conversation history.",
-        )
+        """Compact the main thread's history without an agent turn.
+
+        This used to start a normal run asking the model to call the
+        ``compact_conversation`` tool — a full-context main-model call spent at
+        the exact moment context is at its largest, and one the model was free
+        to ignore. Now the summarization engine runs directly: one
+        summary-model call, deterministic.
+        """
+        bar = self.query_one(StatusBar)
+        if self._side is not None:
+            # A side mode's ephemeral thread is dropped on exit — compacting it
+            # is pointless, and /compact must not silently touch the main
+            # thread from inside one.
+            bar.flash(
+                "[yellow]/compact works on the main session — "
+                "leave plan/ask mode first.[/yellow]"
+            )
+            return
+        if self._compaction_engine is None:
+            bar.flash("[yellow]Compaction unavailable in this session.[/yellow]")
+            return
+        self._agent_worker = self._run_compaction()
+
+    @work(exclusive=True)
+    async def _run_compaction(self) -> None:
+        """Read state → summarize → persist, atomically from the UI's view.
+
+        Runs busy and exclusive (and is refused while a run is in flight via
+        ``needs_idle``), so no turn can grow ``messages`` between the state
+        read and the ``cutoff_index`` write. Nothing is persisted until the
+        final ``aupdate_state`` — a failure or an Escape-cancel anywhere before
+        that leaves the thread untouched.
+        """
+        self._set_busy(True)
+        response = self.query_one(ResponseLog)
+        response.log_user("/compact")
+        try:
+            state = await self._agent.aget_state(self._config)
+            result = await compact_out_of_band(
+                self._compaction_engine,
+                state.values.get("messages", []),
+                state.values.get("_summarization_event"),
+                thread_id=self._session_id,
+            )
+            if result is None:
+                self.query_one(StatusBar).flash(
+                    "[yellow]Nothing to compact yet.[/yellow]"
+                )
+                return
+            # `as_node="tools"` writes the event as the node that owns it on
+            # the in-graph path (the compact tool); pinned by a real-graph test.
+            await self._agent.aupdate_state(
+                self._config, {"_summarization_event": result.event}, as_node="tools"
+            )
+            saved = (
+                f" Full history saved to {result.file_path}."
+                if result.file_path
+                else ""
+            )
+            response.write(
+                f"[green]✦ Compacted {result.summarized_count} messages into a "
+                f"summary.{saved}[/green]"
+            )
+        except Exception as exc:
+            response.write(
+                f"[bold red]✗ Compaction failed: {exc} — "
+                "the conversation was not changed.[/bold red]"
+            )
+        finally:
+            self._set_busy(False)
+            self.query_one("#query", Input).focus()
 
     def _cmd_cancel_side(self, kind: Kind) -> None:
         bar = self.query_one(StatusBar)

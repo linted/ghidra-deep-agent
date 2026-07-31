@@ -15,7 +15,10 @@ requires-python = ">=3.12"
 # plain `pip install .` has only these to go on, and the LangChain 1.x stack
 # moves fast enough that an unconstrained resolve is not safe.
 dependencies = [
-    "deepagents>=0.7.0",
+    # <0.8: compaction.py drives private summarization-engine methods (see
+    # compact_out_of_band); revisit the pin alongside the private-API smoke
+    # test in tests/test_compaction.py on upgrade.
+    "deepagents>=0.7.0,<0.8",
     "jsonschema>=4.26.0",
     "langchain-mcp-adapters>=0.3.0",
     "langchain-mongodb>=0.11.0",

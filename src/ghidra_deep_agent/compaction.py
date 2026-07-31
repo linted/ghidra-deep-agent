@@ -2,11 +2,14 @@
 
 Two concerns live here:
 
-1. **Manual ``/compact``.** deepagents' built-in ``compact_conversation`` tool
-   refuses to run until reported usage reaches ~50% of the auto-summarization
-   trigger, making a user-driven ``/compact`` a no-op while the conversation is
-   still comfortably within budget. We swap in a subclass that always treats
-   manual compaction as eligible.
+1. **Manual ``/compact``.** The TUI used to compact by asking the *agent* to
+   call deepagents' ``compact_conversation`` tool — a full-context main-model
+   turn spent at the exact moment context is at its largest, and one the model
+   was free to ignore. ``compact_out_of_band`` instead drives the summarization
+   engine directly: one summary-model call, no agent turn, always runs. It
+   only computes the ``_summarization_event``; persisting it (via
+   ``graph.aupdate_state``) is the caller's job, so a failure anywhere leaves
+   the thread untouched.
 
 2. **Tuning the *auto* summarizer.** ``create_deep_agent`` installs a stock
    ``SummarizationMiddleware(model, backend)`` for the main agent and every
@@ -32,44 +35,104 @@ Two concerns live here:
 
 import os
 import sys
+from dataclasses import dataclass
 from typing import Any, Literal
 
-from deepagents.middleware.summarization import (
-    SummarizationToolMiddleware,
-    create_summarization_middleware,
-)
+from deepagents.middleware.summarization import create_summarization_middleware
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AnyMessage
+from langchain_core.messages import AnyMessage, get_buffer_string
+from langchain_core.runnables.config import var_child_runnable_config
 
 
-class ForcedCompactionToolMiddleware(SummarizationToolMiddleware):
-    """``compact_conversation`` that always compacts on demand.
+def create_manual_compaction_engine(model: str | BaseChatModel, backend: Any) -> Any:
+    """Build the summarization engine `/compact` drives directly.
 
-    The upstream tool refuses to compact until usage reaches ~50% of the
-    auto-summarization trigger. For an explicit user-driven ``/compact`` we
-    always want it to run, so manual compaction is always eligible. The
-    independent cutoff check still returns "nothing to compact" when there are
-    too few messages to summarize.
-    """
-
-    def _is_eligible_for_compaction(self, messages: list[AnyMessage]) -> bool:
-        return True
-
-
-def create_forced_summarization_tool_middleware(
-    model: str | BaseChatModel, backend: Any
-) -> ForcedCompactionToolMiddleware:
-    """Mirror of ``create_summarization_tool_middleware`` using the forced subclass.
-
-    Resolves a model string to a ``BaseChatModel`` (as the upstream factory does)
-    before building the summarization engine.
+    A plain deepagents ``SummarizationMiddleware`` — never registered as
+    middleware, only used as the engine behind ``compact_out_of_band`` and the
+    agent's own ``compact_conversation`` tool (``SummarizationToolMiddleware``
+    wraps this same instance). ``trim_tokens_to_summarize`` stays ``None``: the
+    whole evicted slice goes to the (cheap, per ``SUMMARY_MODEL``) summary
+    model, which beats summarizing a 4k-token tail. A slice exceeding that
+    model's context window fails the summary call cleanly — nothing persisted.
     """
     from deepagents._models import resolve_model
 
     if isinstance(model, str):
         model = resolve_model(model)
-    summarization = create_summarization_middleware(model, backend)
-    return ForcedCompactionToolMiddleware(summarization)
+    return create_summarization_middleware(model, backend)
+
+
+@dataclass(frozen=True)
+class ManualCompactionResult:
+    """What an out-of-band compaction produced, ready to persist."""
+
+    # The ``_summarization_event`` to write into thread state.
+    event: dict[str, Any]
+    summarized_count: int
+    # Backend path the evicted history was offloaded to; None if that
+    # (non-fatal) write failed.
+    file_path: str | None
+
+
+async def compact_out_of_band(
+    engine: Any,
+    messages: list[AnyMessage],
+    prior_event: Any,
+    *,
+    thread_id: str,
+) -> ManualCompactionResult | None:
+    """Compact a thread's history without an agent turn.
+
+    Runs the same steps as the ``compact_conversation`` tool body
+    (``SummarizationToolMiddleware._arun_compact``), minus its eligibility gate
+    (this path is explicitly user-driven) and minus the ``ToolMessage`` (there
+    is no calling AI message to pair it with). Compaction never rewrites
+    ``state["messages"]`` — the effective list is rebuilt from
+    ``_summarization_event`` — so the returned event is the entire state
+    change. Returns ``None`` when there is nothing to compact.
+
+    Raises whatever the summary-model call raises; no side effect has happened
+    by then, so the caller can report the error and leave the thread as-is.
+    """
+    effective = engine._apply_event_to_messages(list(messages), prior_event)
+    cutoff = engine._determine_cutoff_index(effective)
+    if cutoff == 0:
+        return None
+    to_summarize, _ = engine._partition_messages(effective, cutoff)
+    summary = await _summarize_or_raise(engine, to_summarize)
+    # The offload derives its per-thread history file from the thread_id in the
+    # runnable-config contextvar. Outside a graph run that var is unset and the
+    # engine falls back to a random `session_*` id, fragmenting the history
+    # file — so pin the real thread id for the duration of the write.
+    token = var_child_runnable_config.set({"configurable": {"thread_id": thread_id}})
+    try:
+        file_path = await engine._aoffload_to_backend(engine._backend, to_summarize)
+    finally:
+        var_child_runnable_config.reset(token)
+    event = {
+        "cutoff_index": engine._compute_state_cutoff(prior_event, cutoff),
+        "summary_message": engine._build_new_messages_with_path(summary, file_path)[0],
+        "file_path": file_path,
+    }
+    return ManualCompactionResult(event, len(to_summarize), file_path)
+
+
+async def _summarize_or_raise(engine: Any, to_summarize: list[AnyMessage]) -> str:
+    """The engine's summary call, except failures raise.
+
+    ``_acreate_summary`` swallows model errors into an ``"Error generating
+    summary: ..."`` string, which a persisting caller would then install as the
+    summary — silently replacing real history with junk. Same prompt, same
+    trim, but the exception propagates so nothing gets persisted.
+    """
+    lc = engine._lc_helper
+    trimmed = lc._trim_messages_for_summary(to_summarize)
+    formatted = get_buffer_string(trimmed, format="xml")
+    response = await lc.model.ainvoke(
+        lc.summary_prompt.format(messages=formatted).rstrip(),
+        config={"metadata": {"lc_source": "summarization"}},
+    )
+    return str(response.text).strip()
 
 
 # --- Auto-summarization tuning -------------------------------------------------
