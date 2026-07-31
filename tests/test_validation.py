@@ -1,9 +1,10 @@
 """Tests for ArgumentValidationMiddleware (validation.py).
 
-Covers the three behaviors the middleware is responsible for: rejecting calls
-that don't match a dict JSON schema, blocking write actions in a read-only
-context, and never blocking on a malformed schema. Also pins the validator
-cache, since that is what keeps `check_schema` off the per-call path.
+Covers the four behaviors the middleware is responsible for: rejecting calls
+that don't match a dict JSON schema, blocking write actions in a restricted
+context, requiring the provisional prefix on renames from an annotations-tier
+agent, and never blocking on a malformed schema. Also pins the validator cache,
+since that is what keeps `check_schema` off the per-call path.
 
 Run:  uv run pytest tests/test_validation.py -v
 """
@@ -157,6 +158,128 @@ def test_malformed_schema_still_blocks_write_actions() -> None:
 
     assert isinstance(result, ToolMessage)
     assert _payload(result)["read_only_error"]["action"] == "delete"
+
+
+# ── provisional-rename prefix ─────────────────────────────────────────────────
+
+BATCH_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"renames": {"type": "array"}},
+}
+
+VARIABLES_RENAME_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string"},
+        "function_name": {"type": "string"},
+        "old_name": {"type": "string"},
+        "new_name": {"type": "string"},
+    },
+}
+
+
+def _prefix_mw() -> ArgumentValidationMiddleware:
+    return create_argument_validation_middleware(rename_prefix="maybe_")
+
+
+def test_prefixed_rename_is_allowed() -> None:
+    tool = _FakeTool("rename_symbol", RENAME_SCHEMA)
+    assert (
+        _check(_prefix_mw(), tool, {"address": "0x1000", "new_name": "maybe_init"})
+        is None
+    )
+
+
+def test_unprefixed_rename_is_rejected() -> None:
+    tool = _FakeTool("rename_symbol", RENAME_SCHEMA)
+
+    result = _check(_prefix_mw(), tool, {"address": "0x1000", "new_name": "init"})
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    payload = _payload(result)["rename_prefix_error"]
+    assert payload["required_prefix"] == "maybe_"
+    assert payload["rejected_names"] == ["init"]
+
+
+def test_one_unprefixed_entry_rejects_the_whole_batch() -> None:
+    """A batch is all-or-nothing: the tool applies it as a unit."""
+    tool = _FakeTool("batch_rename", BATCH_SCHEMA)
+    args = {
+        "renames": [
+            {"address": "0x1", "new_name": "maybe_parse"},
+            {"address": "0x2", "new_name": "decrypt_payload"},
+        ]
+    }
+
+    result = _check(_prefix_mw(), tool, args)
+
+    assert isinstance(result, ToolMessage)
+    assert _payload(result)["rename_prefix_error"]["rejected_names"] == [
+        "decrypt_payload"
+    ]
+
+
+def test_fully_prefixed_batch_is_allowed() -> None:
+    tool = _FakeTool("batch_rename", BATCH_SCHEMA)
+    args = {
+        "renames": [
+            {"address": "0x1", "new_name": "maybe_parse"},
+            {"address": "0x2", "new_name": "maybe_decrypt"},
+        ]
+    }
+    assert _check(_prefix_mw(), tool, args) is None
+
+
+def test_variables_rename_is_checked_but_other_actions_are_not() -> None:
+    tool = _FakeTool("variables", VARIABLES_RENAME_SCHEMA)
+    mw = _prefix_mw()
+
+    rejected = _check(
+        mw,
+        tool,
+        {"action": "rename", "old_name": "local_10", "new_name": "file_size"},
+    )
+    assert isinstance(rejected, ToolMessage)
+
+    # A read action names nothing, so the rule must not fire on it.
+    assert _check(mw, tool, {"action": "list", "function_name": "main"}) is None
+
+
+def test_target_identifying_args_do_not_trigger_the_rule() -> None:
+    """`function_name`/`old_name` name the existing symbol, not the new one."""
+    tool = _FakeTool("variables", VARIABLES_RENAME_SCHEMA)
+    args = {
+        "action": "rename",
+        "function_name": "process_packet",
+        "old_name": "local_10",
+        "new_name": "maybe_file_size",
+    }
+    assert _check(_prefix_mw(), tool, args) is None
+
+
+def test_missing_new_name_argument_fails_closed() -> None:
+    """If the new name can't be found, the call is rejected, not waved through."""
+    tool = _FakeTool("rename_symbol", {"type": "object"})
+
+    result = _check(_prefix_mw(), tool, {"address": "0x1000", "label": "init"})
+
+    assert isinstance(result, ToolMessage)
+    payload = _payload(result)["rename_prefix_error"]
+    assert payload["rejected_names"] == []
+    assert "cannot be checked" in payload["hint"]
+
+
+def test_rename_prefix_not_enforced_without_the_rule() -> None:
+    """A full-write agent may settle a name; the rule is off for it."""
+    mw = create_argument_validation_middleware()
+    tool = _FakeTool("rename_symbol", RENAME_SCHEMA)
+    assert _check(mw, tool, {"address": "0x1000", "new_name": "init"}) is None
+
+
+def test_non_rename_tools_are_untouched_by_the_rule() -> None:
+    tool = _FakeTool("comments", ACTION_SCHEMA)
+    assert _check(_prefix_mw(), tool, {"action": "set"}) is None
 
 
 # ── validator cache ───────────────────────────────────────────────────────────
