@@ -80,6 +80,41 @@ def test_read_only_switch_tool_is_not_registered() -> None:
     assert "find_unrecovered_switches" not in _MUTATING_TOOLS
 
 
+def test_general_mutation_paths_are_registered() -> None:
+    """Tools that change bytes or code units invalidate the decompilation too.
+
+    `scripts` is the widest hole of the set: an agent holding it can run any
+    Ghidra script, including one that renames or patches, so leaving it out let
+    `get_code` serve pre-mutation output for the full TTL.
+    """
+    for name in (
+        "scripts",
+        "patch_bytes",
+        "assemble_code",
+        "disassemble_at",
+        "create_data_var",
+    ):
+        assert name in _MUTATING_TOOLS
+
+
+def test_bookmarks_do_not_flush_the_cache() -> None:
+    """Bookmarks are the pending-change queue: written constantly, cached never.
+
+    No cached tier renders bookmarks, so flushing on each write would throw away
+    the decompilation cache for nothing — precisely the re-read cost the cache
+    exists to avoid.
+    """
+    assert "bookmarks" not in _MUTATING_TOOLS
+
+    mw, coll = _middleware()
+    mw.wrap_tool_call(_request("get_code"), lambda r: _ok("get_code", "v1"))
+
+    mw.wrap_tool_call(_request("bookmarks"), lambda r: _ok("bookmarks", "added"))
+
+    assert coll.docs != {}
+    assert mw.invalidations == 0
+
+
 # ── caching + invalidation ────────────────────────────────────────────────────
 
 

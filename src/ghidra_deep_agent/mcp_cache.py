@@ -90,6 +90,15 @@ _MUTATING_TOOLS = frozenset(
         "types",
         "struct",
         "create_function",
+        "create_data_var",
+        "patch_bytes",
+        "assemble_code",
+        # Converts undefined bytes to instructions / clears code units, which
+        # changes disassembly and decompilation output.
+        "disassemble_at",
+        # Fully general mutation path: an agent with `scripts` can run arbitrary
+        # Ghidra scripts, including ones that rename/retype/patch.
+        "scripts",
         # Local tool (prototype_tools.py) that commits recovered prototypes via a
         # Ghidra script. It's the name seen in the graph — the coordinator calls
         # it, not `scripts` — so invalidation keys on it here.
@@ -105,9 +114,11 @@ _MUTATING_TOOLS = frozenset(
         # can't tell the two apart from the result text, so invalidating on both is
         # the safe side of the trade (a needless flush only costs a re-read).
         "deobfuscate_cff",
-        # Bookmarks don't change decompilation, but they do show up in the listing
-        # reads above, so a successful write flushes the tier for consistency.
-        "bookmarks",
+        # `bookmarks` is deliberately absent: bookmark writes don't affect any
+        # cached tier's output (neither tier renders bookmarks), and they are
+        # written constantly as the pending-change queue — flushing the mutable
+        # tier on each one would defeat the cache. Revisit if `bookmarks` is ever
+        # added to a cached tier via the env allowlist overrides.
     }
 )
 

@@ -2,9 +2,16 @@
 
 Agents are declared in ``subagents.toml`` (path overridable via ``AGENT_CONFIG``):
 the main/coordinator agent's model + tool allowlist, and each sub-agent's
-``name`` / ``description`` / ``system_prompt`` / ``model`` / ``tools``. This module
-loads and validates that file and turns it into the objects ``create_deep_agent``
-expects.
+``name`` / ``description`` / ``system_prompt`` / ``model`` / ``tools`` /
+``write_policy``. This module loads and validates that file and turns it into the
+objects ``create_deep_agent`` expects.
+
+How much of the program each sub-agent may change is a ``WritePolicy`` tier
+rather than a read-only boolean — see ``WRITE_POLICIES`` below for why the middle
+tier exists. A tier is enforced two ways: blocked tools are dropped from the
+agent's tool set, and blocked ``action``s (plus the provisional-rename prefix) are
+rejected per call by ``ArgumentValidationMiddleware``. The tier also *writes its
+own prompt text*, so what the model is told always matches what it can do.
 
 Why config-driven: models can be right-sized per agent (a cheap model for recon,
 a capable one for analysis) without code edits, and the coordinator's tool set is
@@ -46,16 +53,14 @@ _CONFIG_FILENAME = "subagents.toml"
 # `tools = "*"` in the config means "every available tool".
 _ALL_TOOLS = "*"
 
-# GhidrAssistMCP write tools that must be dropped entirely from a read-only
-# context: each one mutates the program/project (or the knowledge base) with no
-# read mode to preserve. Read-only is then "everything else", so newly added
-# *read* tools are auto-covered. Applied to any ``read_only`` sub-agent (see
-# ``build_subagents``) and to ``build_plan_mode_main_tools``. Dual read/write
-# tools (``variables``,
-# ``comments``, ``types``, ``struct``, ``bookmarks``) are NOT dropped here — they
-# keep their read actions and have their write actions blocked via
-# ``READ_ONLY_WRITE_ACTIONS`` (see ``validation.py``).
-PLAN_MODE_BLOCKED_TOOLS = frozenset(
+# Every write-only tool: each mutates the program/project (or the knowledge base)
+# with no read mode to preserve, so a restricted context drops it entirely.
+# "Read-only" is then "everything else", meaning newly added *read* tools are
+# auto-covered. Dual read/write tools (``variables``, ``comments``, ``types``,
+# ``struct``, ``bookmarks``) are NOT listed here — they keep their read actions
+# and have their write actions blocked per-call via ``ALL_WRITE_ACTIONS`` (see
+# ``validation.py``).
+MUTATION_TOOLS = frozenset(
     {
         "rename_symbol",
         "batch_rename",
@@ -71,6 +76,7 @@ PLAN_MODE_BLOCKED_TOOLS = frozenset(
         "scripts",
         "recover_prototypes",  # local tool: commits recovered prototypes (mutates)
         "apply_switch_override",  # local tool: writes jump-table overrides (mutates)
+        "deobfuscate_cff",  # local tool: rewrites flattened control flow (apply=True)
         "project_files",  # has a `delete` action
         "analysis_options",
         "analysis_control",
@@ -78,11 +84,11 @@ PLAN_MODE_BLOCKED_TOOLS = frozenset(
         "update_knowledge",
     }
 )
-# Write ``action`` values on GhidrAssistMCP's consolidated read/write tools. In a
-# read-only context these actions are rejected by the argument-validation
-# middleware while the tool's read actions (list/get/field_xrefs) still work.
+# Write ``action`` values on GhidrAssistMCP's consolidated read/write tools. A
+# restricted context rejects these via the argument-validation middleware while
+# the tool's read actions (list/get/field_xrefs) still work.
 # Action strings verified against the live server's tool schemas.
-READ_ONLY_WRITE_ACTIONS: dict[str, frozenset[str]] = {
+ALL_WRITE_ACTIONS: dict[str, frozenset[str]] = {
     "variables": frozenset({"rename", "retype", "set_prototype"}),
     "comments": frozenset({"set", "remove"}),
     "types": frozenset(
@@ -101,6 +107,167 @@ READ_ONLY_WRITE_ACTIONS: dict[str, frozenset[str]] = {
     ),
     "bookmarks": frozenset({"set", "remove"}),
 }
+
+# --- Write policy tiers --------------------------------------------------------
+#
+# Sub-agents used to be either fully write-capable or fully read-only. That binary
+# forced every analysis agent that shouldn't do type surgery to be read-only, which
+# meant its conclusions could not be persisted at all: each follow-up delegation
+# re-decompiled and re-reasoned about the same function from scratch, and any
+# change it wanted was lost in free-text prose. The middle tier (``annotations``)
+# exists so an investigator can persist *cheap, revisable* findings — renames,
+# comments, bookmarks, knowledge-base entries — while heavyweight, hard-to-undo
+# mutations stay with the specialists that own them.
+#
+# The restricted tiers are defined by SUBTRACTION from the full-lockdown sets
+# above, so a write tool or write action added later is blocked by default in
+# every restricted tier (fail closed) until it is explicitly allowed.
+
+# Write-only tools the ``annotations`` tier keeps. Renames are metadata and
+# trivially reversible; KB writes never touch the program at all.
+ANNOTATION_TOOLS = frozenset(
+    {
+        "rename_symbol",
+        "batch_rename",
+        "save_knowledge",
+        "update_knowledge",
+    }
+)
+# Write ``action``s the ``annotations`` tier keeps on the dual read/write tools.
+# Notably absent: ``variables:retype``/``set_prototype`` and everything on
+# ``types``/``struct`` — type and signature surgery is program-global and stays
+# with ``type-fixer`` / ``prototype-fixer``.
+ANNOTATION_ACTIONS: dict[str, frozenset[str]] = {
+    "variables": frozenset({"rename"}),
+    "comments": frozenset({"set", "remove"}),
+    "bookmarks": frozenset({"set", "remove"}),
+}
+
+# A rename applied by an ``annotations``-tier agent must carry this prefix. The
+# tier is for *provisional* conclusions, so the uncertainty is encoded in the name
+# itself rather than left to the agent's discretion; the rule is enforced by the
+# argument-validation middleware, not by prompt text. Promotion (dropping the
+# prefix once the evidence is settled) requires a ``full``-tier agent.
+PROVISIONAL_RENAME_PREFIX = "maybe_"
+
+_PENDING_PROTOCOL = f"""
+## Your write scope in this session
+You may apply CHEAP, REVISABLE annotations directly in Ghidra as you work, and you
+SHOULD — what you persist is what the next sub-agent sees instead of re-deriving:
+- rename functions, variables, and parameters (`rename_symbol`, `batch_rename`,
+  `variables` with `action: rename`),
+- add comments (`comments` with `action: set`),
+- drop bookmarks (`bookmarks` with `action: set`),
+- record findings in the knowledge base (`save_knowledge`, `update_knowledge`).
+
+Every rename you apply MUST start with `{PROVISIONAL_RENAME_PREFIX}` — the tool
+rejects the call otherwise. The prefix marks the name as provisional: your
+evidence was good enough to be worth persisting, not good enough to be final. Also
+`save_knowledge` each rename (category `rename`, confidence `provisional`) with the
+evidence behind it, so a later agent can confirm or correct the guess instead of
+starting over. Do NOT try to remove an existing `{PROVISIONAL_RENAME_PREFIX}`
+prefix — confirming a provisional name is `function-analyst`'s job.
+
+You may NOT retype variables, set prototypes, create or edit types/structs, patch
+or assemble bytes, run scripts, or apply switch/CFF overrides.
+
+## PENDING protocol — how a change you cannot apply gets made
+When the evidence supports a change outside your scope, do BOTH of these:
+1. File it in Ghidra: `bookmarks` with `action: set`, `category: pending-change`,
+   at the relevant address, with the comment
+   `pending <retype|prototype|struct|switch|patch|other>: <target> -> <detail>`.
+   This is a durable queue — it survives this delegation, and the coordinator
+   drains it to the specialist that owns the change.
+2. List it in your summary under a `PENDING:` heading, one line per item.
+A `read_only_error` result means the change is out of scope: file it as pending.
+Never retry the blocked call.
+""".strip()
+
+_READ_ONLY_SECTION = """
+## Your write scope in this session
+You are STRICTLY READ-ONLY. You cannot mutate the Ghidra program in any way and
+cannot write the knowledge base: no renames, retypes, comments, bookmarks,
+prototypes, types, structs, patches, or scripts. Do not ask for those tools.
+
+State the concrete changes you would recommend (renames, retypes, comments,
+prototypes, knowledge-base entries) in your summary instead of applying them, so
+the coordinator can fold them into its plan or answer. A `read_only_error` result
+means the tool is blocked here — do not retry it.
+""".strip()
+
+
+@dataclass(frozen=True)
+class WritePolicy:
+    """How much of the program a sub-agent may mutate.
+
+    ``blocked_tools`` are dropped from the agent's tool set entirely;
+    ``blocked_actions`` are rejected per-call by the argument-validation
+    middleware. ``prompt_section`` and ``description_suffix`` are appended in
+    ``build_subagents`` rather than written into ``subagents.toml``, so the text
+    the model sees can never drift from what the middleware enforces, and one
+    TOML entry can describe itself correctly under different policies (the same
+    ``research`` agent annotates in the normal graph and is read-only in plan and
+    ask mode).
+    """
+
+    name: str
+    blocked_tools: frozenset[str]
+    blocked_actions: Mapping[str, frozenset[str]]
+    # Rename calls must use this prefix; None disables the check.
+    rename_prefix: str | None
+    prompt_section: str
+    description_suffix: str
+
+
+def _actions_minus(
+    allowed: Mapping[str, frozenset[str]],
+) -> dict[str, frozenset[str]]:
+    """``ALL_WRITE_ACTIONS`` minus ``allowed``, dropping now-empty entries."""
+    remaining: dict[str, frozenset[str]] = {}
+    for tool, actions in ALL_WRITE_ACTIONS.items():
+        blocked = actions - allowed.get(tool, frozenset())
+        if blocked:
+            remaining[tool] = blocked
+    return remaining
+
+
+WRITE_POLICIES: dict[str, WritePolicy] = {
+    # Trusted specialists: everything their tool allowlist grants.
+    "full": WritePolicy(
+        name="full",
+        blocked_tools=frozenset(),
+        blocked_actions={},
+        rename_prefix=None,
+        prompt_section="",
+        description_suffix="",
+    ),
+    # Investigators: provisional renames, comments, bookmarks, KB writes.
+    "annotations": WritePolicy(
+        name="annotations",
+        blocked_tools=MUTATION_TOOLS - ANNOTATION_TOOLS,
+        blocked_actions=_actions_minus(ANNOTATION_ACTIONS),
+        rename_prefix=PROVISIONAL_RENAME_PREFIX,
+        prompt_section=_PENDING_PROTOCOL,
+        description_suffix=(
+            " Applies provisional annotations only (renames prefixed "
+            f"`{PROVISIONAL_RENAME_PREFIX}`, comments, bookmarks, knowledge-base "
+            "entries); anything heavier it files as a `pending-change` bookmark "
+            "and reports under PENDING: for you to route to a specialist."
+        ),
+    ),
+    # Plan mode / ask mode: no writes at all.
+    "none": WritePolicy(
+        name="none",
+        blocked_tools=MUTATION_TOOLS,
+        blocked_actions=ALL_WRITE_ACTIONS,
+        rename_prefix=None,
+        prompt_section=_READ_ONLY_SECTION,
+        description_suffix=" Read-only: applies no changes of any kind.",
+    ),
+}
+
+DEFAULT_WRITE_POLICY = "full"
+READ_ONLY_WRITE_POLICY = "none"
 # Tools withheld from every agent. Filtered out of the full tool set once at
 # startup (cli.py), before any per-agent selection — the only reliable block,
 # since `tools = "*"` agents and the read-only research sub-agent would otherwise
@@ -138,7 +305,8 @@ class SubAgentConfig:
     all_tools: bool
     exclude: tuple[str, ...]
     model: str | None
-    read_only: bool
+    # A key of ``WRITE_POLICIES``; see that table for what each tier allows.
+    write_policy: str
 
 
 @dataclass(frozen=True)
@@ -212,6 +380,31 @@ def _parse_tools(table: Mapping[str, Any], where: str) -> tuple[tuple[str, ...],
     return tuple(value), False
 
 
+def _parse_write_policy(table: Mapping[str, Any], where: str) -> str:
+    """Resolve an entry's write policy from ``write_policy`` / ``read_only``.
+
+    ``read_only = true`` is kept as sugar for ``write_policy = "none"`` (it
+    predates the tiers and reads well for the fully-locked-down case). Setting
+    both is only an error when they disagree, so the redundant-but-consistent
+    spelling doesn't break an existing config.
+    """
+    policy = _opt_str(table, "write_policy", where)
+    if policy is not None and policy not in WRITE_POLICIES:
+        raise ValueError(
+            f"{where}: unknown write_policy {policy!r}; expected one of "
+            f"{', '.join(sorted(WRITE_POLICIES))}"
+        )
+    read_only = _opt_bool(table, "read_only", where)
+    if read_only:
+        if policy is not None and policy != READ_ONLY_WRITE_POLICY:
+            raise ValueError(
+                f"{where}: read_only = true conflicts with "
+                f"write_policy = {policy!r}; set only one"
+            )
+        return READ_ONLY_WRITE_POLICY
+    return policy or DEFAULT_WRITE_POLICY
+
+
 def _parse_subagent(raw: Any, path: Path) -> SubAgentConfig:
     if not isinstance(raw, dict):
         raise ValueError(f"{path}: each [[subagents]] entry must be a table")
@@ -229,7 +422,7 @@ def _parse_subagent(raw: Any, path: Path) -> SubAgentConfig:
         all_tools=all_tools,
         exclude=_opt_str_list(raw, "exclude", where),
         model=_opt_str(raw, "model", where),
-        read_only=_opt_bool(raw, "read_only", where),
+        write_policy=_parse_write_policy(raw, where),
     )
 
 
@@ -341,6 +534,13 @@ def build_main_tools(
     return _select(by_name, config.main_tools, agent="main")
 
 
+def _with_policy_section(system_prompt: str, policy: WritePolicy) -> str:
+    """Append the policy's generated write-scope section to a system prompt."""
+    if not policy.prompt_section:
+        return system_prompt
+    return f"{system_prompt.rstrip()}\n\n{policy.prompt_section}\n"
+
+
 def build_subagents(
     all_tools: Sequence[BaseTool],
     config: AgentConfig,
@@ -350,6 +550,7 @@ def build_subagents(
     cache_middleware: AgentMiddleware | None = None,
     async_middleware: AgentMiddleware | None = None,
     summary_model: str | BaseChatModel | None = None,
+    policy_override: str | None = None,
 ) -> list[SubAgent]:
     """Build ``SubAgent`` specs from config, filtered against the live tools.
 
@@ -363,7 +564,18 @@ def build_subagents(
     ``backend`` is the shared filesystem backend the summarizer offloads evicted
     history to; ``summary_model`` (when given) routes summary calls to a cheaper
     model.
+
+    ``policy_override`` forces every sub-agent onto one ``WRITE_POLICIES`` tier,
+    ignoring what the config asked for. Plan mode and ask mode build their
+    delegates with ``"none"``, which is what makes those graphs read-only *by
+    construction* rather than by trusting the config — the same TOML entry can
+    then annotate in the normal graph and be locked down in the read-only ones.
     """
+    if policy_override is not None and policy_override not in WRITE_POLICIES:
+        raise ValueError(
+            f"unknown policy_override {policy_override!r}; expected one of "
+            f"{', '.join(sorted(WRITE_POLICIES))}"
+        )
     by_name = {tool.name: tool for tool in all_tools}
     specs: list[SubAgent] = []
     for sub in config.subagents:
@@ -374,22 +586,21 @@ def build_subagents(
         if sub.exclude:
             excluded = set(sub.exclude)
             tools = [tool for tool in tools if tool.name not in excluded]
-        if sub.read_only:
-            # Drop the write-only tools and reject write `action`s on the dual
-            # read/write tools, so a `read_only` sub-agent can never mutate the
-            # program or the knowledge base (see PLAN_MODE_BLOCKED_TOOLS /
-            # READ_ONLY_WRITE_ACTIONS).
-            tools = _read_only_tools(tools)
-            validation_mw = create_argument_validation_middleware(
-                READ_ONLY_WRITE_ACTIONS
-            )
-        else:
-            validation_mw = create_argument_validation_middleware()
+        policy = WRITE_POLICIES[policy_override or sub.write_policy]
+        # Drop the tier's blocked write-only tools outright; its blocked write
+        # `action`s on the dual read/write tools are rejected per call by the
+        # middleware, which also enforces the provisional-rename prefix.
+        if policy.blocked_tools:
+            tools = [tool for tool in tools if tool.name not in policy.blocked_tools]
+        validation_mw = create_argument_validation_middleware(
+            policy.blocked_actions or None,
+            rename_prefix=policy.rename_prefix,
+        )
         model = resolve_model(sub.model)
         spec: SubAgent = {
             "name": sub.name,
-            "description": sub.description,
-            "system_prompt": sub.system_prompt,
+            "description": sub.description + policy.description_suffix,
+            "system_prompt": _with_policy_section(sub.system_prompt, policy),
             "tools": tools,
             "model": model,
             "middleware": [
@@ -412,16 +623,6 @@ def build_subagents(
 # --- Plan mode (read-only) -----------------------------------------------------
 
 
-def _read_only_tools(all_tools: Sequence[BaseTool]) -> list[BaseTool]:
-    """Every tool except the write-only ones in ``PLAN_MODE_BLOCKED_TOOLS``.
-
-    Consolidated read/write tools (``variables``/``comments``/``types``/
-    ``struct``/``bookmarks``) are kept — their write ``action``s are blocked at
-    call time by the read-only argument-validation middleware, not here.
-    """
-    return [tool for tool in all_tools if tool.name not in PLAN_MODE_BLOCKED_TOOLS]
-
-
 def build_plan_mode_main_tools(
     all_tools: Sequence[BaseTool], config: AgentConfig
 ) -> list[BaseTool]:
@@ -435,5 +636,5 @@ def build_plan_mode_main_tools(
     return [
         tool
         for tool in build_main_tools(all_tools, config)
-        if tool.name not in PLAN_MODE_BLOCKED_TOOLS
+        if tool.name not in MUTATION_TOOLS
     ]

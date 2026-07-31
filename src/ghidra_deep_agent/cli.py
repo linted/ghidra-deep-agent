@@ -64,6 +64,9 @@ from ghidra_deep_agent.sandbox import (
 from ghidra_deep_agent.sandbox_sync import SandboxSyncMiddleware
 from ghidra_deep_agent.sessions import build_session_store
 from ghidra_deep_agent.subagents import (
+    ALL_WRITE_ACTIONS,
+    DEFAULT_WRITE_POLICY,
+    READ_ONLY_WRITE_POLICY,
     RESEARCH_SUBAGENT_NAME,
     build_main_tools,
     build_plan_mode_main_tools,
@@ -199,23 +202,24 @@ def _read_only_delegates(
 ) -> tuple[list[Any], list[Any]]:
     """Pick the sub-agents plan mode and ask mode may delegate to.
 
-    Returns ``(plan_mode_subagents, ask_mode_subagents)``. Both modes are
-    read-only, so only read-only sub-agents qualify — the other config
-    sub-agents all mutate Ghidra (`prototype-fixer` included).
+    Returns ``(plan_mode_subagents, ask_mode_subagents)``. Pass the sub-agent
+    list built with ``policy_override=READ_ONLY_WRITE_POLICY``: these two modes
+    are read-only *by construction*, so what a config entry asks for doesn't
+    matter here. Only investigation-shaped agents are offered — the fixers exist
+    to mutate and have nothing to do once they cannot.
 
-    `research` is a config `[[subagents]]` entry (`read_only = true`) shared by
-    every graph: the normal coordinator gets it in its full set, and plan mode
-    uses it as its ONLY delegate. Ask mode additionally gets the read-only
-    `vuln-hunter` so exploitability questions can be routed to it.
+    `research` is a config `[[subagents]]` entry shared by every graph: the normal
+    coordinator gets the annotating build of it, and plan mode uses the read-only
+    build as its ONLY delegate. Ask mode additionally gets `vuln-hunter` so
+    exploitability questions can be routed to it.
     """
     research_sub = next(
         (s for s in subagents if s.get("name") == RESEARCH_SUBAGENT_NAME), None
     )
     if research_sub is None:
         raise ValueError(
-            f"A read-only '{RESEARCH_SUBAGENT_NAME}' sub-agent is required "
-            "(plan mode and ask mode depend on it); add it to the agent config "
-            "with read_only = true."
+            f"A '{RESEARCH_SUBAGENT_NAME}' sub-agent is required "
+            "(plan mode and ask mode depend on it); add it to the agent config."
         )
 
     ask_mode_subagents = [research_sub]
@@ -348,7 +352,12 @@ def _build_shared_middleware(
         # Tool calls: validate args (reject bad calls without retry), serve
         # immutable reads from cache, resolve async task stubs (inside the cache
         # so resolved results are what gets cached), then retry transient I/O.
-        create_argument_validation_middleware(),
+        #
+        # The coordinator never mutates the program itself — it delegates. Its
+        # allowlist grants no write-only tool, but the dual read/write tools it
+        # does need (`bookmarks`, to drain the pending-change queue) carry write
+        # actions along with the reads, so every write action is blocked here.
+        create_argument_validation_middleware(ALL_WRITE_ACTIONS),
         *([cache_mw] if cache_mw is not None else []),
         *([async_mw] if async_mw is not None else []),
         build_tool_retry_middleware(),
@@ -372,7 +381,8 @@ class Graphs(NamedTuple):
     main: Any
     # Read-only planner: no mutating tools, delegates only to read-only sub-agents.
     plan: Any
-    # Read-only question-answerer: full coordinator tool set minus Ghidra writes.
+    # Read-only question-answerer: same tool set as plan mode (no Ghidra writes
+    # and no knowledge-base writes), with one more read-only delegate.
     ask: Any
 
 
@@ -416,7 +426,10 @@ def _build_graphs(
     return Graphs(
         main=build(SYSTEM_PROMPT, main_tools, subagents),
         plan=build(PLAN_MODE_SYSTEM_PROMPT, plan_tools, plan_mode_subagents),
-        ask=build(ASK_MODE_SYSTEM_PROMPT, main_tools, ask_mode_subagents),
+        # Ask mode gets `plan_tools`, not `main_tools`: it is a read-only mode, so
+        # the knowledge-base write tools are withheld structurally rather than
+        # left for the prompt to talk it out of using.
+        ask=build(ASK_MODE_SYSTEM_PROMPT, plan_tools, ask_mode_subagents),
     )
 
 
@@ -472,9 +485,16 @@ async def main() -> None:
         print("Async task resolution enabled (polling get_task_status).")
     print(f"Main agent: {main_model_spec}  [{len(main_tools)} tool(s)]")
     for sub_cfg in agent_config.subagents:
+        # Show the write tier for anything but the default: how much of the
+        # program an agent may change is worth seeing before a session starts.
+        policy = (
+            ""
+            if sub_cfg.write_policy == DEFAULT_WRITE_POLICY
+            else f"  [writes: {sub_cfg.write_policy}]"
+        )
         print(
             f"  sub-agent {sub_cfg.name}: "
-            f"{resolve_model_spec(sub_cfg.model, agent_config)}"
+            f"{resolve_model_spec(sub_cfg.model, agent_config)}{policy}"
         )
 
     recursion_limit = env_int("RECURSION_LIMIT", DEFAULT_RECURSION_LIMIT)
@@ -530,7 +550,24 @@ async def main() -> None:
                 async_middleware=async_mw,
                 summary_model=summary_override,
             )
-            plan_mode_subagents, ask_mode_subagents = _read_only_delegates(subagents)
+            # Plan mode and ask mode delegate to the SAME config entries, rebuilt
+            # under a forced read-only policy. Building a second set (rather than
+            # relying on `read_only = true` in the config) is what makes those
+            # graphs read-only by construction: `research` can annotate in the
+            # normal graph and still be structurally unable to write here.
+            read_only_subagents = build_subagents(
+                all_tools,
+                agent_config,
+                resolve_model,
+                storage.backend,
+                cache_middleware=cache_mw,
+                async_middleware=async_mw,
+                summary_model=summary_override,
+                policy_override=READ_ONLY_WRITE_POLICY,
+            )
+            plan_mode_subagents, ask_mode_subagents = _read_only_delegates(
+                read_only_subagents
+            )
 
             shared_middleware = _build_shared_middleware(
                 storage=storage,
