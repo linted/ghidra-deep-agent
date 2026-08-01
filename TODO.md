@@ -61,6 +61,15 @@ default-agent turn's input tokens 65%). Follow-ups it unlocks:
   `filesystem.py:1337`) via replace-by-name `middleware=`; no fork or internal
   patching. See the backlog entry above for the original evidence; wire it to an
   env knob like the `COMPACT_*` family if a lower threshold proves out.
+- [ ] **File the report-extraction bug upstream** — deepagents 0.7's
+  `_return_command_with_state_update` (`middleware/subagents.py:495-505`) picks
+  the sub-agent report as the last `AIMessage` with any non-empty text, without
+  checking `tool_calls` — so a run that ends on a tool call (plus Anthropic's
+  trailing empty `end_turn`) reports only the tool-call preamble ("Now let me
+  save the findings..."). Their own code comment shows partial awareness. We
+  backstop it locally with `report_guard.py` (`SubagentReportGuardMiddleware`,
+  2026-08-01) — the guard can shrink or go away once upstream skips tool-call
+  messages in the walk.
 - [ ] **Revisit the deferred prompt-trim sub-items** — the TodoListMiddleware
   injection is gone as of this upgrade, and built-in tool descriptions are now
   overridable directly (`FilesystemMiddleware(custom_tool_descriptions={...})`).

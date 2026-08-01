@@ -77,7 +77,10 @@ class SubagentReportScreen(ModalScreen[None]):
         if report.text:
             body.write(Markdown(report.text))
         else:
-            body.write("(empty report)")
+            body.write(
+                "(sub-agent returned no report text — it ended on a tool call; "
+                "findings, if any, were persisted to the knowledge base)"
+            )
         body.scroll_home(animate=False)
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:

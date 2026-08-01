@@ -42,6 +42,7 @@ from langchain_core.tools import BaseTool
 from ghidra_deep_agent.compaction import build_tuned_summarization_middleware
 from ghidra_deep_agent.defaults import config_path
 from ghidra_deep_agent.models import build_model
+from ghidra_deep_agent.report_guard import SubagentReportGuardMiddleware
 from ghidra_deep_agent.resilience import (
     build_model_resilience_middleware,
     build_tool_retry_middleware,
@@ -181,6 +182,20 @@ When the evidence supports a change outside your scope, do BOTH of these:
 2. List it in your summary under a `PENDING:` heading, one line per item.
 A `read_only_error` result means the change is out of scope: file it as pending.
 Never retry the blocked call.
+""".strip()
+
+# Appended to EVERY sub-agent prompt regardless of tier (full-tier specialists
+# also end runs on writes). deepagents forwards only the text of the final
+# non-empty AIMessage to the coordinator, so a run that ends on a tool call
+# reports nothing but that call's preamble; SubagentReportGuardMiddleware
+# backstops the runs where the model ignores this instruction anyway.
+_REPORT_PROTOCOL = """
+## Final report
+The coordinator receives ONLY the text of your final message. Your tool calls
+(knowledge-base writes, bookmarks, renames, comments) persist state but are
+INVISIBLE to it. After your last tool call, ALWAYS end the turn with your
+complete plain-text findings summary (including the `PENDING:` list where
+applicable). Never end the turn on a tool call or with an empty message.
 """.strip()
 
 _READ_ONLY_SECTION = """
@@ -535,10 +550,12 @@ def build_main_tools(
 
 
 def _with_policy_section(system_prompt: str, policy: WritePolicy) -> str:
-    """Append the policy's generated write-scope section to a system prompt."""
-    if not policy.prompt_section:
-        return system_prompt
-    return f"{system_prompt.rstrip()}\n\n{policy.prompt_section}\n"
+    """Append the policy's write-scope section and the report protocol."""
+    sections = [system_prompt.rstrip()]
+    if policy.prompt_section:
+        sections.append(policy.prompt_section)
+    sections.append(_REPORT_PROTOCOL)
+    return "\n\n".join(sections) + "\n"
 
 
 def build_subagents(
@@ -614,6 +631,11 @@ def build_subagents(
                 build_tuned_summarization_middleware(
                     model, backend, summary_model=summary_model, scope="subagent"
                 ),
+                # Backstops deepagents' report extraction (subagents.py,
+                # `_return_command_with_state_update`): it forwards the last
+                # non-empty AIMessage's text even when that message is a
+                # tool-call preamble. Runs after the loop, so order is moot.
+                SubagentReportGuardMiddleware(),
             ],
         }
         specs.append(spec)
