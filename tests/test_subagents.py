@@ -21,7 +21,9 @@ from deepagents.backends import StateBackend
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.tools import BaseTool
 
+from ghidra_deep_agent.report_guard import SubagentReportGuardMiddleware
 from ghidra_deep_agent.subagents import (
+    _REPORT_PROTOCOL,
     ALL_WRITE_ACTIONS,
     MUTATION_TOOLS,
     PROVISIONAL_RENAME_PREFIX,
@@ -194,14 +196,38 @@ def test_policy_text_is_appended_and_differs_per_tier(tmp_path: Path) -> None:
     for spec in (full, annotations, none):
         assert "base prompt" in spec["system_prompt"]
 
-    # `full` adds nothing; the restricted tiers each add their own scope text.
-    assert full["system_prompt"] == "base prompt"
+    # `full` adds no scope text (only the tier-invariant report protocol); the
+    # restricted tiers each add their own scope text.
+    assert full["system_prompt"] == "base prompt\n\n" + _REPORT_PROTOCOL + "\n"
     assert full["description"] == "d"
     assert PROVISIONAL_RENAME_PREFIX in annotations["system_prompt"]
     assert "pending-change" in annotations["system_prompt"]
     assert "STRICTLY READ-ONLY" in none["system_prompt"]
     assert annotations["system_prompt"] != none["system_prompt"]
     assert annotations["description"] != none["description"] != "d"
+
+
+def test_report_protocol_and_guard_apply_to_every_tier(tmp_path: Path) -> None:
+    """The final-report protocol and its middleware backstop are tier-invariant.
+
+    Both exist because deepagents forwards only the last non-empty AIMessage's
+    text as the sub-agent's report; see report_guard.py.
+    """
+    body = (
+        _entry("full")
+        + _entry("annotations", policy_line='write_policy = "annotations"\n')
+        + _entry("none", policy_line="read_only = true\n")
+    )
+    for spec in _build(tmp_path, body).values():
+        assert "## Final report" in spec["system_prompt"]
+        # The protocol comes after the tier's scope section, closing the prompt.
+        assert spec["system_prompt"].rstrip().endswith(_REPORT_PROTOCOL)
+        guards = [
+            m
+            for m in spec["middleware"]
+            if isinstance(m, SubagentReportGuardMiddleware)
+        ]
+        assert len(guards) == 1, spec["name"]
 
 
 # --- policy_override (what makes plan/ask mode read-only) ----------------------
