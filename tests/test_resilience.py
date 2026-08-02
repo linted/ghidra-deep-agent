@@ -10,14 +10,22 @@ Run:  uv run pytest tests/test_resilience.py -v
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage
 
 from ghidra_deep_agent.resilience import (
+    _MAX_TRUNCATION_RECOVERIES,
+    _TRUNCATION_NUDGE,
+    TruncationRecoveryMiddleware,
     UsageLimitError,
     _is_out_of_credits,
     _is_transient,
     _is_usage_limit,
     _on_model_retries_exhausted,
+    build_model_resilience_middleware,
+    is_truncated_message,
 )
 from ghidra_deep_agent.toasts import ToastRequest
 
@@ -154,3 +162,107 @@ def test_on_failure_does_not_toast_on_usage_limit(
         _on_model_retries_exhausted(_StatusError("rate limit exceeded", 429))
 
     assert received == []
+
+
+# --- truncation recovery --------------------------------------------------------
+
+
+def _truncated_ai(
+    text: str = "Now let me save the key findings to the knowledge base.",
+    *,
+    stop_reason: str | None = "max_tokens",
+    **kwargs: object,
+) -> AIMessage:
+    meta = {"stop_reason": stop_reason} if stop_reason else {}
+    return AIMessage(text, response_metadata=meta, **kwargs)
+
+
+def test_max_tokens_stop_reason_is_truncated() -> None:
+    assert is_truncated_message(_truncated_ai())
+    assert is_truncated_message(
+        AIMessage("x", response_metadata={"finish_reason": "length"})
+    )
+
+
+def test_normal_stop_reasons_are_not_truncated() -> None:
+    assert not is_truncated_message(
+        AIMessage("done", response_metadata={"stop_reason": "end_turn"})
+    )
+    assert not is_truncated_message(AIMessage("no metadata at all"))
+    assert not is_truncated_message(HumanMessage("not an AIMessage"))
+
+
+def _after_model(messages: list[object]) -> dict[str, Any] | None:
+    return TruncationRecoveryMiddleware().after_model(
+        {"messages": messages},  # type: ignore[typeddict-item]
+        None,  # type: ignore[arg-type]  # runtime is unused
+    )
+
+
+def test_truncated_dead_end_jumps_back_to_the_model() -> None:
+    # The observed failure: preamble text, tool_use cut off before it parsed,
+    # no tool_calls -> the loop would route to END and the save never runs.
+    update = _after_model([HumanMessage("analyze"), _truncated_ai()])
+    assert update is not None
+    assert update["jump_to"] == "model"
+    (nudge,) = update["messages"]
+    assert isinstance(nudge, HumanMessage)
+    assert nudge.content == _TRUNCATION_NUDGE
+
+
+def test_truncated_but_parsed_tool_calls_continue_normally() -> None:
+    # A complete tool_use block parsed before the cut: the loop proceeds to the
+    # tools node on its own; jumping would double-execute.
+    msg = _truncated_ai(
+        tool_calls=[
+            {"name": "save_knowledge", "args": {}, "id": "c1", "type": "tool_call"}
+        ]
+    )
+    assert _after_model([HumanMessage("analyze"), msg]) is None
+
+
+def test_untruncated_response_is_untouched() -> None:
+    assert _after_model([HumanMessage("analyze"), AIMessage("## Report")]) is None
+
+
+def test_recovery_is_bounded_per_turn() -> None:
+    messages: list[object] = [HumanMessage("analyze")]
+    for _ in range(_MAX_TRUNCATION_RECOVERIES):
+        messages += [_truncated_ai(), HumanMessage(_TRUNCATION_NUDGE)]
+    messages.append(_truncated_ai())
+    assert _after_model(messages) is None
+
+
+def test_a_new_turn_resets_the_recovery_budget() -> None:
+    messages: list[object] = [HumanMessage("first task")]
+    for _ in range(_MAX_TRUNCATION_RECOVERIES):
+        messages += [_truncated_ai(), HumanMessage(_TRUNCATION_NUDGE)]
+    messages += [HumanMessage("second task"), _truncated_ai()]
+    assert _after_model(messages) is not None
+
+
+def test_invalid_tool_calls_are_replaced_not_resubmitted() -> None:
+    msg = _truncated_ai(
+        id="msg-1",
+        invalid_tool_calls=[
+            {
+                "name": "save_knowledge",
+                "args": '{"content": "half a',
+                "id": "c1",
+                "error": None,
+                "type": "invalid_tool_call",
+            }
+        ],
+    )
+    update = _after_model([HumanMessage("analyze"), msg])
+    assert update is not None
+    replacement, nudge = update["messages"]
+    assert isinstance(replacement, AIMessage)
+    assert replacement.id == "msg-1"  # same id -> add_messages overwrites in place
+    assert not replacement.invalid_tool_calls
+    assert nudge.content == _TRUNCATION_NUDGE
+
+
+def test_truncation_recovery_is_wired_into_the_resilience_stack() -> None:
+    middleware = build_model_resilience_middleware(lambda spec: spec or "m")
+    assert any(isinstance(m, TruncationRecoveryMiddleware) for m in middleware)

@@ -17,15 +17,20 @@ Configuration (env):
 """
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from typing import Any
 
 from langchain.agents.middleware import (
     AgentMiddleware,
+    AgentState,
     ModelFallbackMiddleware,
     ModelRetryMiddleware,
     ToolRetryMiddleware,
+    hook_config,
 )
 from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langgraph.runtime import Runtime
 
 from ghidra_deep_agent.defaults import env_int
 from ghidra_deep_agent.toasts import notify_toast
@@ -178,6 +183,93 @@ def _on_model_retries_exhausted(exc: BaseException) -> str:
     return f"Model call failed after retries: {exc}"
 
 
+def is_truncated_message(msg: BaseMessage) -> bool:
+    """Was this model response cut off at the output-token limit?
+
+    Anthropic-protocol providers set ``stop_reason: "max_tokens"``; OpenAI-shaped
+    ones (OpenRouter, DeepSeek) set ``finish_reason: "length"``. Both land in
+    ``response_metadata`` (langchain-anthropic sets it on streaming and
+    non-streaming paths alike).
+    """
+    if not isinstance(msg, AIMessage):
+        return False
+    meta = msg.response_metadata or {}
+    return meta.get("stop_reason") == "max_tokens" or meta.get("finish_reason") in (
+        "length",
+        "max_tokens",
+    )
+
+
+_TRUNCATION_NUDGE = (
+    "[automated] Your previous response was cut off by the output-token limit "
+    "before its tool calls could run. Nothing you announced was executed. "
+    "Continue where you left off: re-issue the tool calls you intended (keep "
+    "each payload concise; split large saves into several smaller ones), then "
+    "finish with your final report."
+)
+
+# Truncation-recovery attempts per turn. Two failed continuations mean the model
+# keeps overrunning the cap; further retries would loop, so fall through and let
+# the report/reply guards salvage what exists.
+_MAX_TRUNCATION_RECOVERIES = 2
+
+
+class TruncationRecoveryMiddleware(AgentMiddleware):
+    """Resume the loop when a response is truncated instead of ending the run.
+
+    A response cut off at ``max_tokens`` *before* a complete ``tool_use`` block
+    parses leaves an ``AIMessage`` with no ``tool_calls`` — the agent loop then
+    routes to END, silently dropping whatever the model was about to do (the
+    observed failure: "Now let me save the key findings…" and the save never
+    ran). This hook detects that dead end, appends a corrective ``HumanMessage``,
+    and jumps back to the model node. Bounded per turn by counting its own nudge
+    messages, so a model that keeps overrunning the cap cannot loop forever.
+    """
+
+    @hook_config(can_jump_to=["model"])
+    def after_model(
+        self, state: AgentState, runtime: Runtime[Any]
+    ) -> dict[str, Any] | None:
+        messages = state.get("messages") or []
+        if not messages:
+            return None
+        last = messages[-1]
+        if (
+            not isinstance(last, AIMessage)
+            or last.tool_calls
+            or not is_truncated_message(last)
+        ):
+            return None
+        if self._recoveries_this_turn(messages) >= _MAX_TRUNCATION_RECOVERIES:
+            return None
+
+        updates: list[BaseMessage] = []
+        if last.invalid_tool_calls:
+            # Resubmitting a half-parsed tool_use block can 400 on the provider;
+            # replace the message (same id -> add_messages overwrites) with a
+            # text-only copy before continuing.
+            updates.append(AIMessage(content=last.text or "", id=last.id))
+        updates.append(HumanMessage(content=_TRUNCATION_NUDGE))
+        return {"jump_to": "model", "messages": updates}
+
+    async def aafter_model(
+        self, state: AgentState, runtime: Runtime[Any]
+    ) -> dict[str, Any] | None:
+        return self.after_model(state, runtime)
+
+    @staticmethod
+    def _recoveries_this_turn(messages: Sequence[BaseMessage]) -> int:
+        """Count nudges since the last real (non-nudge) HumanMessage."""
+        count = 0
+        for msg in reversed(messages):
+            if isinstance(msg, HumanMessage):
+                if msg.content == _TRUNCATION_NUDGE:
+                    count += 1
+                else:
+                    break
+        return count
+
+
 def _fallback_specs() -> list[str]:
     raw = os.environ.get("MODEL_FALLBACK", "")
     return [spec.strip() for spec in raw.split(",") if spec.strip()]
@@ -209,6 +301,9 @@ def build_model_resilience_middleware(
             on_failure=_on_model_retries_exhausted,
         )
     )
+    # Response-level (not exception-level) recovery: a max_tokens-truncated
+    # response is a successful HTTP call the retry/fallback layers never see.
+    middleware.append(TruncationRecoveryMiddleware())
     return middleware
 
 

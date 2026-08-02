@@ -87,6 +87,15 @@ def extract_subagent_report(output: object) -> str:
     return _flatten_content(getattr(output, "content", output))
 
 
+def extract_stop_reason(output: object) -> str | None:
+    """The provider's stop/finish reason for a chat model output, if present."""
+    meta = getattr(output, "response_metadata", None)
+    if not isinstance(meta, dict):
+        return None
+    reason = meta.get("stop_reason") or meta.get("finish_reason")
+    return reason if isinstance(reason, str) else None
+
+
 class Usage(NamedTuple):
     input_tokens: int
     output_tokens: int

@@ -28,10 +28,10 @@ skipped with a startup warning rather than crashing.
 import os
 import sys
 import tomllib
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from deepagents import SubAgent
 from deepagents.middleware.subagents import DEFAULT_SUBAGENT_PROMPT
@@ -306,7 +306,17 @@ WITHHELD_TOOLS = frozenset(
 # The read-only research sub-agent's name, referenced by both graphs.
 RESEARCH_SUBAGENT_NAME = "research"
 
-ModelResolver = Callable[[str | None], str | BaseChatModel]
+
+class ModelResolver(Protocol):
+    """Resolve a model string (and optional output cap) to a model instance.
+
+    Also callable with just the string, so it satisfies resilience.py's
+    one-argument ``ModelResolver`` for fallback specs.
+    """
+
+    def __call__(
+        self, model: str | None, max_tokens: int | None = None
+    ) -> str | BaseChatModel: ...
 
 
 @dataclass(frozen=True)
@@ -322,6 +332,7 @@ class SubAgentConfig:
     model: str | None
     # A key of ``WRITE_POLICIES``; see that table for what each tier allows.
     write_policy: str
+    max_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -332,6 +343,8 @@ class AgentConfig:
     main_model: str | None
     default_model: str | None
     subagents: tuple[SubAgentConfig, ...]
+    main_max_tokens: int | None = None
+    default_max_tokens: int | None = None
 
 
 # --- TOML loading / validation -------------------------------------------------
@@ -355,6 +368,15 @@ def _opt_str(table: Mapping[str, Any], key: str, where: str) -> str | None:
         return None
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{where}: '{key}' must be a non-empty string if set")
+    return value
+
+
+def _opt_int(table: Mapping[str, Any], key: str, where: str) -> int | None:
+    value = table.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{where}: '{key}' must be a positive integer if set")
     return value
 
 
@@ -438,6 +460,7 @@ def _parse_subagent(raw: Any, path: Path) -> SubAgentConfig:
         exclude=_opt_str_list(raw, "exclude", where),
         model=_opt_str(raw, "model", where),
         write_policy=_parse_write_policy(raw, where),
+        max_tokens=_opt_int(raw, "max_tokens", where),
     )
 
 
@@ -461,12 +484,14 @@ def load_agent_config(path: Path | None = None) -> AgentConfig:
         raise ValueError(f"Agent config {path} is not valid TOML: {exc}") from exc
 
     default_model = _opt_str(raw, "default", str(path))
+    default_max_tokens = _opt_int(raw, "max_tokens", str(path))
 
     main_raw = raw.get("main", {})
     if not isinstance(main_raw, dict):
         raise ValueError(f"{path}: [main] must be a table")
     main_tools = _str_list(main_raw, "tools", f"{path} [main]")
     main_model = _opt_str(main_raw, "model", f"{path} [main]")
+    main_max_tokens = _opt_int(main_raw, "max_tokens", f"{path} [main]")
 
     subs_raw = raw.get("subagents", [])
     if not isinstance(subs_raw, list) or not subs_raw:
@@ -478,6 +503,8 @@ def load_agent_config(path: Path | None = None) -> AgentConfig:
         main_model=main_model,
         default_model=default_model,
         subagents=subagents,
+        main_max_tokens=main_max_tokens,
+        default_max_tokens=default_max_tokens,
     )
 
 
@@ -494,15 +521,31 @@ def resolve_model_spec(model: str | None, config: AgentConfig) -> str:
     return _model_spec(model, config.default_model)
 
 
-def make_model_resolver(default_model: str | None) -> ModelResolver:
-    """Return a cached resolver building each distinct model string once."""
-    cache: dict[str, str | BaseChatModel] = {}
+def make_model_resolver(
+    default_model: str | None, default_max_tokens: int | None = None
+) -> ModelResolver:
+    """Return a cached resolver building each distinct model string once.
 
-    def resolve(model: str | None) -> str | BaseChatModel:
+    ``max_tokens`` resolves like the model string: per-call value (a config
+    entry's ``max_tokens``) -> TOML top-level ``max_tokens`` -> ``MODEL_MAX_TOKENS``
+    env -> unset (provider default; unprofiled Anthropic-protocol models still
+    get a floor in ``build_model``).
+    """
+    cache: dict[tuple[str, int | None], str | BaseChatModel] = {}
+
+    def resolve(
+        model: str | None, max_tokens: int | None = None
+    ) -> str | BaseChatModel:
         spec = _model_spec(model, default_model)
-        if spec not in cache:
-            cache[spec] = build_model(spec)
-        return cache[spec]
+        if max_tokens is None:
+            max_tokens = default_max_tokens
+        if max_tokens is None:
+            env_raw = os.environ.get("MODEL_MAX_TOKENS")
+            max_tokens = int(env_raw) if env_raw and env_raw.isdigit() else None
+        key = (spec, max_tokens)
+        if key not in cache:
+            cache[key] = build_model(spec, max_tokens)
+        return cache[key]
 
     return resolve
 
@@ -613,7 +656,7 @@ def build_subagents(
             policy.blocked_actions or None,
             rename_prefix=policy.rename_prefix,
         )
-        model = resolve_model(sub.model)
+        model = resolve_model(sub.model, sub.max_tokens)
         spec: SubAgent = {
             "name": sub.name,
             "description": sub.description + policy.description_suffix,

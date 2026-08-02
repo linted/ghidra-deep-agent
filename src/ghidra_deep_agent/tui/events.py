@@ -9,6 +9,7 @@ from ghidra_deep_agent.async_tasks import ASYNC_DONE_EVENT, async_task_id
 from ghidra_deep_agent.tui.formatting import (
     extract_output_snippet,
     extract_preview,
+    extract_stop_reason,
     extract_subagent_report,
     extract_text,
     extract_usage,
@@ -162,6 +163,18 @@ def handle_event(
         else:
             activity.post_message(LLMDone(run_id))
         output = event.get("data", {}).get("output")
+        # Truncation is otherwise invisible (an HTTP-success response that just
+        # stops): surface it so a run that dead-ends on a cut-off tool call is
+        # explainable from the status bar.
+        if not is_compaction and extract_stop_reason(output) in (
+            "max_tokens",
+            "length",
+        ):
+            app.post_message(
+                StatusFlash(
+                    "[red]⚠ Model response truncated at the output-token limit[/red]"
+                )
+            )
         usage = extract_usage(output)
         if usage.input_tokens or usage.output_tokens:
             app.post_message(TokenUpdate(usage.input_tokens, usage.output_tokens))
