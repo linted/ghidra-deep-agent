@@ -164,6 +164,33 @@ def _anthropic_has_profile(model_name: str) -> bool:
     return bool(profile.get("max_output_tokens"))
 
 
+# z.ai's OpenAI-compatible endpoint — the path their LangChain guide documents
+# (docs.z.ai/guides/develop/langchain/introduction). There is no dedicated
+# LangChain z.ai integration; ``zai:<model>`` builds ChatOpenAI against this
+# URL (override via ZAI_API_URL) with the ZAI_API_KEY credential.
+_ZAI_DEFAULT_API_URL = "https://api.z.ai/api/paas/v4/"
+
+
+def _build_zai_model(model_name: str, max_tokens: int | None) -> BaseChatModel:
+    api_key = os.environ.get("ZAI_API_KEY")
+    if not api_key:
+        raise ValueError(
+            f"zai:{model_name} requires the ZAI_API_KEY environment variable "
+            "(the same z.ai key used for the Anthropic-compatible endpoint)."
+        )
+    from langchain_openai import ChatOpenAI
+
+    kwargs: dict[str, Any] = {}
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    return ChatOpenAI(
+        model=model_name,
+        base_url=os.environ.get("ZAI_API_URL", _ZAI_DEFAULT_API_URL),
+        api_key=api_key,  # type: ignore[arg-type]  # str coerces to SecretStr
+        **kwargs,
+    )
+
+
 def build_model(
     model_string: str, max_tokens: int | None = None
 ) -> BaseChatModel | str:
@@ -173,13 +200,17 @@ def build_model(
     correctly round-tripped. For ``openrouter:<model>`` models that have a
     provider-routing preset (see ``openrouter.toml``), we construct
     ``ChatOpenRouter`` directly with that routing; otherwise the string is
-    returned as-is for init_chat_model to resolve.
+    returned as-is for init_chat_model to resolve. ``zai:<model>`` targets
+    z.ai's OpenAI-compatible endpoint via ChatOpenAI (their documented
+    LangChain path; no dedicated integration exists).
 
     ``max_tokens`` (from ``max_tokens`` in subagents.toml) caps output tokens.
     Anthropic-protocol models that langchain-anthropic has no profile for get
     ``_UNPROFILED_ANTHROPIC_MAX_TOKENS`` even without an explicit setting —
     the library's 4096 fallback truncates real runs.
     """
+    if model_string.startswith("zai:"):
+        return _build_zai_model(model_string.split(":", 1)[1], max_tokens)
     if model_string.startswith("deepseek:"):
         model_name = model_string.split(":", 1)[1]
         if max_tokens is not None:
@@ -216,7 +247,7 @@ def build_model(
         # num_predict, etc.), so don't guess — say it's ignored.
         print(
             f"Warning: max_tokens is not supported for {model_string!r}; "
-            "ignoring (supported: anthropic, deepseek, openrouter).",
+            "ignoring (supported: anthropic, deepseek, openrouter, zai).",
             file=sys.stderr,
         )
     return model_string

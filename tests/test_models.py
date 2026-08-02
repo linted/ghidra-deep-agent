@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import pytest
 from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
 
 from ghidra_deep_agent.models import (
     _UNPROFILED_ANTHROPIC_MAX_TOKENS,
@@ -28,6 +29,8 @@ def _api_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("ZAI_API_KEY", "test-key")
+    monkeypatch.delenv("ZAI_API_URL", raising=False)
 
 
 def test_unprofiled_anthropic_model_gets_the_floor_cap() -> None:
@@ -67,3 +70,36 @@ def test_unsupported_provider_warns_and_ignores(
 ) -> None:
     assert build_model("ollama:llama3", max_tokens=1000) == "ollama:llama3"
     assert "max_tokens is not supported" in capsys.readouterr().err
+
+
+# --- zai: provider (z.ai OpenAI-compatible endpoint) ----------------------------
+
+
+def test_zai_builds_chatopenai_against_the_documented_endpoint() -> None:
+    model = build_model("zai:glm-5.2")
+    assert isinstance(model, ChatOpenAI)
+    assert model.model_name == "glm-5.2"
+    assert "api.z.ai/api/paas/v4" in str(model.openai_api_base)
+    # No silent cap on this path: unset means the server default applies.
+    assert model.max_tokens is None
+
+
+def test_zai_threads_max_tokens_through() -> None:
+    model = build_model("zai:glm-5.2", max_tokens=32_768)
+    assert isinstance(model, ChatOpenAI)
+    assert model.max_tokens == 32_768
+
+
+def test_zai_base_url_is_overridable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZAI_API_URL", "https://example.test/v4/")
+    model = build_model("zai:glm-5.2")
+    assert isinstance(model, ChatOpenAI)
+    assert str(model.openai_api_base) == "https://example.test/v4/"
+
+
+def test_zai_without_key_fails_with_a_clear_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ZAI_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="ZAI_API_KEY"):
+        build_model("zai:glm-5.2")

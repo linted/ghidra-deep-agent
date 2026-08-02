@@ -13,6 +13,8 @@
 
 # Optional fallback model for any agent without its own `model`.
 default = "deepseek:deepseek-v4-pro"
+# z.ai GLM direct (OpenAI-compatible endpoint; needs ZAI_API_KEY):
+# default = "zai:glm-5.2"
 
 # Optional output-token cap, resolved like `model`: per-entry `max_tokens` ->
 # this top-level value -> MODEL_MAX_TOKENS env -> provider default. Set it when
