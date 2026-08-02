@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
 from rich.rule import Rule
 from textual import work
 from textual.app import App, ComposeResult
@@ -39,6 +40,7 @@ from ghidra_deep_agent.tui.help_screen import HelpScreen
 from ghidra_deep_agent.tui.messages import (
     AgentDone,
     ContextUpdate,
+    ResponseFinal,
     StatusFlash,
     SubagentReport,
     SubagentReportCaptured,
@@ -773,6 +775,28 @@ class GhidraAgentApp(App[None]):
             time.monotonic() - self._run_start
         )
 
+    async def _surface_salvaged_reply(
+        self, agent: Any, config: dict[str, Any], response: ResponseLog
+    ) -> None:
+        """Render a reply appended after the model loop ended.
+
+        ``MainReplyGuardMiddleware`` appends its salvaged reply from a graph
+        node, not a model call, so events.py's ``on_chat_model_end`` capture
+        never sees it — read the final state instead. On a normal turn the last
+        message's text equals the captured reply and this is a no-op.
+        """
+        try:
+            state = await agent.aget_state(config)
+        except Exception:
+            return  # display-only nicety; never fail the turn over it
+        for msg in reversed(state.values.get("messages") or []):
+            text = extract_text(msg) if isinstance(msg, AIMessage) else ""
+            if text:
+                if text != self.run_state.last_reply_text:
+                    self.run_state.last_reply_text = text
+                    response.post_message(ResponseFinal(text))
+                return
+
     @work(exclusive=True)
     async def _run_agent(self, query: str | None) -> None:
         # Pick the graph AND its thread config together, captured for the lifetime
@@ -814,11 +838,13 @@ class GhidraAgentApp(App[None]):
         # Reset before streaming so a turn that produces no top-level reply can't
         # reuse a stale capture (see events.py for where this gets set).
         self.run_state.last_reply_text = ""
+        errored = False
         try:
             async for event in agent.astream_events(
                 input_data, config=config, version="v2"
             ):
                 handle_event(self, event, activity, response, thinking)
+            await self._surface_salvaged_reply(agent, config, response)
             if side is not None and side.is_plan and side.plan_path:
                 # The streamed reply is the source of truth for the plan; the
                 # disk/state read is only a fallback. Snapshot it for `/approve`.
@@ -829,6 +855,7 @@ class GhidraAgentApp(App[None]):
                 if plan_text:
                     response.log_plan(plan_text)
         except UsageLimitError:
+            errored = True  # pause banner below; no no-reply placeholder on top
             # Not a crash: the provider usage/rate limit outlasted our retries.
             # Everything committed so far (history + finished sub-agents) is
             # durable in the checkpointer, so tell the user how to resume rather
@@ -859,6 +886,7 @@ class GhidraAgentApp(App[None]):
                 )
             response.write(Rule(style="yellow"))
         except Exception as exc:
+            errored = True
             response.write(Rule(style="red"))
             response.write(f"[bold red]✗ Error: {exc}[/bold red]")
             response.write(Rule(style="red"))
@@ -866,6 +894,6 @@ class GhidraAgentApp(App[None]):
             # Runs on cancellation too (CancelledError is a BaseException and
             # is not swallowed above), so the UI always returns to idle.
             thinking.display = False
-            response.post_message(AgentDone())
+            response.post_message(AgentDone(errored))
             self._set_busy(False)
             self.query_one("#query", Input).focus()

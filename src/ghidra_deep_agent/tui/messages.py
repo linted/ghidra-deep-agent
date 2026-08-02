@@ -79,7 +79,13 @@ class ResponseFinal(Message):
 
 
 class AgentDone(Message):
-    pass
+    """The turn's stream loop ended; ``errored`` when it died on an exception
+    (the response pane then skips its no-reply placeholder — an error box is
+    already showing)."""
+
+    def __init__(self, errored: bool = False) -> None:
+        super().__init__()
+        self.errored = errored
 
 
 class StatusFlash(Message):

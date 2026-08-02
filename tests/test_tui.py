@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from langchain_core.messages import AIMessage
 from textual.widgets import Label
 
 from ghidra_deep_agent.compaction import ManualCompactionResult
@@ -17,7 +18,7 @@ from ghidra_deep_agent.tui.commands import COMMANDS, help_lines
 from ghidra_deep_agent.tui.events import handle_event, parse_checkpoint_ns
 from ghidra_deep_agent.tui.formatting import truncate_line
 from ghidra_deep_agent.tui.help_screen import HelpScreen
-from ghidra_deep_agent.tui.messages import SubagentReport
+from ghidra_deep_agent.tui.messages import AgentDone, SubagentReport
 from ghidra_deep_agent.tui.report_screen import SubagentReportScreen
 from ghidra_deep_agent.tui.side_mode import SideMode
 from ghidra_deep_agent.tui.widgets import (
@@ -1034,5 +1035,45 @@ def test_usage_limit_banner_in_plan_mode_omits_relaunch() -> None:
             joined = "\n".join(writes)
             assert "plan-mode" in joined
             assert "--session-id" not in joined
+
+    asyncio.run(run())
+
+
+def test_empty_turn_renders_placeholder_not_nothing() -> None:
+    """A turn that ends with no reply must say so, not leave a blank pane."""
+
+    async def run() -> None:
+        app = _make_app()
+        async with app.run_test():
+            log = app.query_one(ResponseLog)
+            before = len(log.lines)
+            log.on_agent_done(AgentDone())
+            assert len(log.lines) > before  # placeholder rendered
+
+            before = len(log.lines)
+            log.on_agent_done(AgentDone(errored=True))
+            assert len(log.lines) == before  # the error box already told the story
+
+    asyncio.run(run())
+
+
+def test_guard_appended_reply_is_surfaced_after_stream() -> None:
+    """MainReplyGuardMiddleware appends its reply from a graph node, invisible
+    to on_chat_model_end capture — the app must read it back from final state."""
+
+    salvaged = "[Reply recovered: the agent ended its turn without a final reply]"
+
+    class _GuardStub(StubAgent):
+        async def aget_state(self, _config: Any) -> Any:
+            return SimpleNamespace(values={"messages": [AIMessage(salvaged)]})
+
+    async def run() -> None:
+        app = _make_app(agent=_GuardStub())
+        async with app.run_test() as pilot:
+            app.query_one(CommandInput).value = "answer the questions"
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            log = app.query_one(ResponseLog)
+            assert salvaged in log.transcript
 
     asyncio.run(run())

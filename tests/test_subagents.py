@@ -21,7 +21,10 @@ from deepagents.backends import StateBackend
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.tools import BaseTool
 
-from ghidra_deep_agent.report_guard import SubagentReportGuardMiddleware
+from ghidra_deep_agent.report_guard import (
+    REPORT_SENTINEL,
+    SubagentReportGuardMiddleware,
+)
 from ghidra_deep_agent.subagents import (
     _REPORT_PROTOCOL,
     ALL_WRITE_ACTIONS,
@@ -219,8 +222,10 @@ def test_report_protocol_and_guard_apply_to_every_tier(tmp_path: Path) -> None:
         + _entry("annotations", policy_line='write_policy = "annotations"\n')
         + _entry("none", policy_line="read_only = true\n")
     )
+    # Prompt and guard share the sentinel constant so they cannot drift.
+    assert REPORT_SENTINEL in _REPORT_PROTOCOL
     for spec in _build(tmp_path, body).values():
-        assert "## Final report" in spec["system_prompt"]
+        assert REPORT_SENTINEL in spec["system_prompt"]
         # The protocol comes after the tier's scope section, closing the prompt.
         assert spec["system_prompt"].rstrip().endswith(_REPORT_PROTOCOL)
         guards = [

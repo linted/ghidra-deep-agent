@@ -49,6 +49,7 @@ from ghidra_deep_agent.prompt import (
     format_sandbox_guidance,
 )
 from ghidra_deep_agent.prototype_tools import build_prototype_tools
+from ghidra_deep_agent.report_guard import MainReplyGuardMiddleware
 from ghidra_deep_agent.resilience import (
     build_model_resilience_middleware,
     build_tool_retry_middleware,
@@ -372,6 +373,11 @@ def _build_shared_middleware(
         build_tuned_summarization_middleware(
             built_model, storage.backend, summary_model=summary_override, scope="main"
         ),
+        # Reply backstop: when a turn ends on a tool call / truncated preamble
+        # instead of a user-facing reply, append a salvaged one (the TUI renders
+        # only the turn's final message). Runs after the loop; independent of
+        # the sandbox sync's after_agent (different state keys).
+        MainReplyGuardMiddleware(),
     ]
 
 
