@@ -42,7 +42,10 @@ from langchain_core.tools import BaseTool
 from ghidra_deep_agent.compaction import build_tuned_summarization_middleware
 from ghidra_deep_agent.defaults import config_path
 from ghidra_deep_agent.models import build_model
-from ghidra_deep_agent.report_guard import SubagentReportGuardMiddleware
+from ghidra_deep_agent.report_guard import (
+    REPORT_SENTINEL,
+    SubagentReportGuardMiddleware,
+)
 from ghidra_deep_agent.resilience import (
     build_model_resilience_middleware,
     build_tool_retry_middleware,
@@ -188,14 +191,17 @@ Never retry the blocked call.
 # also end runs on writes). deepagents forwards only the text of the final
 # non-empty AIMessage to the coordinator, so a run that ends on a tool call
 # reports nothing but that call's preamble; SubagentReportGuardMiddleware
-# backstops the runs where the model ignores this instruction anyway.
-_REPORT_PROTOCOL = """
+# backstops the runs where the model ignores this instruction anyway, using
+# the `REPORT_SENTINEL` line required below as its validity check.
+_REPORT_PROTOCOL = f"""
 ## Final report
 The coordinator receives ONLY the text of your final message. Your tool calls
 (knowledge-base writes, bookmarks, renames, comments) persist state but are
-INVISIBLE to it. After your last tool call, ALWAYS end the turn with your
+INVISIBLE to it. After your last tool call, ALWAYS end the turn with one final
+message that starts with the exact line `{REPORT_SENTINEL}`, followed by your
 complete plain-text findings summary (including the `PENDING:` list where
-applicable). Never end the turn on a tool call or with an empty message.
+applicable). Never end the turn on a tool call, with an announcement of what
+you will do next, or with an empty message.
 """.strip()
 
 _READ_ONLY_SECTION = """
