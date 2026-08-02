@@ -446,7 +446,9 @@ async def main() -> None:
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
-    resolve_model = make_model_resolver(agent_config.default_model)
+    resolve_model = make_model_resolver(
+        agent_config.default_model, agent_config.default_max_tokens
+    )
 
     agents_md = _load_agents_md()
     tools = await _connect_mcp(mcp_config)
@@ -471,7 +473,7 @@ async def main() -> None:
     all_tools, knowledge_ok = _build_tools(
         tools, mongodb_uri, mongodb_db, storage_cfg.embed_model, binary_name
     )
-    built_model = resolve_model(agent_config.main_model)
+    built_model = resolve_model(agent_config.main_model, agent_config.main_max_tokens)
     main_model_spec = resolve_model_spec(agent_config.main_model, agent_config)
     main_tools = build_main_tools(all_tools, agent_config)
     # Shared across the coordinator and sub-agents: one cache for the whole

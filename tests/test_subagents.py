@@ -10,7 +10,7 @@ Run:  uv run pytest tests/test_subagents.py -v
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -30,6 +30,7 @@ from ghidra_deep_agent.subagents import (
     READ_ONLY_WRITE_POLICY,
     build_subagents,
     load_agent_config,
+    make_model_resolver,
 )
 from ghidra_deep_agent.validation import ArgumentValidationMiddleware
 
@@ -50,7 +51,7 @@ def _fake_tools() -> Sequence[BaseTool]:
     return cast("Sequence[BaseTool]", tools)
 
 
-def _resolver(spec: str | None) -> FakeListChatModel:
+def _resolver(model: str | None, max_tokens: int | None = None) -> FakeListChatModel:
     """Stub model resolver returning a real chat model instance.
 
     ``build_subagents`` stores the result in the spec and hands it to the tuned
@@ -300,3 +301,74 @@ def test_read_only_rejects_non_bool(tmp_path: Path) -> None:
         load_agent_config(
             _write_config(tmp_path, _entry("a", policy_line='read_only = "yes"\n'))
         )
+
+
+# --- max_tokens configuration ---------------------------------------------------
+
+
+def test_max_tokens_parses_at_every_level(tmp_path: Path) -> None:
+    path = tmp_path / "subagents.toml"
+    path.write_text(
+        "max_tokens = 32768\n"
+        '[main]\ntools = ["get_code"]\nmax_tokens = 20000\n\n'
+        + _entry("a")
+        + "max_tokens = 10000\n"
+        + _entry("b"),
+        encoding="utf-8",
+    )
+    config = load_agent_config(path)
+    assert config.default_max_tokens == 32768
+    assert config.main_max_tokens == 20000
+    by_name = {sub.name: sub for sub in config.subagents}
+    assert by_name["a"].max_tokens == 10000
+    assert by_name["b"].max_tokens is None
+
+
+def test_max_tokens_must_be_a_positive_integer(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="max_tokens"):
+        load_agent_config(_write_config(tmp_path, _entry("a") + "max_tokens = 0\n"))
+
+
+def _recording_build_model(
+    calls: list[tuple[str, int | None]],
+) -> Callable[[str, int | None], str]:
+    def fake_build_model(spec: str, max_tokens: int | None = None) -> str:
+        calls.append((spec, max_tokens))
+        return spec
+
+    return fake_build_model
+
+
+def test_resolver_threads_max_tokens_to_build_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, int | None]] = []
+    monkeypatch.setattr(
+        "ghidra_deep_agent.subagents.build_model", _recording_build_model(calls)
+    )
+    monkeypatch.delenv("MODEL_MAX_TOKENS", raising=False)
+    resolve = make_model_resolver("anthropic:glm-5.2", 32768)
+
+    resolve(None)  # falls back to the config default
+    resolve("deepseek:deepseek-v4-pro", 10000)  # per-entry override wins
+    resolve(None)  # cached: no new build_model call
+
+    assert calls == [
+        ("anthropic:glm-5.2", 32768),
+        ("deepseek:deepseek-v4-pro", 10000),
+    ]
+
+
+def test_resolver_falls_back_to_env_max_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, int | None]] = []
+    monkeypatch.setattr(
+        "ghidra_deep_agent.subagents.build_model", _recording_build_model(calls)
+    )
+    monkeypatch.setenv("MODEL_MAX_TOKENS", "12345")
+    resolve = make_model_resolver("anthropic:glm-5.2")
+
+    resolve(None)
+
+    assert calls == [("anthropic:glm-5.2", 12345)]

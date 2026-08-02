@@ -14,6 +14,16 @@
 # Optional fallback model for any agent without its own `model`.
 default = "deepseek:deepseek-v4-pro"
 
+# Optional output-token cap, resolved like `model`: per-entry `max_tokens` ->
+# this top-level value -> MODEL_MAX_TOKENS env -> provider default. Set it when
+# routing an Anthropic-protocol endpoint at a non-Claude model (e.g.
+# `anthropic:glm-5.2` on z.ai): langchain-anthropic has no profile for those and
+# silently falls back to max_tokens=4096, which truncates long responses
+# mid-tool_use and ends runs on a bare preamble. Unprofiled anthropic:* models
+# get a 32768 floor even without this key; set it to match your endpoint's
+# documented cap.
+# max_tokens = 32768
+
 [main]
 # The coordinator: orchestrates sub-agents, navigates/searches, and uses the
 # knowledge base. It does NOT decompile, disassemble, xref, or mutate Ghidra —

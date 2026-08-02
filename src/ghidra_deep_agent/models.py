@@ -140,7 +140,33 @@ def _load_openrouter_presets() -> dict[str, dict[str, Any]]:
     return presets
 
 
-def build_model(model_string: str) -> BaseChatModel | str:
+# Output-token budget for Anthropic-protocol models langchain-anthropic has no
+# profile for (third-party endpoints like z.ai's glm models). Without this,
+# ChatAnthropic falls back to max_tokens=4096 (_FALLBACK_MAX_OUTPUT_TOKENS),
+# which truncates long tool_use payloads mid-call and silently ends agent runs
+# on a bare preamble. Overridable per model via `max_tokens` in subagents.toml.
+_UNPROFILED_ANTHROPIC_MAX_TOKENS = 32768
+
+
+def _anthropic_has_profile(model_name: str) -> bool:
+    """Whether langchain-anthropic knows this model's real output cap.
+
+    Uses a private helper; if a future langchain-anthropic removes it, assume a
+    profile exists (explicit TOML ``max_tokens`` still applies either way).
+    """
+    try:
+        from langchain_anthropic.chat_models import _get_default_model_profile
+    except ImportError:
+        return True
+    # Unknown models yield an empty profile; a known model without the cap key
+    # would hit the same 4096 fallback, so require the key itself.
+    profile = _get_default_model_profile(model_name) or {}
+    return bool(profile.get("max_output_tokens"))
+
+
+def build_model(
+    model_string: str, max_tokens: int | None = None
+) -> BaseChatModel | str:
     """Return a configured chat model for the given provider:model string.
 
     For DeepSeek models we return _ChatDeepSeekFixed so reasoning_content is
@@ -148,17 +174,51 @@ def build_model(model_string: str) -> BaseChatModel | str:
     provider-routing preset (see ``openrouter.toml``), we construct
     ``ChatOpenRouter`` directly with that routing; otherwise the string is
     returned as-is for init_chat_model to resolve.
+
+    ``max_tokens`` (from ``max_tokens`` in subagents.toml) caps output tokens.
+    Anthropic-protocol models that langchain-anthropic has no profile for get
+    ``_UNPROFILED_ANTHROPIC_MAX_TOKENS`` even without an explicit setting —
+    the library's 4096 fallback truncates real runs.
     """
     if model_string.startswith("deepseek:"):
         model_name = model_string.split(":", 1)[1]
+        if max_tokens is not None:
+            return _ChatDeepSeekFixed(model=model_name, max_tokens=max_tokens)
         return _ChatDeepSeekFixed(model=model_name)
     if model_string.startswith("openrouter:"):
         model_id = model_string.split(":", 1)[1]
         prefs = _load_openrouter_presets().get(model_id)
-        if prefs:
+        if prefs or max_tokens is not None:
             from langchain_openrouter import ChatOpenRouter
 
-            return ChatOpenRouter(model=model_id, openrouter_provider=prefs)
+            kwargs: dict[str, Any] = {}
+            if prefs:
+                kwargs["openrouter_provider"] = prefs
+            if max_tokens is not None:
+                kwargs["max_tokens"] = max_tokens
+            return ChatOpenRouter(model=model_id, **kwargs)
+        return model_string
+    if model_string.startswith("anthropic:"):
+        model_name = model_string.split(":", 1)[1]
+        if max_tokens is None and not _anthropic_has_profile(model_name):
+            max_tokens = _UNPROFILED_ANTHROPIC_MAX_TOKENS
+        if max_tokens is not None:
+            from langchain_anthropic import ChatAnthropic
+
+            # The documented runtime names; mypy's pydantic plugin only sees
+            # the field aliases.
+            return ChatAnthropic(  # type: ignore[call-arg]
+                model=model_name, max_tokens=max_tokens
+            )
+        return model_string
+    if max_tokens is not None:
+        # Not every provider accepts a `max_tokens` kwarg (Ollama wants
+        # num_predict, etc.), so don't guess — say it's ignored.
+        print(
+            f"Warning: max_tokens is not supported for {model_string!r}; "
+            "ignoring (supported: anthropic, deepseek, openrouter).",
+            file=sys.stderr,
+        )
     return model_string
 
 
