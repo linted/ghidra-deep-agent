@@ -20,7 +20,7 @@ The knowledge base is scoped per binary — each program analyzed gets its own i
 
 ## Requirements
 
-- Python 3.12+
+- Python 3.13+
 - [uv](https://docs.astral.sh/uv/)
 - Ghidra 11.4+ (tested with 12.1) with the [GhidrAssistMCP](https://github.com/symgraph/GhidrAssistMCP) extension installed and its MCP server enabled (HTTP or SSE)
 - MongoDB instance (local or remote)
@@ -308,6 +308,6 @@ which covers the tests that need live tooling:
 uv run pytest -m integration
 ```
 
-CI (`.github/workflows/ci.yml`) runs the same three scripts across Python 3.12
+CI (`.github/workflows/ci.yml`) runs the same three scripts across Python 3.13
 (the floor declared in `pyproject.toml`) and 3.14 (what `.python-version` pins
 locally), so the floor can't silently rot.

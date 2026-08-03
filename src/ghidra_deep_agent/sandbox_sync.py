@@ -9,9 +9,10 @@ LangChain deep-agents "SandboxSyncMiddleware" guidance.
 
 Change detection uses an in-memory sha256 manifest keyed by path relative to
 ``AGENT_OUTPUT_DIR``: only new or changed files are transferred in either
-direction. Files deleted inside the sandbox are left in place locally. Any sync
-failure is surfaced as a warning toast and swallowed — a sandbox hiccup must
-never kill the turn.
+direction. Directory symlinks inside ``AGENT_OUTPUT_DIR`` are followed on seed,
+so an external directory can be symlinked into the sync root. Files deleted
+inside the sandbox are left in place locally. Any sync failure is surfaced as a
+warning toast and swallowed — a sandbox hiccup must never kill the turn.
 """
 
 from __future__ import annotations
@@ -174,7 +175,10 @@ class SandboxSyncMiddleware(AgentMiddleware):
         uploads: list[tuple[str, bytes]] = []
         pending: dict[str, tuple[str, str]] = {}  # remote path -> (rel, digest)
         oversize: list[str] = []
-        for path in sorted(self._local_dir.rglob("*")):
+        # recurse_symlinks: descend into symlinked directories so an external
+        # directory symlinked into the sync root is seeded like a real one. A
+        # symlink cycle would hang the walk; the sync root is user-controlled.
+        for path in sorted(self._local_dir.rglob("*", recurse_symlinks=True)):
             if not path.is_file():
                 continue
             rel = path.relative_to(self._local_dir).as_posix()
