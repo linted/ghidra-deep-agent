@@ -259,6 +259,49 @@ def test_remote_change_downloads_back(tmp_path: Path) -> None:
     assert (tmp_path / "a.txt").read_bytes() == b"local-only-change-not-synced-back"
 
 
+def test_seed_follows_directory_symlink(tmp_path: Path) -> None:
+    """A directory symlinked into the sync root is seeded like a real one."""
+    local = tmp_path / "local"
+    local.mkdir()
+    target = tmp_path / "elsewhere"
+    (target / "sub").mkdir(parents=True)
+    (target / "notes.md").write_bytes(b"question one")
+    (target / "sub" / "deep.md").write_bytes(b"question two")
+    (local / "questions").symlink_to(target)
+    backend = FakeSandboxBackend()
+    mw = _mw(backend, local)
+
+    asyncio.run(mw._seed())
+    assert {p for p, _ in backend.upload_calls[0]} == {
+        "/workspace/questions/notes.md",
+        "/workspace/questions/sub/deep.md",
+    }
+
+    # An edit in the *target* directory is still detected through the link.
+    (target / "notes.md").write_bytes(b"question one, revised")
+    asyncio.run(mw._seed())
+    assert backend.upload_calls[-1] == [
+        ("/workspace/questions/notes.md", b"question one, revised")
+    ]
+
+
+def test_sync_back_writes_through_directory_symlink(tmp_path: Path) -> None:
+    """A file downloaded under a symlinked dir lands in the link's target."""
+    local = tmp_path / "local"
+    local.mkdir()
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    (local / "questions").symlink_to(target)
+    backend = FakeSandboxBackend()
+    mw = _mw(backend, local)
+
+    backend.fs["/workspace/questions/answer.md"] = b"# solved"
+    asyncio.run(mw._sync_back())
+
+    assert (target / "answer.md").read_bytes() == b"# solved"
+    assert (local / "questions" / "answer.md").read_bytes() == b"# solved"
+
+
 def test_oversize_file_skipped_with_toast(tmp_path: Path) -> None:
     toasts: list[ToastRequest] = []
     register_toast_sink(toasts.append)

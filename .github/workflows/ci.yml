@@ -15,9 +15,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.12 is the floor declared in pyproject; 3.14 is what .python-version
+        # 3.13 is the floor declared in pyproject; 3.14 is what .python-version
         # pins locally. Both are exercised so the floor can't silently rot.
-        python-version: ["3.12", "3.14"]
+        python-version: ["3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v5

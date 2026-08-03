@@ -10,7 +10,7 @@ name = "ghidra-deep-agent"
 version = "0.1.0"
 description = "A reverse engineering deep agent with Ghidra integration via MCP"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 # Floors match the versions in uv.lock: `uv sync` resolves from the lock, but a
 # plain `pip install .` has only these to go on, and the LangChain 1.x stack
 # moves fast enough that an unconstrained resolve is not safe.
@@ -90,7 +90,7 @@ filterwarnings = [
 ]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.13"
 strict = true
 ignore_missing_imports = true
 exclude = ["agent_output"]
