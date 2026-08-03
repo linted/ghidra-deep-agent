@@ -19,7 +19,7 @@ import base64
 import os
 import shlex
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any, cast
 
@@ -28,6 +28,7 @@ from deepagents.backends.protocol import (
     FileUploadResponse,
     SandboxBackendProtocol,
 )
+from tenacity import RetryError, Retrying, stop_after_attempt, wait_exponential
 
 SANDBOX_ENV = "SANDBOX"
 OPENSHELL_MODE = "openshell"
@@ -48,6 +49,96 @@ class OpenShellSandboxError(RuntimeError):
 def sandbox_mode() -> str:
     """Return the configured sandbox backend name; ``""`` means disabled."""
     return os.environ.get(SANDBOX_ENV, "").strip().lower()
+
+
+# Substring fallback for exceptions that aren't live grpc.RpcError instances
+# (or when grpc itself isn't importable); matched against str(exc) lowercased.
+_CONNECTIVITY_MARKERS = ("unavailable", "connection reset", "failed to connect")
+
+
+def _is_connectivity_error(exc: BaseException) -> bool:
+    """True when the sandbox server was unreachable, i.e. worth retrying."""
+    try:
+        import grpc
+    except ImportError:
+        pass
+    else:
+        if isinstance(exc, grpc.RpcError):
+            code = getattr(exc, "code", None)
+            if callable(code):
+                try:
+                    return bool(code() is grpc.StatusCode.UNAVAILABLE)
+                except Exception:
+                    pass
+    text = str(exc).lower()
+    return any(marker in text for marker in _CONNECTIVITY_MARKERS)
+
+
+def _teardown_warning(exc: BaseException) -> str:
+    """One-line teardown warning; condenses gRPC errors' multi-line debug repr."""
+    detail = str(exc)
+    try:
+        import grpc
+    except ImportError:
+        pass
+    else:
+        if isinstance(exc, grpc.RpcError):
+            code = getattr(exc, "code", None)
+            details = getattr(exc, "details", None)
+            if callable(code) and callable(details):
+                try:
+                    detail = f"{code().name}: {' '.join(str(details()).split())}"
+                except Exception:
+                    pass
+    return f"Warning: OpenShell sandbox teardown failed: {detail}"
+
+
+def _retry_delete(
+    sandbox_name: str,
+    workspace: str,
+    *,
+    client_factory: Callable[[], Any] | None = None,
+) -> bool:
+    """Re-delete a sandbox after a connectivity failure; True on success.
+
+    The SDK's ``Sandbox.__exit__`` closes its channel and drops its session even
+    when the delete RPC fails, so a retry needs a fresh client built from the
+    on-disk gateway state. Attempts are bounded (this runs during shutdown and
+    must not hang while offline) and every failure is swallowed into ``False``
+    for the caller to report.
+    """
+    if client_factory is None:
+        try:
+            from openshell import SandboxClient
+        except ImportError:
+            return False
+
+        def client_factory() -> Any:
+            # Short per-call timeout so a dead network fails fast at shutdown.
+            return SandboxClient.from_active_cluster(timeout=5.0)
+
+    try:
+        for attempt in Retrying(
+            stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, max=4)
+        ):
+            with attempt:
+                client = client_factory()
+                try:
+                    client.delete(sandbox_name, workspace=workspace)
+                except Exception as exc:
+                    # Already gone (e.g. the failed first delete did land).
+                    code = getattr(exc, "code", None)
+                    try:
+                        status = code() if callable(code) else None
+                    except Exception:
+                        status = None
+                    if getattr(status, "name", None) != "NOT_FOUND":
+                        raise
+                finally:
+                    client.close()
+    except RetryError:
+        return False
+    return True
 
 
 @asynccontextmanager
@@ -155,6 +246,13 @@ async def open_sandbox_backend() -> AsyncIterator[SandboxBackendProtocol]:
         sandbox_id = "unknown"
     print(f"Sandbox: openshell [id={sandbox_id}]")
 
+    # The delete-by-name coordinate for the teardown retry; best-effort, since
+    # without it a failed teardown simply can't be retried.
+    try:
+        sandbox_name: str | None = sandbox_cm.sandbox.name
+    except Exception:
+        sandbox_name = None
+
     # Create the working/sync directory up front so the very first command and
     # the sync middleware's probe both find it.
     def _mkdir_workdir() -> Any:
@@ -180,7 +278,19 @@ async def open_sandbox_backend() -> AsyncIterator[SandboxBackendProtocol]:
         try:
             await asyncio.to_thread(sandbox_cm.__exit__, None, None, None)
         except Exception as exc:  # teardown must not mask a crash
-            print(
-                f"Warning: OpenShell sandbox teardown failed: {exc}",
-                file=sys.stderr,
-            )
+            if _is_connectivity_error(exc) and sandbox_name is not None:
+                print(
+                    "Sandbox server unreachable during teardown; retrying...",
+                    file=sys.stderr,
+                )
+                if await asyncio.to_thread(_retry_delete, sandbox_name, workspace):
+                    print("Sandbox deleted on retry.", file=sys.stderr)
+                else:
+                    print(
+                        f"Warning: sandbox server unreachable; could not delete "
+                        f"sandbox {sandbox_id} (it may be reclaimed by the "
+                        f"server later).",
+                        file=sys.stderr,
+                    )
+            else:
+                print(_teardown_warning(exc), file=sys.stderr)
