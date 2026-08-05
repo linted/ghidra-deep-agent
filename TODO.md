@@ -61,35 +61,17 @@ default-agent turn's input tokens 65%). Follow-ups it unlocks:
   `filesystem.py:1337`) via replace-by-name `middleware=`; no fork or internal
   patching. See the backlog entry above for the original evidence; wire it to an
   env knob like the `COMPACT_*` family if a lower threshold proves out.
-- [ ] **File the report-extraction bug upstream** — deepagents 0.7's
-  `_return_command_with_state_update` (`middleware/subagents.py:495-505`) picks
-  the sub-agent report as the last `AIMessage` with any non-empty text, without
-  checking `tool_calls` — so a run that ends on a tool call (plus Anthropic's
-  trailing empty `end_turn`) reports only the tool-call preamble ("Now let me
-  save the findings..."). Their own code comment shows partial awareness. We
-  backstop it locally with `report_guard.py` (`SubagentReportGuardMiddleware`,
-  2026-08-01). A second shape surfaced 2026-08-02: a preamble with *no* parsed
-  tool_calls at all (max_tokens truncation before the tool_use parsed /
-  `invalid_tool_calls` / plain end_turn announcement) — root-caused to
-  langchain-anthropic's 4096 max_tokens fallback for unprofiled models
-  (`models.py` now sets it explicitly; `TruncationRecoveryMiddleware` resumes
-  truncated turns). The guard now enforces a positive `## Final report`
-  sentinel contract, so an upstream fix that merely skips tool-call messages
-  in the walk would shrink but not remove it (truncation handling stays
-  local).
-- [ ] **Bail-out: revert the report/persistence chain if preamble-only reports
-  recur** — decided 2026-08-02: if sub-agent reports or coordinator replies
-  still come back as bare tool-call preambles after the truncation +
-  sentinel/reply-guard fixes, stop patching and revert the behavioral chain,
-  newest first (all single squash commits on `main`):
-  `git revert <report-reply-protocol PR>` (sentinel/reply guards + protocols),
-  `git revert 4b58f2d` (#57 report guard + `_REPORT_PROTOCOL`),
-  `git revert 1ab4930` (#56 provisional-findings persistence) — returning
-  sub-agents to handing findings back as prose. **Keep the max_tokens /
-  truncation-recovery PR either way**: a 4096-token output cap breaks the
-  prose approach too. Revert on a branch and run
-  `./scripts/lint.sh && ./scripts/typecheck.sh && ./scripts/test.sh`
-  (each revert removes its own tests).
+- [ ] **Upstream report-extraction quirk, guards reverted** — deepagents 0.7's
+  `_return_command_with_state_update` (`middleware/subagents.py:495-505`) still
+  picks the sub-agent report as the last non-empty `AIMessage` without checking
+  `tool_calls`, so a run ending on a tool call reports only its preamble. The
+  local guard layer for it (#57 report guard + #60 sentinel/reply protocols)
+  was reverted 2026-08-04: redundant once the real cause was fixed — the 4096
+  max_tokens fallback (#58, kept) — and the `zai:` provider (#59) left the
+  anthropic-compat path; the guards had started misfiring on good output. If
+  preamble-only reports ever recur, the remaining lever is reverting #56
+  (provisional-findings persistence); the full bail-out recipe is in git
+  history at c3dafd7's version of this file.
 - [ ] **Revisit the deferred prompt-trim sub-items** — the TodoListMiddleware
   injection is gone as of this upgrade, and built-in tool descriptions are now
   overridable directly (`FilesystemMiddleware(custom_tool_descriptions={...})`).

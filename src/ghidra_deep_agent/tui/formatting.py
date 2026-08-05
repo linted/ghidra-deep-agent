@@ -5,16 +5,6 @@ from __future__ import annotations
 from typing import NamedTuple
 
 
-def truncate_line(text: str, limit: int) -> str:
-    """First line of ``text``, capped at ``limit`` characters.
-
-    For one-line UI slots (list rows, status previews): a plain ``[:limit]``
-    slice keeps embedded newlines, which break the surrounding layout.
-    """
-    line = text.splitlines()[0] if text else ""
-    return line[:limit]
-
-
 def extract_preview(raw: object) -> str:
     if isinstance(raw, dict):
         text = (
@@ -22,7 +12,7 @@ def extract_preview(raw: object) -> str:
         )
     else:
         text = str(raw)
-    return truncate_line(text, 60)
+    return text[:60]
 
 
 def extract_text(chunk: object) -> str:
