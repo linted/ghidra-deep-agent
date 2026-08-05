@@ -49,12 +49,7 @@ class ResponseLog(RichLog):
         self.write(Rule(style="dim green"))
         self.write(Markdown(text))
 
-    def on_agent_done(self, msg: AgentDone) -> None:
+    def on_agent_done(self, _msg: AgentDone) -> None:
         if self._response_buf:
             self.log_assistant(self._response_buf)
             self._response_buf = ""
-        elif not msg.errored:
-            # A turn that produced no reply used to render nothing at all —
-            # indistinguishable from the app hanging. (Error turns already
-            # wrote their own box.)
-            self.write("[dim](the agent ended its turn without a reply)[/dim]")

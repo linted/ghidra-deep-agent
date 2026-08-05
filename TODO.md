@@ -68,28 +68,8 @@ default-agent turn's input tokens 65%). Follow-ups it unlocks:
   trailing empty `end_turn`) reports only the tool-call preamble ("Now let me
   save the findings..."). Their own code comment shows partial awareness. We
   backstop it locally with `report_guard.py` (`SubagentReportGuardMiddleware`,
-  2026-08-01). A second shape surfaced 2026-08-02: a preamble with *no* parsed
-  tool_calls at all (max_tokens truncation before the tool_use parsed /
-  `invalid_tool_calls` / plain end_turn announcement) — root-caused to
-  langchain-anthropic's 4096 max_tokens fallback for unprofiled models
-  (`models.py` now sets it explicitly; `TruncationRecoveryMiddleware` resumes
-  truncated turns). The guard now enforces a positive `## Final report`
-  sentinel contract, so an upstream fix that merely skips tool-call messages
-  in the walk would shrink but not remove it (truncation handling stays
-  local).
-- [ ] **Bail-out: revert the report/persistence chain if preamble-only reports
-  recur** — decided 2026-08-02: if sub-agent reports or coordinator replies
-  still come back as bare tool-call preambles after the truncation +
-  sentinel/reply-guard fixes, stop patching and revert the behavioral chain,
-  newest first (all single squash commits on `main`):
-  `git revert <report-reply-protocol PR>` (sentinel/reply guards + protocols),
-  `git revert 4b58f2d` (#57 report guard + `_REPORT_PROTOCOL`),
-  `git revert 1ab4930` (#56 provisional-findings persistence) — returning
-  sub-agents to handing findings back as prose. **Keep the max_tokens /
-  truncation-recovery PR either way**: a 4096-token output cap breaks the
-  prose approach too. Revert on a branch and run
-  `./scripts/lint.sh && ./scripts/typecheck.sh && ./scripts/test.sh`
-  (each revert removes its own tests).
+  2026-08-01) — the guard can shrink or go away once upstream skips tool-call
+  messages in the walk.
 - [ ] **Revisit the deferred prompt-trim sub-items** — the TodoListMiddleware
   injection is gone as of this upgrade, and built-in tool descriptions are now
   overridable directly (`FilesystemMiddleware(custom_tool_descriptions={...})`).
