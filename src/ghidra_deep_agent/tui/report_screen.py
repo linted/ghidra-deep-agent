@@ -14,7 +14,7 @@ from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Label, ListItem, ListView, RichLog, Static
 
-from ghidra_deep_agent.tui.formatting import fmt_duration, truncate_line
+from ghidra_deep_agent.tui.formatting import fmt_duration
 from ghidra_deep_agent.tui.messages import SubagentReport
 
 
@@ -55,7 +55,7 @@ class SubagentReportScreen(ModalScreen[None]):
             label = (
                 f"#{len(self._reports) - i}  {marker} "
                 f"[dim]{fmt_duration(report.elapsed)}[/dim]  "
-                f"{truncate_line(report.description, 60)}"
+                f"{report.description[:60]}"
             )
             rows.append(ListItem(Label(label, markup=True)))
         return rows
@@ -77,10 +77,7 @@ class SubagentReportScreen(ModalScreen[None]):
         if report.text:
             body.write(Markdown(report.text))
         else:
-            body.write(
-                "(sub-agent returned no report text — it ended on a tool call; "
-                "findings, if any, were persisted to the knowledge base)"
-            )
+            body.write("(empty report)")
         body.scroll_home(animate=False)
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:

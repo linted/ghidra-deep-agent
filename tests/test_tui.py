@@ -8,14 +8,12 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from textual.widgets import Label
 
 from ghidra_deep_agent.compaction import ManualCompactionResult
 from ghidra_deep_agent.resilience import UsageLimitError
 from ghidra_deep_agent.tui import GhidraAgentApp
 from ghidra_deep_agent.tui.commands import COMMANDS, help_lines
 from ghidra_deep_agent.tui.events import handle_event, parse_checkpoint_ns
-from ghidra_deep_agent.tui.formatting import truncate_line
 from ghidra_deep_agent.tui.help_screen import HelpScreen
 from ghidra_deep_agent.tui.messages import SubagentReport
 from ghidra_deep_agent.tui.report_screen import SubagentReportScreen
@@ -467,32 +465,6 @@ def test_report_screen_opens_and_closes() -> None:
             await pilot.press("escape")
             await pilot.pause()
             assert not isinstance(app.screen, SubagentReportScreen)
-
-    asyncio.run(run())
-
-
-def test_report_row_titles_stop_at_the_first_newline() -> None:
-    # A multiline task description must not break the one-line list rows.
-    assert truncate_line("analyze FUN_1400\nand also FUN_1500", 60) == (
-        "analyze FUN_1400"
-    )
-    assert truncate_line("x" * 100, 60) == "x" * 60
-    assert truncate_line("", 60) == ""
-    assert truncate_line("\nleading newline", 60) == ""
-
-    async def run() -> None:
-        app = _make_app()
-        async with app.run_test() as pilot:
-            app._subagent_reports = [
-                SubagentReport("r1", "line one\nline two", "report", False, 1.0),
-            ]
-            await pilot.press("ctrl+o")
-            await pilot.pause()
-            assert isinstance(app.screen, SubagentReportScreen)
-            labels = app.screen.query_one("#report-list").query(Label)
-            label = str(labels.first().content)
-            assert "line one" in label
-            assert "\n" not in label
 
     asyncio.run(run())
 
