@@ -61,6 +61,17 @@ default-agent turn's input tokens 65%). Follow-ups it unlocks:
   `filesystem.py:1337`) via replace-by-name `middleware=`; no fork or internal
   patching. See the backlog entry above for the original evidence; wire it to an
   env knob like the `COMPACT_*` family if a lower threshold proves out.
+- [ ] **Upstream report-extraction quirk, guards reverted** — deepagents 0.7's
+  `_return_command_with_state_update` (`middleware/subagents.py:495-505`) still
+  picks the sub-agent report as the last non-empty `AIMessage` without checking
+  `tool_calls`, so a run ending on a tool call reports only its preamble. The
+  local guard layer for it (#57 report guard + #60 sentinel/reply protocols)
+  was reverted 2026-08-04: redundant once the real cause was fixed — the 4096
+  max_tokens fallback (#58, kept) — and the `zai:` provider (#59) left the
+  anthropic-compat path; the guards had started misfiring on good output. If
+  preamble-only reports ever recur, the remaining lever is reverting #56
+  (provisional-findings persistence); the full bail-out recipe is in git
+  history at c3dafd7's version of this file.
 - [ ] **Revisit the deferred prompt-trim sub-items** — the TodoListMiddleware
   injection is gone as of this upgrade, and built-in tool descriptions are now
   overridable directly (`FilesystemMiddleware(custom_tool_descriptions={...})`).
