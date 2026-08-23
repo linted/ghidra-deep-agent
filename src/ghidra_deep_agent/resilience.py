@@ -17,19 +17,23 @@ Configuration (env):
 """
 
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from langchain.agents.middleware import (
     AgentMiddleware,
     AgentState,
     ModelFallbackMiddleware,
+    ModelRequest,
+    ModelResponse,
     ModelRetryMiddleware,
     ToolRetryMiddleware,
     hook_config,
 )
+from langchain_core.exceptions import ModelError, ModelRateLimitError
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langgraph.errors import GraphBubbleUp
 from langgraph.runtime import Runtime
 
 from ghidra_deep_agent.defaults import env_int
@@ -105,12 +109,21 @@ _USAGE_LIMIT_MARKERS = (
 
 
 def _is_transient(exc: BaseException) -> bool:
-    """Heuristic: would retrying this error plausibly succeed?
+    """Would retrying this error plausibly succeed?
 
     True for rate limits, timeouts, connection resets, and 5xx responses; False
     for deterministic failures (bad request, auth, schema/validation), which
     would only waste time and money on retry.
+
+    Since langchain-core 1.6.0, provider packages raise standard ``ModelError``
+    subclasses (dual-inherited with the SDK's own types) carrying an
+    authoritative ``is_retryable`` flag — trust it outright: the provider knows
+    "overloaded" is a blip and "invalid api key" is not, no matter what the
+    message text says. The status/text heuristics remain as the fallback for
+    providers that haven't adopted the hierarchy (e.g. Ollama).
     """
+    if isinstance(exc, ModelError):
+        return exc.is_retryable
     status = getattr(exc, "status_code", None)
     if isinstance(status, int) and status in _TRANSIENT_STATUS:
         return True
@@ -121,11 +134,15 @@ def _is_transient(exc: BaseException) -> bool:
 def _is_usage_limit(exc: BaseException) -> bool:
     """Would waiting hours (not seconds) be the only thing that clears this?
 
-    True for provider rate/usage/quota limits (429, or a limit marker in the
-    text). Provider-agnostic: relies on status code + text, never on a
-    provider-specific ``retry-after`` header (inconsistent across
+    True for provider rate/usage/quota limits: the standard
+    ``ModelRateLimitError`` type (anthropic/openai-protocol providers since
+    langchain-core 1.6.0), a 429 status, or a limit marker in the text — the
+    latter two remain for providers without the standard hierarchy. Never
+    relies on a provider-specific ``retry-after`` header (inconsistent across
     Anthropic/OpenRouter/DeepSeek, absent on Ollama).
     """
+    if isinstance(exc, ModelRateLimitError):
+        return True
     status = getattr(exc, "status_code", None)
     if isinstance(status, int) and status == 429:
         return True
@@ -149,10 +166,12 @@ def _is_out_of_credits(exc: BaseException) -> bool:
 
 
 def _on_model_retries_exhausted(exc: BaseException) -> str:
-    """`on_failure` for ``ModelRetryMiddleware``: halt on a limit, else continue.
+    """Terminal model-error policy: halt on a limit, else continue.
 
-    Called both when retries are exhausted and immediately for non-retryable
-    errors (``ModelRetryMiddleware`` skips the retry loop for those, e.g. a 402).
+    Called from two places that together see every terminal model error:
+    ``ModelRetryMiddleware``'s ``on_failure`` when retries of a transient error
+    are exhausted, and :class:`ModelErrorBoundaryMiddleware` for non-retryable
+    errors (e.g. a 402), which langchain ≥1.3.16 re-raises past ``on_failure``.
 
     An out-of-credits error or a usage/rate limit is raised as
     :class:`UsageLimitError` so the turn stops at a clean, resumable checkpoint
@@ -181,6 +200,56 @@ def _on_model_retries_exhausted(exc: BaseException) -> str:
         timeout=10.0,
     )
     return f"Model call failed after retries: {exc}"
+
+
+class ModelErrorBoundaryMiddleware(AgentMiddleware):
+    """Route non-retryable model errors through the terminal-error policy.
+
+    langchain 1.3.16 changed ``ModelRetryMiddleware``: exceptions not matched
+    by ``retry_on`` are re-raised immediately instead of being handed to
+    ``on_failure``. Left alone, that raw raise crashes the turn mid-stream —
+    losing the 402 out-of-credits toast/halt and the synthetic-error-reply
+    behavior this project relied on. This boundary wraps the retry layer and
+    applies the same policy (:func:`_on_model_retries_exhausted`) to whatever
+    it re-raises, restoring the pre-1.3.16 routing in the position the
+    ``on_failure`` hook used to occupy: inside the fallback layer, so a
+    usage-limit halt on the primary model still triggers the configured
+    fallbacks, while a "continue" verdict returns a synthetic reply without
+    falling back — exactly as before.
+
+    ``UsageLimitError`` (already the product of this policy, raised by the
+    retry layer's own ``on_failure``) and langgraph control-flow exceptions
+    pass through untouched.
+    """
+
+    def _handle(self, exc: Exception) -> ModelResponse:
+        return ModelResponse(
+            result=[AIMessage(content=_on_model_retries_exhausted(exc))]
+        )
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        try:
+            return handler(request)
+        except (GraphBubbleUp, UsageLimitError):
+            raise
+        except Exception as exc:
+            return self._handle(exc)
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        try:
+            return await handler(request)
+        except (GraphBubbleUp, UsageLimitError):
+            raise
+        except Exception as exc:
+            return self._handle(exc)
 
 
 def is_truncated_message(msg: BaseMessage) -> bool:
@@ -278,13 +347,15 @@ def _fallback_specs() -> list[str]:
 def build_model_resilience_middleware(
     resolve_model: ModelResolver,
 ) -> list[AgentMiddleware]:
-    """Model-call resilience: optional provider fallback (outer) + retry (inner).
+    """Model-call resilience: fallback (outer) > error boundary > retry (inner).
 
     Fallback is listed first so it is the outermost wrapper: the primary model
-    is retried on transient errors first, and only if those retries are
-    exhausted does the call fall back to the next configured model (which is then
-    itself retried). Returns an empty-fallback list when ``MODEL_FALLBACK`` is
-    unset.
+    is retried on transient errors first, and only when the terminal-error
+    policy raises (a usage/credit limit) does the call fall back to the next
+    configured model (which is then itself retried). The error boundary between
+    them applies that policy to non-retryable errors, which the retry layer
+    re-raises rather than routing to ``on_failure`` since langchain 1.3.16.
+    Omits the fallback layer when ``MODEL_FALLBACK`` is unset.
     """
     max_retries = env_int("MODEL_MAX_RETRIES", 3)
     middleware: list[AgentMiddleware] = []
@@ -294,6 +365,9 @@ def build_model_resilience_middleware(
         resolved = [resolve_model(spec) for spec in fallbacks]
         middleware.append(ModelFallbackMiddleware(resolved[0], *resolved[1:]))
 
+    # Between fallback and retry: catches the non-retryable errors the retry
+    # layer re-raises (langchain ≥1.3.16) and applies the terminal-error policy.
+    middleware.append(ModelErrorBoundaryMiddleware())
     middleware.append(
         ModelRetryMiddleware(
             max_retries=max_retries,
