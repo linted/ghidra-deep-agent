@@ -7,9 +7,10 @@ Two concerns live here:
    turn spent at the exact moment context is at its largest, and one the model
    was free to ignore. ``compact_out_of_band`` instead drives the summarization
    engine directly: one summary-model call, no agent turn, always runs. It
-   only computes the ``_summarization_event``; persisting it (via
-   ``graph.aupdate_state``) is the caller's job, so a failure anywhere leaves
-   the thread untouched.
+   only computes the ``_summarization_event`` (and the
+   ``_summarization_session_id`` naming the offload file); persisting them
+   (via ``graph.aupdate_state``) is the caller's job, so a failure anywhere
+   leaves the thread untouched.
 
 2. **Tuning the *auto* summarizer.** ``create_deep_agent`` installs a stock
    ``SummarizationMiddleware(model, backend)`` for the main agent and every
@@ -41,7 +42,6 @@ from typing import Any, Literal
 from deepagents.middleware.summarization import create_summarization_middleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AnyMessage, get_buffer_string
-from langchain_core.runnables.config import var_child_runnable_config
 
 
 def create_manual_compaction_engine(model: str | BaseChatModel, backend: Any) -> Any:
@@ -72,6 +72,10 @@ class ManualCompactionResult:
     # Backend path the evicted history was offloaded to; None if that
     # (non-fatal) write failed.
     file_path: str | None
+    # The id that named the history file. Must be persisted as
+    # ``_summarization_session_id`` alongside the event so every later
+    # compaction — auto, tool, or manual — appends to the same file.
+    session_id: str
 
 
 async def compact_out_of_band(
@@ -79,7 +83,7 @@ async def compact_out_of_band(
     messages: list[AnyMessage],
     prior_event: Any,
     *,
-    thread_id: str,
+    session_id: str | None,
 ) -> ManualCompactionResult | None:
     """Compact a thread's history without an agent turn.
 
@@ -88,8 +92,10 @@ async def compact_out_of_band(
     (this path is explicitly user-driven) and minus the ``ToolMessage`` (there
     is no calling AI message to pair it with). Compaction never rewrites
     ``state["messages"]`` — the effective list is rebuilt from
-    ``_summarization_event`` — so the returned event is the entire state
-    change. Returns ``None`` when there is nothing to compact.
+    ``_summarization_event`` — so the returned event plus the returned
+    ``session_id`` is the entire state change. ``session_id`` is the thread's
+    persisted ``_summarization_session_id`` (``None`` if it has none yet).
+    Returns ``None`` when there is nothing to compact.
 
     Raises whatever the summary-model call raises; no side effect has happened
     by then, so the caller can report the error and leave the thread as-is.
@@ -100,21 +106,19 @@ async def compact_out_of_band(
         return None
     to_summarize, _ = engine._partition_messages(effective, cutoff)
     summary = await _summarize_or_raise(engine, to_summarize)
-    # The offload derives its per-thread history file from the thread_id in the
-    # runnable-config contextvar. Outside a graph run that var is unset and the
-    # engine falls back to a random `session_*` id, fragmenting the history
-    # file — so pin the real thread id for the duration of the write.
-    token = var_child_runnable_config.set({"configurable": {"thread_id": thread_id}})
-    try:
-        file_path = await engine._aoffload_to_backend(engine._backend, to_summarize)
-    finally:
-        var_child_runnable_config.reset(token)
+    # The offload appends to one history file per session id. Pass through the
+    # thread's persisted ``_summarization_session_id`` so manual compaction
+    # shares a file with the in-graph paths (auto summarizer, compact tool); on
+    # a thread with none yet the engine mints one, which the caller must
+    # persist with the event or the next compaction starts a new file.
+    sid = engine._get_session_id({"_summarization_session_id": session_id})
+    file_path = await engine._aoffload_to_backend(engine._backend, to_summarize, sid)
     event = {
         "cutoff_index": engine._compute_state_cutoff(prior_event, cutoff),
         "summary_message": engine._build_new_messages_with_path(summary, file_path)[0],
         "file_path": file_path,
     }
-    return ManualCompactionResult(event, len(to_summarize), file_path)
+    return ManualCompactionResult(event, len(to_summarize), file_path, sid)
 
 
 async def _summarize_or_raise(engine: Any, to_summarize: list[AnyMessage]) -> str:

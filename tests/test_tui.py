@@ -796,7 +796,11 @@ class _CompactStubAgent(StubAgent):
 
     async def aget_state(self, config: Any) -> Any:
         return SimpleNamespace(
-            values={"messages": self.messages, "_summarization_event": self.event}
+            values={
+                "messages": self.messages,
+                "_summarization_event": self.event,
+                "_summarization_session_id": "sid-1",
+            }
         )
 
     async def aupdate_state(
@@ -809,7 +813,8 @@ def test_compact_persists_the_event_without_an_agent_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """/compact drives the summarization engine directly: the only state change
-    is a `_summarization_event` written as the tools node."""
+    is a `_summarization_event` plus its `_summarization_session_id`, written
+    as the tools node."""
 
     async def run() -> None:
         agent = _CompactStubAgent(messages=["m"] * 20, event={"cutoff_index": 3})
@@ -819,12 +824,13 @@ def test_compact_persists_the_event_without_an_agent_turn(
             event={"cutoff_index": 14, "summary_message": "s", "file_path": "h.md"},
             summarized_count=12,
             file_path="h.md",
+            session_id="sid-1",
         )
 
         async def fake_compact(
-            engine: Any, messages: Any, prior: Any, *, thread_id: str
+            engine: Any, messages: Any, prior: Any, *, session_id: str | None
         ) -> ManualCompactionResult:
-            seen.append((engine, list(messages), prior, thread_id))
+            seen.append((engine, list(messages), prior, session_id))
             return result
 
         monkeypatch.setattr(
@@ -833,11 +839,20 @@ def test_compact_persists_the_event_without_an_agent_turn(
         async with app.run_test() as pilot:
             app._dispatch_slash("/compact")
             await pilot.pause(0.2)
-            # The driver got the thread's real state, keyed by the session id.
+            # The driver got the thread's real state, including the persisted
+            # summarization session id.
             assert seen == [
-                (app._compaction_engine, ["m"] * 20, {"cutoff_index": 3}, "abc")
+                (app._compaction_engine, ["m"] * 20, {"cutoff_index": 3}, "sid-1")
             ]
-            assert agent.updates == [({"_summarization_event": result.event}, "tools")]
+            assert agent.updates == [
+                (
+                    {
+                        "_summarization_event": result.event,
+                        "_summarization_session_id": "sid-1",
+                    },
+                    "tools",
+                )
+            ]
             assert app.query_one(ResponseLog).transcript == ["❯ /compact"]
             assert not app._agent_running
 
