@@ -18,6 +18,8 @@ from langchain.agents.middleware import ModelResponse, ModelRetryMiddleware
 from langchain_core.exceptions import (
     ModelAuthenticationError,
     ModelInvalidRequestError,
+    ModelNotFoundError,
+    ModelPermissionDeniedError,
     ModelRateLimitError,
 )
 from langchain_core.messages import AIMessage, HumanMessage
@@ -236,14 +238,39 @@ def test_boundary_halts_on_a_usage_limit() -> None:
         _boundary_raise(ModelRateLimitError("rate limited"))
 
 
-def test_boundary_converts_other_errors_to_a_synthetic_reply(
+def test_boundary_converts_content_shaped_errors_to_a_synthetic_reply(
     captured_toasts: list[ToastRequest],
 ) -> None:
-    response = _boundary_raise(ModelAuthenticationError("invalid x-api-key"))
+    # An invalid-request rejection is often specific to one call's payload
+    # (e.g. one sub-agent's input drawing a 400): the coordinator can route
+    # around it, so the run continues on a synthetic reply instead of halting.
+    response = _boundary_raise(ModelInvalidRequestError("schema rejected"))
     (msg,) = response.result
     assert isinstance(msg, AIMessage)
     assert "Model call failed after retries" in msg.content
     assert len(captured_toasts) == 1
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ModelAuthenticationError("invalid x-api-key"),
+        ModelNotFoundError("no such model: claude-fable-6"),
+        ModelPermissionDeniedError("key lacks access to this model"),
+    ],
+)
+def test_boundary_reraises_deterministic_config_errors(
+    exc: Exception, captured_toasts: list[ToastRequest]
+) -> None:
+    # Nothing downstream can route around a bad key / model id / permission —
+    # every later call fails identically, so continuing on a synthetic reply
+    # would cascade fabricated messages through the run. Fail loudly instead
+    # (the run is still checkpointed); the TUI's error banner reports it, so no
+    # toast either.
+    with pytest.raises(type(exc)) as excinfo:
+        _boundary_raise(exc)
+    assert excinfo.value is exc
+    assert captured_toasts == []
 
 
 def test_boundary_reraises_usage_limit_and_control_flow_untouched() -> None:

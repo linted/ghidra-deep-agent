@@ -30,7 +30,13 @@ from langchain.agents.middleware import (
     ToolRetryMiddleware,
     hook_config,
 )
-from langchain_core.exceptions import ModelError, ModelRateLimitError
+from langchain_core.exceptions import (
+    ModelAuthenticationError,
+    ModelError,
+    ModelNotFoundError,
+    ModelPermissionDeniedError,
+    ModelRateLimitError,
+)
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.errors import GraphBubbleUp
@@ -202,20 +208,42 @@ def _on_model_retries_exhausted(exc: BaseException) -> str:
     return f"Model call failed after retries: {exc}"
 
 
+# Deterministic configuration errors nothing downstream can route around: a bad
+# API key, a nonexistent model id, or a permission denial fails every subsequent
+# call identically, so "continuing" on a synthetic reply would only cascade
+# fabricated messages through the rest of the run. These propagate raw (per
+# upstream's rationale in langchain#38960) — loudly halting a turn that is still
+# checkpointed and resumable. Deliberately absent: ModelInvalidRequestError and
+# unclassified errors, which are often content-specific (one sub-agent's payload
+# drawing a 400) — there the coordinator can route around the failure, and
+# halting an hours-long autonomous run over it is the worse trade.
+_CONFIG_ERRORS = (
+    ModelAuthenticationError,
+    ModelNotFoundError,
+    ModelPermissionDeniedError,
+)
+
+
 class ModelErrorBoundaryMiddleware(AgentMiddleware):
     """Route non-retryable model errors through the terminal-error policy.
 
     langchain 1.3.16 changed ``ModelRetryMiddleware``: exceptions not matched
     by ``retry_on`` are re-raised immediately instead of being handed to
-    ``on_failure``. Left alone, that raw raise crashes the turn mid-stream —
-    losing the 402 out-of-credits toast/halt and the synthetic-error-reply
-    behavior this project relied on. This boundary wraps the retry layer and
-    applies the same policy (:func:`_on_model_retries_exhausted`) to whatever
-    it re-raises, restoring the pre-1.3.16 routing in the position the
-    ``on_failure`` hook used to occupy: inside the fallback layer, so a
-    usage-limit halt on the primary model still triggers the configured
-    fallbacks, while a "continue" verdict returns a synthetic reply without
-    falling back — exactly as before.
+    ``on_failure`` (see langchain#38960). Left alone, that raw raise loses the
+    402 out-of-credits toast/halt and the synthetic-error-reply behavior this
+    project relies on. This boundary wraps the retry layer — the position the
+    ``on_failure`` hook used to occupy, inside the fallback layer — and sorts
+    what it re-raises three ways:
+
+    - credit/usage limits: :class:`UsageLimitError`, so the TUI pauses the run
+      at a resumable checkpoint (and, configured, the fallback models are
+      still tried first);
+    - deterministic config errors (``_CONFIG_ERRORS``): re-raised untouched —
+      nothing can route around a bad key, so fail loudly rather than feed the
+      agent fabricated replies;
+    - everything else: the ``on_failure`` "continue" policy
+      (:func:`_on_model_retries_exhausted`) — toast plus synthetic reply, so a
+      content-specific rejection in one sub-agent doesn't kill the whole run.
 
     ``UsageLimitError`` (already the product of this policy, raised by the
     retry layer's own ``on_failure``) and langgraph control-flow exceptions
@@ -234,7 +262,7 @@ class ModelErrorBoundaryMiddleware(AgentMiddleware):
     ) -> ModelResponse:
         try:
             return handler(request)
-        except (GraphBubbleUp, UsageLimitError):
+        except (GraphBubbleUp, UsageLimitError, *_CONFIG_ERRORS):
             raise
         except Exception as exc:
             return self._handle(exc)
@@ -246,7 +274,7 @@ class ModelErrorBoundaryMiddleware(AgentMiddleware):
     ) -> ModelResponse:
         try:
             return await handler(request)
-        except (GraphBubbleUp, UsageLimitError):
+        except (GraphBubbleUp, UsageLimitError, *_CONFIG_ERRORS):
             raise
         except Exception as exc:
             return self._handle(exc)
