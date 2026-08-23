@@ -10,14 +10,25 @@ Run:  uv run pytest tests/test_resilience.py -v
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
+from langchain.agents.middleware import ModelResponse, ModelRetryMiddleware
+from langchain_core.exceptions import (
+    ModelAuthenticationError,
+    ModelInvalidRequestError,
+    ModelNotFoundError,
+    ModelPermissionDeniedError,
+    ModelRateLimitError,
+)
 from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.errors import GraphBubbleUp
 
 from ghidra_deep_agent.resilience import (
     _MAX_TRUNCATION_RECOVERIES,
     _TRUNCATION_NUDGE,
+    ModelErrorBoundaryMiddleware,
     TruncationRecoveryMiddleware,
     UsageLimitError,
     _is_out_of_credits,
@@ -162,6 +173,174 @@ def test_on_failure_does_not_toast_on_usage_limit(
         _on_model_retries_exhausted(_StatusError("rate limit exceeded", 429))
 
     assert received == []
+
+
+# --- standard model exception types (langchain-core >= 1.6.0) -------------------
+
+
+def test_standard_rate_limit_type_classifies_without_status_or_markers() -> None:
+    # Anthropic/openai-protocol providers now raise ModelRateLimitError; the
+    # type alone must classify it even when neither a status_code attribute nor
+    # any marker text is present.
+    exc = ModelRateLimitError("please slow down")
+    assert _is_transient(exc) is True
+    assert _is_usage_limit(exc) is True
+
+
+def test_standard_non_retryable_type_beats_transient_looking_text() -> None:
+    # The text heuristic alone would call this transient ("connection"); the
+    # typed is_retryable=False verdict must win.
+    exc = ModelInvalidRequestError("the connection field of the request is bad")
+    assert _is_transient(exc) is False
+
+
+def test_standard_auth_error_is_neither_transient_nor_a_limit() -> None:
+    exc = ModelAuthenticationError("invalid x-api-key")
+    assert _is_transient(exc) is False
+    assert _is_usage_limit(exc) is False
+
+
+# --- non-retryable error boundary ------------------------------------------------
+
+
+def _boundary_raise(exc: BaseException) -> Any:
+    def handler(request: Any) -> Any:
+        raise exc
+
+    return ModelErrorBoundaryMiddleware().wrap_model_call(
+        None,  # type: ignore[arg-type]  # request is unused
+        handler,
+    )
+
+
+def test_boundary_passes_a_successful_response_through() -> None:
+    sentinel = ModelResponse(result=[AIMessage("ok")])
+    result = ModelErrorBoundaryMiddleware().wrap_model_call(
+        None,  # type: ignore[arg-type]
+        lambda request: sentinel,
+    )
+    assert result is sentinel
+
+
+def test_boundary_halts_on_out_of_credits(
+    captured_toasts: list[ToastRequest],
+) -> None:
+    original = _StatusError("payment required", 402)
+    with pytest.raises(UsageLimitError) as excinfo:
+        _boundary_raise(original)
+    assert excinfo.value.original is original
+    assert len(captured_toasts) == 1
+    assert "credits" in captured_toasts[0].message
+
+
+def test_boundary_halts_on_a_usage_limit() -> None:
+    with pytest.raises(UsageLimitError):
+        _boundary_raise(ModelRateLimitError("rate limited"))
+
+
+def test_boundary_converts_content_shaped_errors_to_a_synthetic_reply(
+    captured_toasts: list[ToastRequest],
+) -> None:
+    # An invalid-request rejection is often specific to one call's payload
+    # (e.g. one sub-agent's input drawing a 400): the coordinator can route
+    # around it, so the run continues on a synthetic reply instead of halting.
+    response = _boundary_raise(ModelInvalidRequestError("schema rejected"))
+    (msg,) = response.result
+    assert isinstance(msg, AIMessage)
+    assert "Model call failed after retries" in msg.content
+    assert len(captured_toasts) == 1
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ModelAuthenticationError("invalid x-api-key"),
+        ModelNotFoundError("no such model: claude-fable-6"),
+        ModelPermissionDeniedError("key lacks access to this model"),
+    ],
+)
+def test_boundary_reraises_deterministic_config_errors(
+    exc: Exception, captured_toasts: list[ToastRequest]
+) -> None:
+    # Nothing downstream can route around a bad key / model id / permission —
+    # every later call fails identically, so continuing on a synthetic reply
+    # would cascade fabricated messages through the run. Fail loudly instead
+    # (the run is still checkpointed); the TUI's error banner reports it, so no
+    # toast either.
+    with pytest.raises(type(exc)) as excinfo:
+        _boundary_raise(exc)
+    assert excinfo.value is exc
+    assert captured_toasts == []
+
+
+def test_boundary_reraises_usage_limit_and_control_flow_untouched() -> None:
+    # UsageLimitError is already the product of this policy (raised by the
+    # retry layer's on_failure); re-wrapping it would toast twice. GraphBubbleUp
+    # is langgraph control flow, not an error.
+    original = UsageLimitError(RuntimeError("429"))
+    with pytest.raises(UsageLimitError) as excinfo:
+        _boundary_raise(original)
+    assert excinfo.value is original
+    with pytest.raises(GraphBubbleUp):
+        _boundary_raise(GraphBubbleUp())
+
+
+def test_async_boundary_halts_on_out_of_credits() -> None:
+    original = _StatusError("payment required", 402)
+
+    async def run() -> None:
+        async def handler(request: Any) -> Any:
+            raise original
+
+        await ModelErrorBoundaryMiddleware().awrap_model_call(
+            None,  # type: ignore[arg-type]
+            handler,
+        )
+
+    with pytest.raises(UsageLimitError) as excinfo:
+        asyncio.run(run())
+    assert excinfo.value.original is original
+
+
+def test_upstream_retry_reraises_non_retryables_into_the_boundary(
+    captured_toasts: list[ToastRequest],
+) -> None:
+    """Pins the langchain >= 1.3.16 contract the boundary exists for.
+
+    ``ModelRetryMiddleware`` re-raises exceptions ``retry_on`` rejects without
+    calling ``on_failure`` (before 1.3.16 it routed them to ``on_failure``).
+    The boundary directly outside must apply the terminal policy instead. If a
+    langchain upgrade changes this contract again, fail here."""
+    retry = ModelRetryMiddleware(
+        max_retries=3,
+        retry_on=_is_transient,
+        on_failure=_on_model_retries_exhausted,
+    )
+    original = _StatusError("payment required", 402)
+
+    def model(request: Any) -> Any:
+        raise original
+
+    def through_retry(request: Any) -> Any:
+        return retry.wrap_model_call(request, model)
+
+    with pytest.raises(UsageLimitError) as excinfo:
+        ModelErrorBoundaryMiddleware().wrap_model_call(
+            None,  # type: ignore[arg-type]
+            through_retry,
+        )
+    assert excinfo.value.original is original
+    assert len(captured_toasts) == 1
+
+
+def test_boundary_is_wired_directly_outside_the_retry_layer() -> None:
+    middleware = build_model_resilience_middleware(lambda spec: spec or "m")
+    kinds = [type(m) for m in middleware]
+    boundary = kinds.index(ModelErrorBoundaryMiddleware)
+    retry = kinds.index(ModelRetryMiddleware)
+    # Adjacent, boundary outside: with MODEL_FALLBACK set the fallback layer
+    # wraps both, so a usage-limit halt still triggers the fallback models.
+    assert boundary == retry - 1
 
 
 # --- truncation recovery --------------------------------------------------------
