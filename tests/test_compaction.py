@@ -2,8 +2,9 @@
 Unit tests for the two halves of compaction:
 
 - the out-of-band ``/compact`` driver (``compact_out_of_band``), which must
-  summarize on exactly one model call, offload history under the *passed*
-  thread id, handle chained compaction, and persist nothing on failure; and
+  summarize on exactly one model call, offload history under the thread's
+  persisted session id, handle chained compaction, and persist nothing on
+  failure; and
 - scope-aware auto-summarization tuning: the builder must hand sub-agent scope
   the aggressive built-in thresholds (trigger 50k tokens / keep 10k tokens),
   leave main scope on deepagents' stock defaults, honor the per-scope
@@ -131,9 +132,7 @@ def _engine(tmp_path: Path, model: Any | None = None) -> Any:
 
 def test_compact_out_of_band_summarizes_and_offloads(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
-    result = asyncio.run(
-        compact_out_of_band(engine, _history(), None, thread_id="thread-42")
-    )
+    result = asyncio.run(compact_out_of_band(engine, _history(), None, session_id=None))
     assert result is not None
     event = result.event
     # The summary message is what later turns see in place of the evicted slice.
@@ -141,10 +140,11 @@ def test_compact_out_of_band_summarizes_and_offloads(tmp_path: Path) -> None:
     assert "the summary" in event["summary_message"].content
     assert 0 < event["cutoff_index"] < 30
     assert result.summarized_count == event["cutoff_index"]
-    # The history file is named by the *passed* thread id — the engine resolves
-    # it from the runnable-config contextvar, which the driver must pin (unset,
-    # it falls back to a random `session_*` name).
-    history = tmp_path / "conversation_history" / "thread-42.md"
+    # With no persisted session id the engine mints a `session_*` one; the
+    # driver must return it so the caller persists it — it names the history
+    # file every later compaction appends to.
+    assert result.session_id.startswith("session_")
+    history = tmp_path / "conversation_history" / f"{result.session_id}.md"
     assert history.exists()
     assert "question 0" in history.read_text(encoding="utf-8")
 
@@ -152,9 +152,7 @@ def test_compact_out_of_band_summarizes_and_offloads(tmp_path: Path) -> None:
 def test_compact_out_of_band_with_tiny_history_is_a_noop(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
     messages: list[Any] = [HumanMessage(content="hi"), AIMessage(content="hello")]
-    result = asyncio.run(
-        compact_out_of_band(engine, messages, None, thread_id="thread-42")
-    )
+    result = asyncio.run(compact_out_of_band(engine, messages, None, session_id=None))
     assert result is None
     assert not (tmp_path / "conversation_history").exists()
 
@@ -173,10 +171,13 @@ def test_compact_out_of_band_chains_on_a_prior_event(tmp_path: Path) -> None:
     }
     effective = engine._apply_event_to_messages(list(messages), prior)
     effective_cutoff = engine._determine_cutoff_index(effective)
-    result = asyncio.run(compact_out_of_band(engine, messages, prior, thread_id="t"))
+    result = asyncio.run(compact_out_of_band(engine, messages, prior, session_id="t"))
     assert result is not None
     # -1: the prior summary sits at effective index 0 but is not a state message.
     assert result.event["cutoff_index"] == 10 + effective_cutoff - 1
+    # A persisted session id is reused verbatim, so the chained compaction
+    # appends to the first one's file.
+    assert result.session_id == "t"
     # The prior summary is filtered from the offload — its originals are
     # already stored.
     history = (tmp_path / "conversation_history" / "t.md").read_text(encoding="utf-8")
@@ -192,7 +193,7 @@ def test_compact_out_of_band_summary_failure_raises_before_any_write(
     is written anywhere."""
     engine = _engine(tmp_path, model=_ExplodingModel(responses=["unused"]))
     with pytest.raises(RuntimeError, match="summary model down"):
-        asyncio.run(compact_out_of_band(engine, _history(), None, thread_id="t"))
+        asyncio.run(compact_out_of_band(engine, _history(), None, session_id="t"))
     assert not (tmp_path / "conversation_history").exists()
 
 
@@ -205,6 +206,7 @@ def test_engine_exposes_every_private_attr_the_driver_uses(tmp_path: Path) -> No
         "_apply_event_to_messages",
         "_determine_cutoff_index",
         "_partition_messages",
+        "_get_session_id",
         "_aoffload_to_backend",
         "_build_new_messages_with_path",
         "_compute_state_cutoff",
@@ -227,11 +229,11 @@ class _ToolFake(FakeListChatModel):
 def test_summarization_event_written_as_tools_node_round_trips() -> None:
     """Pins the TUI's ``aupdate_state(..., as_node="tools")`` coupling.
 
-    Out-of-band compaction persists only ``_summarization_event`` (no
-    ``ToolMessage`` — there is no calling AI message to pair one with), written
-    as the ``tools`` node, the node that owns this key on the in-graph tool
-    path. If a deepagents/langchain upgrade renames the node or stops
-    accepting the write, fail here."""
+    Out-of-band compaction persists only ``_summarization_event`` and
+    ``_summarization_session_id`` (no ``ToolMessage`` — there is no calling AI
+    message to pair one with), written as the ``tools`` node, the node that
+    owns these keys on the in-graph tool path. If a deepagents/langchain
+    upgrade renames the node or stops accepting the write, fail here."""
 
     async def run() -> None:
         agent = create_deep_agent(
@@ -252,10 +254,15 @@ def test_summarization_event_written_as_tools_node_round_trips() -> None:
             "file_path": None,
         }
         await agent.aupdate_state(
-            config, {"_summarization_event": event}, as_node="tools"
+            config,
+            {"_summarization_event": event, "_summarization_session_id": "sid-1"},
+            as_node="tools",
         )
         state = await agent.aget_state(config)
         assert state.values["_summarization_event"]["cutoff_index"] == n_messages
+        # The session id round-trips too — later compactions read it back to
+        # keep appending to the same history file.
+        assert state.values["_summarization_session_id"] == "sid-1"
         # Raw history is untouched — compaction only records the event.
         assert len(state.values["messages"]) == n_messages
         # And the next turn still runs on the compacted thread.

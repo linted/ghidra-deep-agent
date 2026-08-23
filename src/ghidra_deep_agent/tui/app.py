@@ -402,7 +402,7 @@ class GhidraAgentApp(App[None]):
                 self._compaction_engine,
                 state.values.get("messages", []),
                 state.values.get("_summarization_event"),
-                thread_id=self._session_id,
+                session_id=state.values.get("_summarization_session_id"),
             )
             if result is None:
                 self.query_one(StatusBar).flash(
@@ -411,8 +411,15 @@ class GhidraAgentApp(App[None]):
                 return
             # `as_node="tools"` writes the event as the node that owns it on
             # the in-graph path (the compact tool); pinned by a real-graph test.
+            # The session id must persist too, so later compactions (auto or
+            # manual) append to the same history file.
             await self._agent.aupdate_state(
-                self._config, {"_summarization_event": result.event}, as_node="tools"
+                self._config,
+                {
+                    "_summarization_event": result.event,
+                    "_summarization_session_id": result.session_id,
+                },
+                as_node="tools",
             )
             saved = (
                 f" Full history saved to {result.file_path}."
