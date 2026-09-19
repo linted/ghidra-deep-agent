@@ -57,6 +57,15 @@ All configuration is done via environment variables (`.env` file or shell export
 | `COMPACT_TRIGGER_FRACTION` | *(unset)* | **Sub-agents:** fractional trigger (0-1 of context window); needs a model with a langchain context profile — unusable for most proxied models, prefer the token form |
 | `COMPACT_MAIN_TRIGGER_TOKENS` | *(deepagents default: 170k)* | **Coordinator:** auto-compact trigger. Its baseline prompt alone is ~60k+, so don't set it below that |
 | `COMPACT_MAIN_KEEP_TOKENS` | *(deepagents default: 6 messages)* | **Coordinator:** recent history kept after a compaction (`COMPACT_MAIN_KEEP_MESSAGES` also accepted) |
+| `TYPESAFE_API_KEY` | *(unset)* | Enables [context pruning with TypeSafe Jev](#context-pruning-with-typesafe-jev-optional): stale tool results are blanked from each model call |
+| `JEV_PRUNE` | `1` | Set to `0` to keep the key configured but leave pruning off |
+| `JEV_PRUNE_THRESHOLD` | `0.2` | Evict a tool result when Jev's P(still needed) is below this |
+| `JEV_PRUNE_TRIGGER_TOKENS` | `20000` | Message-history size (system prompt excluded) at which pruning starts |
+| `JEV_PRUNE_KEEP_RECENT` | `4` | Most recent tool exchanges that are never judged |
+| `JEV_PRUNE_EXCLUDE_TOOLS` | `task` | Comma-separated tools whose results are never pruned (sub-agent reports by default) |
+| `JEV_PRUNE_DEBUG` | *(unset)* | Set to print one `[jev-prune]` line per pass to stderr |
+| `JEV_PRUNE_LOG` | `1` | Set to `0` to skip the MongoDB savings log |
+| `MONGODB_PRUNE_LOG_COLLECTION` | `jev_prune_log` | Collection the savings log is written to |
 | `MODEL_FALLBACK` | *(unset)* | Comma-separated `provider:model` fallbacks tried, in order, after the primary model's retries are exhausted |
 | `MODEL_MAX_RETRIES` | `3` | Retry attempts per model call on transient errors (5xx/429/timeouts) |
 | `TOOL_MAX_RETRIES` | `3` | Retry attempts for transient filesystem-tool I/O errors |
@@ -93,6 +102,42 @@ All configuration is done via environment variables (`.env` file or shell export
 | `LANGSMITH_API_KEY` | *(unset)* | *(optional)* LangSmith API key to enable run tracing |
 | `LANGSMITH_TRACING` | *(unset)* | Set to `true` to enable LangSmith tracing |
 | `LANGSMITH_PROJECT` | *(unset)* | LangSmith project name for traces |
+
+### Context pruning with TypeSafe Jev (optional)
+
+Long research runs re-send every decompiler dump and xref listing on each model
+call long after the agent is done with them. With a `TYPESAFE_API_KEY` set
+(`pip`-free: the `langchain-typesafe` package is already a dependency), a
+middleware asks [Jev](https://typesafe.ai) — a classification model that
+returns calibrated probabilities, not text — one yes/no question per older tool
+result on every model call: *does the agent still need this to finish the task?*
+Results judged stale are replaced, **for that request only**, by a one-line
+placeholder naming the tool so the model can re-run it. Everything else is sent
+verbatim; nothing is summarized and the checkpoint is never modified. A pass over
+a full sub-agent context costs a fraction of a cent (Jev bills $0.042 per
+million input tokens) and about 300 ms.
+
+Pruning sits inside the auto-summarizer: the summarizer still counts,
+summarizes, and offloads the *raw* history at its usual thresholds, so once
+pruning proves out you may want to raise `COMPACT_TRIGGER_TOKENS`. `/compact`
+is unaffected. Verdicts are memoized per tool call — an eviction is permanent,
+and a "keep" is re-asked only when the task or the latest user message changes —
+so the prompt prefix stays stable for provider-side caching. Any Jev failure
+fails open and the request goes out unpruned.
+
+Every pass is recorded to MongoDB (`jev_prune_log`, one document per model
+call with `tokens_before`/`tokens_after`/`tokens_saved`, counts, Jev usage, and
+the per-result verdicts) so the saving can be measured. Summarize it with:
+
+```bash
+uv run python -m ghidra_deep_agent.context_pruning report            # everything
+uv run python -m ghidra_deep_agent.context_pruning report --since 7d # recent
+uv run python -m ghidra_deep_agent.context_pruning report --session <id>
+```
+
+The report shows tokens saved (summed over passes, since the whole context is
+resent each call), the eviction rate per tool, Jev's own cost, and a histogram
+of P(keep) verdicts for tuning `JEV_PRUNE_THRESHOLD`.
 
 ### Using Ollama
 
