@@ -305,6 +305,12 @@ _TRUNCATION_NUDGE = (
     "finish with your final report."
 )
 
+
+def is_truncation_nudge(msg: BaseMessage) -> bool:
+    """True for the automated ``HumanMessage`` this middleware appends."""
+    return isinstance(msg, HumanMessage) and msg.content == _TRUNCATION_NUDGE
+
+
 # Truncation-recovery attempts per turn. Two failed continuations mean the model
 # keeps overrunning the cap; further retries would loop, so fall through and let
 # the report/reply guards salvage what exists.
@@ -360,7 +366,7 @@ class TruncationRecoveryMiddleware(AgentMiddleware):
         count = 0
         for msg in reversed(messages):
             if isinstance(msg, HumanMessage):
-                if msg.content == _TRUNCATION_NUDGE:
+                if is_truncation_nudge(msg):
                     count += 1
                 else:
                     break
