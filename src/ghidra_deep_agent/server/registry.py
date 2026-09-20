@@ -388,7 +388,6 @@ class AgentRegistry:
                 f"agent {agent_id} is {inst.status}"
                 + (f": {inst.error}" if inst.error else "")
             )
-        new_session = session_id is None
         session_id = session_id or str(uuid.uuid4())
         thread_id = session_id if mode == "normal" else f"{session_id}::ask"
         if thread_id in inst.active_runs:
@@ -413,8 +412,9 @@ class AgentRegistry:
         store = self.shared.session_store
         if store is not None:
             with contextlib.suppress(Exception):  # best-effort bookkeeping
-                if new_session:
-                    await store.arecord_start(session_id, inst.program.name)
+                # record_start is an upsert, so a caller-chosen session id is
+                # registered on its first run and merely bumped afterwards.
+                await store.arecord_start(session_id, inst.program.name)
                 await store.atouch(session_id, first_prompt=prompt)
         runner = self._runner or _default_runner()
         run.task = asyncio.create_task(runner(run, inst, self), name=f"run:{run.id}")

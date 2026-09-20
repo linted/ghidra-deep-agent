@@ -150,7 +150,10 @@ def stub_engine(program: ProgramRef, graph: Any | None = None, **kw: Any) -> Eng
 
 
 def stub_shared(
-    *, programs: str = TWO_OPEN, session_store: Any | None = None
+    *,
+    programs: str = TWO_OPEN,
+    session_store: Any | None = None,
+    summary_model: Any | None = None,
 ) -> SharedRuntime:
     return SharedRuntime(
         mcp_config={},
@@ -163,7 +166,7 @@ def stub_shared(
         built_model=None,
         main_model_spec="stub:model",
         summary_override=None,
-        summary_model=None,  # type: ignore[arg-type]
+        summary_model=cast(Any, summary_model),
         recursion_limit=7,
         app_name="app",
         max_context_tokens=1000,
@@ -180,6 +183,7 @@ class GraphPlan:
 
     def __init__(self) -> None:
         self.by_path: dict[str, Any] = {}
+        self.ask_by_path: dict[str, Any] = {}
         self.built: list[ProgramRef] = []
         self.closed: list[str] = []
         self.fail_for: set[str] = set()
@@ -190,7 +194,11 @@ class GraphPlan:
         self.kwargs = kw
         if program.project_path in self.fail_for:
             raise RuntimeError("engine build failed on purpose")
-        engine = stub_engine(program, self.by_path.get(program.project_path))
+        engine = stub_engine(
+            program,
+            self.by_path.get(program.project_path),
+            ask=self.ask_by_path.get(program.project_path, StubGraph("ask reply")),
+        )
         engine._stack.callback(lambda: self.closed.append(program.project_path))
         return engine
 

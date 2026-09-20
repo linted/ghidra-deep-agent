@@ -1,5 +1,28 @@
 # TODOs
 
+- [x] **Server mode — many agents, one Ghidra, over HTTP** (2026-09-20). A second
+  entry point, `ghidra-deep-agent-server` (`server/`), runs one main-graph instance
+  per open program concurrently and is driven by curl / Claude Code. Agent
+  construction split into `runtime.py`: `open_shared_runtime()` (config, models,
+  unpinned MCP probe tools, checkpointer, session registry) + `build_engine()` per
+  program (its own MCP client **pinned** via `pinning.py`, scoped knowledge/cache,
+  storage or its own OpenShell sandbox, the three graphs); the TUI is the same seam
+  with one engine. The event rules moved out of Textual into `stream.translate()`.
+  See README "Server mode". Decisions: FastAPI + SSE + cursor polling (no
+  WebSocket, no browser UI yet); events persisted per run in Mongo (`runs`,
+  `run_events`) so a caller can reconnect; a second run on a busy thread is a 409,
+  not a queue; `program_name` is always overridden with the project path and the
+  server's `[Context] Operating on:` line is verified on every result (mismatch →
+  instance `degraded`); knowledge/cache keys stay the bare program name (agent
+  identity is the path; same name in two folders → 409). Follow-ups:
+  - [ ] MCP endpoint: mount `FastMCP.streamable_http_app()` at `/mcp` in the same
+    lifespan, wrapping the registry's plain-async methods (`create_agent`,
+    `start_run`, `wait`, `list_programs`).
+  - [ ] Plan mode over HTTP (`/plan` → `/approve` is TUI-only).
+  - [ ] Key knowledge/cache/sessions by project path (migration) so same-named
+    programs in different folders can coexist.
+  - [ ] Per-thread run queueing instead of 409; `cancel_task` on the Ghidra side
+    when a run is cancelled; an orphaned-sandbox sweep at startup.
 - [x] **Plan mode for the RE agent** — implemented as a separate read-only agent
   graph rather than a tool-blocking middleware. A `PLAN_MODE_BLOCKED_TOOLS` denylist
   (`subagents.py`) defines the mutating tools (Ghidra renames/retypes/comments/

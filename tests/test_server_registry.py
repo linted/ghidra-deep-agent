@@ -175,6 +175,67 @@ def test_ask_mode_uses_ask_graph_on_its_own_thread() -> None:
     asyncio.run(run())
 
 
+def test_first_ask_turn_is_seeded_from_the_main_session() -> None:
+    class Summary:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        async def ainvoke(self, prompt: str) -> Any:
+            self.prompts.append(prompt)
+            return _Output("we found the parser at 0x1000")
+
+    class _Output:
+        def __init__(self, content: str) -> None:
+            self.content = content
+
+    async def run() -> None:
+        summary = Summary()
+        registry, plan, store = make_registry(summary_model=summary)
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        main = StubGraph()
+        main.state_values = {
+            "messages": [HumanMessage("look"), AIMessage("found"), HumanMessage("go")]
+        }
+        ask = StubGraph("ask reply")
+        plan.by_path["/v1/app.exe"] = main
+        plan.ask_by_path["/v1/app.exe"] = ask
+        inst, _ = await registry.create_agent("/v1/app.exe")
+        r1 = await registry.start_run(
+            inst.id, prompt="why?", session_id="s1", mode="ask"
+        )
+        await registry.wait(r1.id, 5)
+        assert r1.status == "done"
+        assert "<transcript>" in summary.prompts[0]
+        first, second = ask.inputs[0]["messages"]
+        assert "we found the parser at 0x1000" in first["content"]
+        assert "BACKGROUND" in first["content"]
+        assert second["content"].endswith("why?")
+        # The ask thread now has history: a follow-up is not re-seeded.
+        ask.state_values = {"messages": ["seeded", "asked", "answered"]}
+        r2 = await registry.start_run(
+            inst.id, prompt="and?", session_id="s1", mode="ask"
+        )
+        await registry.wait(r2.id, 5)
+        assert len(summary.prompts) == 1
+        assert len(ask.inputs[1]["messages"]) == 1
+        # A summary failure is a warning, not a failed run.
+        summary.ainvoke = _boom  # type: ignore[method-assign]
+        ask.state_values = {}
+        r3 = await registry.start_run(
+            inst.id, prompt="again", session_id="s2", mode="ask"
+        )
+        await registry.wait(r3.id, 5)
+        assert r3.status == "done"
+        types = _types(store, r3.id)
+        assert "warning" in types and len(ask.inputs[2]["messages"]) == 1
+
+    async def _boom(prompt: str) -> Any:
+        raise RuntimeError("summary model down")
+
+    asyncio.run(run())
+
+
 def test_continue_replays_with_no_input() -> None:
     run = RunRecord("r", "a", "s", "s", "normal", None, resume=True)
     assert turn_input(run) is None
@@ -324,9 +385,12 @@ def test_session_store_is_recorded_and_touched() -> None:
         await registry.wait(r1.id, 5)
         r2 = await registry.start_run(a.id, prompt="second", session_id=r1.session_id)
         await registry.wait(r2.id, 5)
+        # record_start is an upsert, so it runs every time: a caller-chosen
+        # session id is registered on its first run too.
         assert sessions.calls == [
             ("start", r1.session_id, "app.exe"),
             ("touch", r1.session_id, "first"),
+            ("start", r1.session_id, "app.exe"),
             ("touch", r1.session_id, "second"),
         ]
 

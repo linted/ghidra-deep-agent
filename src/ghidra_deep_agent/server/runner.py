@@ -13,6 +13,7 @@ from typing import Any
 
 from ghidra_deep_agent.prompt import ASK_MODE_TURN_PREFIX
 from ghidra_deep_agent.resilience import UsageLimitError
+from ghidra_deep_agent.seed import SeedError, marked_prior_context
 from ghidra_deep_agent.server.events import (
     Cancelled,
     Failed,
@@ -26,14 +27,51 @@ from ghidra_deep_agent.stream import Reply, Token, Usage, translate
 from ghidra_deep_agent.toasts import ToastRequest, toast_scope
 
 
-def turn_input(run: RunRecord) -> dict[str, Any] | None:
-    """The graph input for this run (``None`` replays from the last checkpoint)."""
+def turn_input(
+    run: RunRecord, *, background: str | None = None
+) -> dict[str, Any] | None:
+    """The graph input for this run (``None`` replays from the last checkpoint).
+
+    ``background`` is the marked summary of the main session that seeds an ask
+    thread's first turn, prepended as its own user message.
+    """
     if run.resume:
         return None
+    messages: list[dict[str, str]] = []
+    if background:
+        messages.append({"role": "user", "content": background})
     prompt = run.prompt or ""
     if run.mode == "ask":
         prompt = f"{ASK_MODE_TURN_PREFIX}\n\n{prompt}"
-    return {"messages": [{"role": "user", "content": prompt}]}
+    messages.append({"role": "user", "content": prompt})
+    return {"messages": messages}
+
+
+async def ask_seed(
+    run: RunRecord, inst: AgentInstance, registry: AgentRegistry, ask_graph: Any
+) -> str | None:
+    """The background block for an ask thread's FIRST turn, else ``None``.
+
+    Same rule as the TUI: a fresh ask thread is seeded with a summary of the
+    main session so the answerer knows what has been established. Follow-up
+    turns on the same ask thread are not re-seeded.
+    """
+    if run.mode != "ask" or run.resume:
+        return None
+    engine = inst.engine
+    assert engine is not None
+    state = await ask_graph.aget_state(registry.shared.config_for(run.thread_id))
+    if state.values.get("messages"):
+        return None
+    try:
+        return await marked_prior_context(
+            engine.graphs.main,
+            registry.shared.config_for(run.session_id),
+            registry.shared.summary_model,
+        )
+    except SeedError as exc:
+        await registry.publish(run, RunWarning(f"Ask mode {exc}", "Agent", "warning"))
+        return None
 
 
 async def execute_run(
@@ -63,9 +101,10 @@ async def execute_run(
             run,
             Started(run.agent_id, run.session_id, run.thread_id, run.mode, run.resume),
         )
+        background = await ask_seed(run, inst, registry, graph)
         with toast_scope(warnings.put_nowait):
             async for event in graph.astream_events(
-                turn_input(run), config=config, version="v2"
+                turn_input(run, background=background), config=config, version="v2"
             ):
                 for ev in translate(event, run.run_state):
                     if isinstance(ev, Token):
