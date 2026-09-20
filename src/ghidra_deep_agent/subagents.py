@@ -592,6 +592,7 @@ def build_subagents(
     *,
     cache_middleware: AgentMiddleware | None = None,
     async_middleware: AgentMiddleware | None = None,
+    pruning_middleware: AgentMiddleware | None = None,
     summary_model: str | BaseChatModel | None = None,
     policy_override: str | None = None,
 ) -> list[SubAgent]:
@@ -600,9 +601,10 @@ def build_subagents(
     Each sub-agent gets its own middleware (sub-agent middleware does not inherit
     from the main agent): model resilience (retry + optional provider fallback),
     argument validation, the shared immutable-read cache (when enabled),
-    async-task resolution, transient filesystem-tool retry, and a tuned
-    auto-summarizer (aggressive sub-agent thresholds; replaces deepagents'
-    stock instance by ``.name``). Plus its resolved model.
+    async-task resolution, transient filesystem-tool retry, the shared Jev
+    context pruner (when enabled), and a tuned auto-summarizer (aggressive
+    sub-agent thresholds; replaces deepagents' stock instance by ``.name``).
+    Plus its resolved model.
 
     ``backend`` is the shared filesystem backend the summarizer offloads evicted
     history to; ``summary_model`` (when given) routes summary calls to a cheaper
@@ -653,6 +655,9 @@ def build_subagents(
                 # Inside the cache so resolved (not stub) results are cached.
                 *([async_middleware] if async_middleware is not None else []),
                 build_tool_retry_middleware(),
+                # Per-request relevance pruning of stale tool results; the
+                # summarizer (outer) still sees the raw history.
+                *([pruning_middleware] if pruning_middleware is not None else []),
                 # Replaces deepagents' stock SummarizationMiddleware by name.
                 build_tuned_summarization_middleware(
                     model, backend, summary_model=summary_model, scope="subagent"

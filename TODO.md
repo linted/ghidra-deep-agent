@@ -46,6 +46,11 @@
   in-process callbacks into the live agent loop that can't cross into a sandbox — the docs
   treat interpreters and sandboxes as disjoint features. Stays parked until that changes (or
   the in-process constraint is accepted); still beta as of langchain-quickjs 0.3.5.
+  *Update (2026-09-19):* Jev relevance pruning shipped (`context_pruning.py`, needs
+  `TYPESAFE_API_KEY`): stale tool results are blanked per model call, so the "no effective
+  compaction across 40 iterations" evidence above predates it. Re-measure a research run
+  with pruning on (`python -m ghidra_deep_agent.context_pruning report`) before sizing
+  this item — the 40–60% target may already be met.
 
 ### From the deepagents 0.7 upgrade (2026-07-30)
 
@@ -61,6 +66,14 @@ default-agent turn's input tokens 65%). Follow-ups it unlocks:
   `filesystem.py:1337`) via replace-by-name `middleware=`; no fork or internal
   patching. See the backlog entry above for the original evidence; wire it to an
   env knob like the `COMPACT_*` family if a lower threshold proves out.
+  Natural companion to Jev pruning (2026-09-19): spilling 20k+ dumps before Jev has
+  to judge them keeps each pass small.
+- [ ] **Age-based pruning fallback without a TypeSafe key** — langchain 1.4 ships
+  `ContextEditingMiddleware(edits=[ClearToolUsesEdit(...)])` (clears tool results older
+  than the last N once context passes a token trigger). Wire it in the
+  `build_context_pruning_middleware` slot when `TYPESAFE_API_KEY` is unset so the
+  DeepSeek/OpenRouter setups get some pruning for free. Relevance-blind, so keep the
+  trigger high. Small.
 - [ ] **Upstream report-extraction quirk, guards reverted** — deepagents 0.7's
   `_return_command_with_state_update` (`middleware/subagents.py:495-505`) still
   picks the sub-agent report as the last non-empty `AIMessage` without checking
