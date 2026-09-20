@@ -67,7 +67,7 @@ from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
@@ -77,6 +77,9 @@ from pymongo.collection import Collection
 from ghidra_deep_agent.defaults import env_float, env_int
 from ghidra_deep_agent.mongo_util import get_mongo_client, mongo_write_with_retry
 from ghidra_deep_agent.resilience import is_truncation_nudge
+
+if TYPE_CHECKING:
+    from langchain_typesafe import ClassifierRequest
 
 # Jev's P(keep) sits at 0.3–0.5 for results the agent has already acted on
 # (mutation confirmations, notes it has read) and at 0.55+ for ones it is still
@@ -184,38 +187,28 @@ def _questions(keys: Iterable[str]) -> dict[str, Any]:
 
 
 class JevJudge:
-    """Ask Jev through ``TypeSafeClassifier``.
+    """Ask Jev through one long-lived ``TypeSafeClassifier``.
 
-    Questions are constructor-bound in ``langchain-typesafe`` 0.0.1a2, so a
-    classifier is built per batch; the ``httpx2`` clients are shared so the
-    connection pool is not.
+    Since ``langchain-typesafe`` 0.0.1a3 the questions travel with each call
+    (``{"state": ..., "questions": ...}``), so a single classifier, and its
+    connection pool, serves every batch.
     """
 
     def __init__(
         self, *, model: str = DEFAULT_MODEL, timeout: float = DEFAULT_TIMEOUT
     ) -> None:
-        import httpx2
-
-        self._model = model
-        self._timeout = timeout
-        self._client = httpx2.Client(timeout=timeout)
-        self._async_client = httpx2.AsyncClient(timeout=timeout)
-
-    def _classifier(self, keys: Sequence[str]) -> Any:
         from langchain_core._api.beta_decorator import LangChainBetaWarning
         from langchain_typesafe import TypeSafeClassifier
 
-        # The classifier class is marked beta and warns on every construction;
-        # once per batch would flood stderr.
+        self._model = model
+        # The classifier class is marked beta and warns on construction.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", LangChainBetaWarning)
-            return TypeSafeClassifier(
-                questions=_questions(keys),
-                model=self._model,
-                timeout=self._timeout,
-                client=self._client,
-                async_client=self._async_client,
-            )
+            self._classifier = TypeSafeClassifier(model=model, timeout=timeout)
+
+    @staticmethod
+    def _request(state: dict[str, Any], keys: Sequence[str]) -> ClassifierRequest:
+        return {"state": state, "questions": _questions(keys)}
 
     @staticmethod
     def _judgement(response: Any, keys: Sequence[str]) -> Judgement:
@@ -225,10 +218,13 @@ class JevJudge:
         return Judgement(probs, response.usage.input_tokens, response.model)
 
     def judge(self, state: dict[str, Any], keys: Sequence[str]) -> Judgement:
-        return self._judgement(self._classifier(keys).invoke(state), keys)
+        return self._judgement(
+            self._classifier.invoke(self._request(state, keys)), keys
+        )
 
     async def ajudge(self, state: dict[str, Any], keys: Sequence[str]) -> Judgement:
-        return self._judgement(await self._classifier(keys).ainvoke(state), keys)
+        response = await self._classifier.ainvoke(self._request(state, keys))
+        return self._judgement(response, keys)
 
 
 def _is_too_large(exc: Exception) -> bool:
