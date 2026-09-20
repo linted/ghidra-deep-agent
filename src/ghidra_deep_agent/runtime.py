@@ -45,6 +45,7 @@ from ghidra_deep_agent.compaction import (
     build_tuned_summarization_middleware,
     create_manual_compaction_engine,
 )
+from ghidra_deep_agent.context_pruning import build_context_pruning_middleware
 from ghidra_deep_agent.defaults import (
     DEFAULT_MAX_CONTEXT_TOKENS,
     DEFAULT_RECURSION_LIMIT,
@@ -503,6 +504,7 @@ def _build_shared_middleware(
     compaction_engine: Any,
     built_model: Any,
     summary_override: Any,
+    prune_mw: Any = None,
 ) -> list[Any]:
     """Middleware shared by all three graphs, in wrapping order.
 
@@ -529,6 +531,11 @@ def _build_shared_middleware(
         *([cache_mw] if cache_mw is not None else []),
         *([async_mw] if async_mw is not None else []),
         build_tool_retry_middleware(),
+        # Jev relevance pruning (when TYPESAFE_API_KEY is set): blanks stale tool
+        # results on each request only. Custom middleware lands inside the
+        # summarizer's slot, so the summarizer still sees and offloads the raw
+        # history; only the model sees the pruned copy.
+        *([prune_mw] if prune_mw is not None else []),
         # The compact_conversation tool for the agent's own proactive use, on
         # the stock ~50% eligibility gate (stops premature self-compaction).
         # User-driven /compact no longer goes through it — the TUI drives the
@@ -598,12 +605,15 @@ async def build_engine(
     program: ProgramRef,
     *,
     output_dir: str,
+    session_id: str = "",
     verify_pin: bool = True,
     on_mismatch: OnMismatch | None = None,
 ) -> Engine:
     """Build one agent bound to ``program``.
 
     ``output_dir`` is where this agent's files live locally ("" for none).
+    ``session_id`` only tags the Jev prune log; the TUI passes its session, the
+    server (whose engines serve many sessions) passes the agent id.
     ``on_mismatch`` is told when a tool result shows Ghidra operated on some
     other program (the pin's last line of defense); the server uses it to stop
     scheduling runs on the instance.
@@ -643,6 +653,15 @@ async def build_engine(
         # agent sees the resolved result. None when the server exposes no
         # get_task_status tool.
         async_mw = build_async_task_middleware(tools)
+        # Jev context pruning, shared by the coordinator and every sub-agent so
+        # a verdict on a tool result holds across graphs. None without a
+        # TypeSafe key. Verdicts are memoized by tool_call_id, which is unique
+        # across sessions, so one instance per engine is safe.
+        prune_mw = build_context_pruning_middleware(
+            shared.mongo.uri, shared.mongo.db, session_id, program.name
+        )
+        if prune_mw is not None:
+            print("Jev context pruning enabled (savings log: MongoDB jev_prune_log).")
         print(
             f"Agent for {program.project_path}: {shared.main_model_spec}  "
             f"[{len(main_tools)} tool(s)]"
@@ -681,6 +700,7 @@ async def build_engine(
             storage.backend,
             cache_middleware=cache_mw,
             async_middleware=async_mw,
+            pruning_middleware=prune_mw,
             summary_model=shared.summary_override,
         )
         # Plan mode and ask mode delegate to the SAME config entries, rebuilt
@@ -695,6 +715,7 @@ async def build_engine(
             storage.backend,
             cache_middleware=cache_mw,
             async_middleware=async_mw,
+            pruning_middleware=prune_mw,
             summary_model=shared.summary_override,
             policy_override=READ_ONLY_WRITE_POLICY,
         )
@@ -713,6 +734,7 @@ async def build_engine(
             compaction_engine=compaction_engine,
             built_model=shared.built_model,
             summary_override=shared.summary_override,
+            prune_mw=prune_mw,
         )
 
         graphs = _build_graphs(

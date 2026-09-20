@@ -337,6 +337,9 @@ class AgentRegistry:
                     self.shared,
                     program,
                     output_dir=self._output_dir_for(program),
+                    # The engine serves many sessions; the agent id is what
+                    # tags its Jev prune log.
+                    session_id=inst.id,
                     on_mismatch=lambda tool, target: self._degrade(inst, tool, target),
                 )
             except (StartupError, Exception) as exc:

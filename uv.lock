@@ -675,6 +675,7 @@ dependencies = [
     { name = "langchain-nvidia-openshell" },
     { name = "langchain-ollama" },
     { name = "langchain-openrouter" },
+    { name = "langchain-typesafe" },
     { name = "langgraph" },
     { name = "langgraph-checkpoint-mongodb" },
     { name = "openshell" },
@@ -706,6 +707,7 @@ requires-dist = [
     { name = "langchain-nvidia-openshell", specifier = ">=0.1.0" },
     { name = "langchain-ollama", specifier = ">=1.1.0" },
     { name = "langchain-openrouter", specifier = ">=0.2.8" },
+    { name = "langchain-typesafe", specifier = ">=0.0.1a2" },
     { name = "langgraph", specifier = ">=1.2.11" },
     { name = "langgraph-checkpoint-mongodb", specifier = ">=0.5.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=2.3.1" },
@@ -1273,6 +1275,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/26/9f/6c545900fefb7b00ddfa3f16b80d61338a0ec68c31c5451eeeab99082760/langchain_text_splitters-1.1.2.tar.gz", hash = "sha256:782a723db0a4746ac91e251c7c1d57fd23636e4f38ed733074e28d7a86f41627", size = 293580, upload-time = "2026-04-16T14:20:39.162Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d3/26/1ef06f56198d631296d646a6223de35bcc6cf9795ceb2442816bc963b84c/langchain_text_splitters-1.1.2-py3-none-any.whl", hash = "sha256:a2de0d799ff31886429fd6e2e0032df275b60ec817c19059a7b46181cc1c2f10", size = 35903, upload-time = "2026-04-16T14:20:38.243Z" },
+]
+
+[[package]]
+name = "langchain-typesafe"
+version = "0.0.1a2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx2" },
+    { name = "langchain-core" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/90/8b/d053623d1443c284090fecb741d7c50332d209101f703e69f1a5bb9f4a3d/langchain_typesafe-0.0.1a2.tar.gz", hash = "sha256:986abcb4b9879ffce1a1b4ade24b39b95c6dce682bfccc59ce898a5de547904b", size = 200602, upload-time = "2026-09-17T22:24:43.354Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d6/a0/e23ee03e9e5d21bbacae9d72c3f529db36f251d99b28216c8a3fe9a70977/langchain_typesafe-0.0.1a2-py3-none-any.whl", hash = "sha256:a686f0d743ba7f2d6a063d05fe65f68fb92c7c513ea48d23e318d2e0ca419045", size = 24748, upload-time = "2026-09-17T22:24:42.306Z" },
 ]
 
 [[package]]

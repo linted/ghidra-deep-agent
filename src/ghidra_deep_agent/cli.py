@@ -60,7 +60,10 @@ async def _run(args: argparse.Namespace, session_id: str) -> None:
             shared.session_store.record_start(session_id, program.name)
 
         engine = await build_engine(
-            shared, program, output_dir=os.environ.get("AGENT_OUTPUT_DIR", "")
+            shared,
+            program,
+            output_dir=os.environ.get("AGENT_OUTPUT_DIR", ""),
+            session_id=session_id,
         )
         try:
             from ghidra_deep_agent.tui import GhidraAgentApp
