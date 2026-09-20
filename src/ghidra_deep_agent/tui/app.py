@@ -24,17 +24,15 @@ from ghidra_deep_agent.defaults import (
     DEFAULT_MAX_CONTEXT_TOKENS,
     DEFAULT_RECURSION_LIMIT,
 )
-from ghidra_deep_agent.prompt import (
-    APPROVED_PLAN_INSTRUCTION,
-    MARKED_BACKGROUND,
-    PLAN_CONTEXT_SUMMARY_PROMPT,
-)
+from ghidra_deep_agent.formatting import extract_text
+from ghidra_deep_agent.prompt import APPROVED_PLAN_INSTRUCTION
 from ghidra_deep_agent.resilience import UsageLimitError
+from ghidra_deep_agent.seed import SeedError, marked_prior_context
 from ghidra_deep_agent.sessions import SessionStore
+from ghidra_deep_agent.stream import RunState
 from ghidra_deep_agent.toasts import ToastRequest, notify_toast, register_toast_sink
 from ghidra_deep_agent.tui.commands import COMMANDS_BY_NAME
 from ghidra_deep_agent.tui.events import handle_event
-from ghidra_deep_agent.tui.formatting import extract_text
 from ghidra_deep_agent.tui.help_screen import HelpScreen
 from ghidra_deep_agent.tui.messages import (
     AgentDone,
@@ -46,7 +44,6 @@ from ghidra_deep_agent.tui.messages import (
     ToolCountChanged,
 )
 from ghidra_deep_agent.tui.report_screen import SubagentReportScreen
-from ghidra_deep_agent.tui.run_state import RunState
 from ghidra_deep_agent.tui.session_select import SessionSelectScreen
 from ghidra_deep_agent.tui.side_mode import Kind, SideMode
 from ghidra_deep_agent.tui.widgets import (
@@ -74,11 +71,6 @@ GHIDRA_THEME = Theme(
     dark=True,
     variables={"footer-key-foreground": "#4ebf71"},
 )
-
-
-# Skip building a prior-context summary when the main thread has fewer than this
-# many messages (nothing meaningful to hand the planner yet).
-MIN_MESSAGES_FOR_SUMMARY = 3
 
 
 def _slug(text: str, max_len: int = 40) -> str:
@@ -610,34 +602,13 @@ class GhidraAgentApp(App[None]):
         thread is empty/tiny, or the summary call fails — the planner then just
         starts from the goal.
         """
-        if self._summary_model is None:
-            return None
         try:
-            state = await self._agent.aget_state(self._config)
-        except Exception as exc:
-            self._warn_once(
-                "seed_state", f"Plan/ask mode started without prior context: {exc}"
+            return await marked_prior_context(
+                self._agent, self._config, self._summary_model
             )
+        except SeedError as exc:
+            self._warn_once(exc.key, f"Plan/ask mode {exc}")
             return None
-        messages = state.values.get("messages", [])
-        if len(messages) < MIN_MESSAGES_FOR_SUMMARY:
-            return None
-        from langchain_core.messages import get_buffer_string
-
-        transcript = get_buffer_string(messages, format="xml")
-        try:
-            reply = await self._summary_model.ainvoke(
-                PLAN_CONTEXT_SUMMARY_PROMPT.format(transcript=transcript)
-            )
-        except Exception as exc:
-            self._warn_once(
-                "seed_summary",
-                f"Plan/ask mode started without prior context ({exc}); "
-                "check SUMMARY_MODEL.",
-            )
-            return None
-        summary = extract_text(reply).strip()
-        return MARKED_BACKGROUND.format(summary=summary) if summary else None
 
     def _approve_plan(self) -> None:
         """Leave plan mode and tell the normal agent to execute the plan.

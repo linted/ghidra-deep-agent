@@ -36,10 +36,12 @@ dependencies = [
     "pymongo>=4.17.0",
     "python-dotenv>=1.2.3",
     "textual>=8.2.8",
+    "fastapi>=0.141.1",
 ]
 
 [project.scripts]
 ghidra-deep-agent = "ghidra_deep_agent.cli:run"
+ghidra-deep-agent-server = "ghidra_deep_agent.server.main:run"
 
 [project.optional-dependencies]
 dev = [

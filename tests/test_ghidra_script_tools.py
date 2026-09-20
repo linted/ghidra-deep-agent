@@ -203,3 +203,62 @@ def test_raw_tail_is_bounded() -> None:
 
     # The tail is capped so a runaway script can't flood the model's context.
     assert error.count("z") == 800
+
+
+# ── deploy once per source, across runners ────────────────────────────────────
+
+
+def test_identical_source_is_deployed_once_across_runners() -> None:
+    """Two agents' runners share the script names; the second run reuses the deploy."""
+    scripts = FakeScriptsTool(_manifest('{"ok": 1}'))
+    first = GhidraScriptRunner(cast(Any, scripts), None)
+    second = GhidraScriptRunner(cast(Any, scripts), None)
+
+    asyncio.run(first.run("x.java", "src"))
+    asyncio.run(second.run("x.java", "src"))
+
+    assert [c["action"] for c in scripts.calls] == ["create", "run", "run"]
+    # The cached deploy output is still available for compile diagnostics.
+    assert second._last_deploy_output == "created"
+
+
+def test_changed_source_redeploys() -> None:
+    scripts = FakeScriptsTool(_manifest('{"ok": 1}'))
+    runner = GhidraScriptRunner(cast(Any, scripts), None)
+
+    asyncio.run(runner.run("x.java", "v1"))
+    asyncio.run(runner.run("x.java", "v2"))
+    asyncio.run(runner.run("y.java", "v2"))  # a different script name
+
+    assert [c["action"] for c in scripts.calls] == [
+        "create",
+        "run",
+        "create",
+        "run",
+        "create",
+        "run",
+    ]
+
+
+def test_concurrent_deploys_are_serialized() -> None:
+    """Deploys never interleave: the second runner waits for the first's create."""
+    order: list[str] = []
+
+    class SlowScripts(FakeScriptsTool):
+        async def ainvoke(self, args: dict[str, Any]) -> str:
+            order.append(f"{args['action']}:start")
+            if args["action"] == "create":
+                await asyncio.sleep(0.01)
+            order.append(f"{args['action']}:end")
+            return await super().ainvoke(args)
+
+    scripts = SlowScripts(_manifest('{"ok": 1}'))
+
+    async def both() -> None:
+        a = GhidraScriptRunner(cast(Any, scripts), None)
+        b = GhidraScriptRunner(cast(Any, scripts), None)
+        await asyncio.gather(a.run("x.java", "src"), b.run("x.java", "src"))
+
+    asyncio.run(both())
+    assert order[:2] == ["create:start", "create:end"]
+    assert order.count("create:start") == 1

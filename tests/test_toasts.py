@@ -54,3 +54,47 @@ def test_unregister_stops_further_delivery() -> None:
     notify_toast("second")
 
     assert received == [ToastRequest("first")]
+
+
+def test_scoped_sink_takes_precedence_and_resets() -> None:
+    from ghidra_deep_agent.toasts import toast_scope
+
+    global_seen: list[ToastRequest] = []
+    scoped_seen: list[ToastRequest] = []
+    register_toast_sink(global_seen.append)
+
+    with toast_scope(scoped_seen.append):
+        notify_toast("inside")
+    notify_toast("outside")
+
+    assert scoped_seen == [ToastRequest("inside")]
+    assert global_seen == [ToastRequest("outside")]
+
+
+def test_scoped_sink_follows_tasks_and_threads_but_not_siblings() -> None:
+    import asyncio
+
+    from ghidra_deep_agent.toasts import toast_scope
+
+    async def run() -> tuple[list[str], list[str]]:
+        a: list[str] = []
+        b: list[str] = []
+
+        async def agent(name: str, seen: list[str]) -> None:
+            with toast_scope(lambda t: seen.append(t.message)):
+                # Emitters run in child tasks and worker threads (middleware,
+                # to_thread'd Mongo writes); both must inherit the scope.
+                await asyncio.create_task(_emit_async(f"{name}-task"))
+                await asyncio.to_thread(notify_toast, f"{name}-thread")
+                await asyncio.sleep(0)
+
+        async def _emit_async(msg: str) -> None:
+            await asyncio.sleep(0)
+            notify_toast(msg)
+
+        await asyncio.gather(agent("a", a), agent("b", b))
+        return a, b
+
+    a, b = asyncio.run(run())
+    assert sorted(a) == ["a-task", "a-thread"]
+    assert sorted(b) == ["b-task", "b-thread"]

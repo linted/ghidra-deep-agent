@@ -213,8 +213,10 @@ GHIDRA_MCP_URL=http://localhost:8080/sse
 At startup the agent calls `list_binaries` on the Ghidra MCP server to determine which binary you are working on. This name is used to scope all knowledge base reads and writes so findings from different binaries never mix.
 
 - **One program open** — selected automatically, printed to console.
-- **Multiple programs open** — a selection screen appears before the main TUI; use arrow keys and Enter to choose.
-- **Override** — set `BINARY_NAME` in `.env` or pass `--binary-name` on the command line to skip detection entirely (useful for scripting or when the MCP server doesn't expose `list_binaries`).
+- **Multiple programs open** — a selection screen appears before the main TUI; use arrow keys and Enter to choose. (In [server mode](#server-mode-many-agents-one-ghidra) there is no picker: each agent names its program explicitly.)
+- **Override** — set `BINARY_NAME` in `.env` or pass `--binary-name` on the command line to skip detection entirely (useful for scripting or when the MCP server doesn't expose `list_binaries`). The override is the knowledge-base label; when it matches nothing open and exactly one program is, that program is what the agent works on.
+
+Every Ghidra tool call the agent makes carries the program's **project path** as `program_name`, so the agent stays bound to its binary even if you switch windows in Ghidra. GhidrAssistMCP falls back to the active window when a name is unknown, so each result's `[Context] Operating on:` line is checked and a mismatch fails the call rather than touching the wrong program.
 
 ```env
 BINARY_NAME=firmware_v2.bin
@@ -328,6 +330,84 @@ To continue once your limit resets:
   then type `/continue`.
 
 `/continue` targets the main session. Plan mode (`/plan`) and ask mode (`/ask`) run on throwaway threads, so continue those by re-issuing the request. Recovery is provider-agnostic — it works the same whether the primary model is Anthropic, OpenRouter, DeepSeek, or Ollama, and across any configured `MODEL_FALLBACK`.
+
+In server mode the same pause surfaces as run status `paused` (exit of the SSE stream with a `paused` event); resume it with `{"continue": true, "session_id": ...}` on the same agent.
+
+## Server mode: many agents, one Ghidra
+
+The TUI runs one agent on one binary. The server runs **one agent per open program, all at once, through the same Ghidra**, and is driven over HTTP — by `curl`, by a script, or by another agent such as Claude Code. Each agent is pinned to its program's project path (see [Binary selection](#binary-selection)), has its own knowledge-base scope, read cache and output directory, and shares the MongoDB checkpointer and session registry with the TUI, so a session started over HTTP can be reopened with `--session-id` in the TUI and vice versa.
+
+```bash
+uv run ghidra-deep-agent-server          # http://127.0.0.1:8000, OpenAPI at /docs
+```
+
+| Variable | Default | Description |
+|---|---|---|
+| `WEB_HOST` | `127.0.0.1` | Bind address. Bind beyond loopback only with `WEB_TOKEN` set |
+| `WEB_PORT` | `8000` | Port |
+| `WEB_TOKEN` | *(unset)* | If set, every route but `/health` requires `Authorization: Bearer <token>` |
+| `AGENT_OUTPUT_DIR` | *(unset)* | Root for agent files; each agent gets `<root>/<program-slug>/`, served by `/agents/{id}/files` |
+| `MONGODB_RUNS_COLLECTION` | `runs` | Run records |
+| `MONGODB_RUN_EVENTS_COLLECTION` | `run_events` | Run events (one document per event, the resume cursor) |
+| `RUN_EVENTS_TTL` | *(unset)* | Seconds before stored events expire (Mongo TTL index) |
+
+Everything else (models, MongoDB, Ghidra transport, `SANDBOX`, …) comes from the same `.env` as the TUI. With `SANDBOX=openshell` each agent gets its **own** sandbox, created when the agent is created and deleted when it is deleted or the server stops; agent creation takes correspondingly longer, and a hard kill of the server can leave sandboxes behind.
+
+#### Walkthrough
+
+```bash
+S=http://127.0.0.1:8000
+
+curl $S/programs                                   # open in Ghidra, with project paths
+curl "$S/programs?project=true"                    # files in the Ghidra project
+curl -X POST $S/programs/open -H 'Content-Type: application/json' \
+     -d '{"path": "/firmware/boot.bin"}'            # open one in CodeBrowser
+
+curl -X POST $S/agents -H 'Content-Type: application/json' \
+     -d '{"program": "/firmware/boot.bin"}'         # -> {"id": "firmware_boot.bin-3f2a1c", "status": "ready", ...}
+
+# Start a turn. The response is immediate (202); the work runs in the background.
+curl -X POST $S/agents/$AGENT/runs -H 'Content-Type: application/json' \
+     -d '{"prompt": "map the init path and rename what you can prove", "session_id": "boot-1"}'
+# -> {"id": "8a1c...", "session_id": "boot-1", "status": "queued", "links": {...}}
+
+curl -N -H 'Accept: text/event-stream' $S/runs/$RUN/events        # live stream
+curl "$S/runs/$RUN/events?after=12"                                # JSON page after seq 12
+curl "$S/runs/$RUN/events?after=12&wait=30"                        # long-poll up to 30 s
+curl -X POST $S/runs/$RUN/wait -d '{"timeout": 600}' -H 'Content-Type: application/json'
+                                                                   # 200 when finished, 202 if still running
+curl -X POST $S/runs/$RUN/cancel
+
+# Ask a read-only question on the same session (its own thread, seeded from nothing but the prompt).
+curl -X POST $S/agents/$AGENT/runs -H 'Content-Type: application/json' \
+     -d '{"prompt": "is the parser reachable from the network?", "session_id": "boot-1", "mode": "ask"}'
+
+# After a usage-limit pause (status "paused"), resume the interrupted turn.
+curl -X POST $S/agents/$AGENT/runs -H 'Content-Type: application/json' \
+     -d '{"continue": true, "session_id": "boot-1"}'
+
+curl $S/sessions                                   # the same registry the TUI's /resume lists
+curl $S/sessions/boot-1/history                    # user/assistant messages on that thread
+curl $S/agents/$AGENT/files                        # files the agent wrote (AGENT_OUTPUT_DIR)
+curl $S/agents/$AGENT/files/notes/init.md
+curl -X DELETE $S/agents/$AGENT
+```
+
+Two runs on different agents (or different sessions of one agent) run concurrently. A second run on a thread that already has one is refused with `409 thread_busy` and the active run's id: wait on it, then resubmit. `GET /runs` lists past runs, and a run's events stay readable after it ends.
+
+#### Events
+
+Each event is `{seq, ts, type, data}`; `seq` starts at 1 per run and is the cursor for `?after=` and for SSE's `Last-Event-ID`. Types: `started`, `tool_start`, `tool_end`, `llm_start`, `llm_end`, `subagent_report` (the full text a sub-agent returned), `reply` (the coordinator's text; the last one is the answer), `usage`, `context`, `compaction`, `truncated`, `warning` (what the TUI would show as a toast), and one terminal event: `final` (`data.reply`, token totals), `paused`, `error` or `cancelled`. Streamed model tokens are not served.
+
+#### From Claude Code (or any agent)
+
+1. Pick the session id yourself (`"session_id": "$(uuidgen)"`) so it is known even if the call is interrupted.
+2. Create the agent, start the run, and read `links.wait` from the 202 body.
+3. For anything longer than a minute, run the follow-up in the background: `POST …/wait` with a generous timeout, or poll `GET …/events?after=<last seq>&wait=30` and act on `tool_start`/`reply` as they arrive. Both survive a dropped connection.
+4. The answer is `final.data.reply` (also `reply` on `GET /runs/{id}`). On `paused`, wait for the limit to clear and send `{"continue": true, "session_id": …}`.
+5. Files the agent wrote are under `/agents/{id}/files` when `AGENT_OUTPUT_DIR` is set.
+
+Limits in this version: plan mode (`/plan` → `/approve`) is TUI-only; two open programs with the **same name** in different project folders cannot both have agents (knowledge and cache are keyed by name); GhidrAssistMCP runs long tools on a small worker pool (4 by default), which caps throughput across agents; an agent whose program is closed in Ghidra goes `degraded` and refuses new runs until re-created.
 
 ## Development
 

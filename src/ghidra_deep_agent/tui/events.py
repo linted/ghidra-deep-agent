@@ -1,26 +1,22 @@
-"""Translation of LangGraph v2 stream events into Textual messages."""
+"""Adapter from the typed event stream to Textual messages.
+
+The rules for *which* LangGraph events matter live in
+:mod:`ghidra_deep_agent.stream` (shared with the HTTP server); this module only
+decides which widget each typed event is posted to.
+"""
 
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING, Any
 
-from ghidra_deep_agent.async_tasks import ASYNC_DONE_EVENT, async_task_id
-from ghidra_deep_agent.tui.formatting import (
-    extract_output_snippet,
-    extract_preview,
-    extract_stop_reason,
-    extract_subagent_report,
-    extract_text,
-    extract_usage,
-)
+from ghidra_deep_agent import stream
+from ghidra_deep_agent.stream import RunState, parse_checkpoint_ns
 from ghidra_deep_agent.tui.messages import (
     ContextUpdate,
     LLMDone,
     LLMThinking,
     ResponseFinal,
     StatusFlash,
-    SubagentReport,
     SubagentReportCaptured,
     TextToken,
     TokenUpdate,
@@ -28,22 +24,12 @@ from ghidra_deep_agent.tui.messages import (
     ToolEnded,
     ToolStarted,
 )
-from ghidra_deep_agent.tui.run_state import RunState
 
 if TYPE_CHECKING:
     from ghidra_deep_agent.tui.app import GhidraAgentApp
     from ghidra_deep_agent.tui.widgets import ActivityTree, ResponseLog, ThinkingPanel
 
-
-def parse_checkpoint_ns(checkpoint_ns: str) -> tuple[str, ...]:
-    """Split a LangGraph checkpoint namespace into its segments.
-
-    A namespace looks like "tools:<uuid>|tools:<inner_uuid>|…"; an empty
-    string (the root) parses to an empty tuple.
-    """
-    if not checkpoint_ns:
-        return ()
-    return tuple(checkpoint_ns.split("|"))
+__all__ = ["handle_event", "parse_checkpoint_ns"]
 
 
 def handle_event(
@@ -61,142 +47,45 @@ def handle_event(
     """
     if run is None:
         run = app.run_state
-    kind = event.get("event", "")
-    run_id: str = event.get("run_id", "")
-    metadata: dict[str, Any] = event.get("metadata", {})
-    checkpoint_ns: str = metadata.get("langgraph_checkpoint_ns", "")
-    is_compaction = metadata.get("lc_source") == "summarization"
-
-    if kind == "on_tool_start":
-        name = event.get("name", "")
-        # The async-task middleware polls `get_task_status` internally; those
-        # polls surface as tool runs but aren't the agent's work, so hide them
-        # (tracking the run_id keeps the paired on_tool_end + counter balanced).
-        if name == "get_task_status":
-            run.hidden_tool_runs.add(run_id)
-            return
-        # A tool call whose ancestry contains a plain tool run was made from
-        # inside that tool's body (e.g. recover_prototypes invoking `scripts`
-        # directly) — an implementation detail, so hide it. Sub-agent (`task`)
-        # runs are deliberately not tracked as parents: their inner tool calls
-        # are the sub-agent's real work and stay visible, nested via checkpoint
-        # namespaces. Hidden runs count as parents too, so a hidden call's own
-        # nested calls stay hidden.
-        parent_ids = event.get("parent_ids") or []
-        if any(
-            pid in run.active_tool_runs or pid in run.hidden_tool_runs
-            for pid in parent_ids
-        ):
-            run.hidden_tool_runs.add(run_id)
-            return
-        raw_input = event.get("data", {}).get("input", {})
-        preview = extract_preview(raw_input)
-        is_subagent = name == "task"
-        if not is_subagent:
-            run.active_tool_runs.add(run_id)
-        else:
-            description = (
-                raw_input.get("description") if isinstance(raw_input, dict) else None
-            )
-            run.subagent_meta[run_id] = (description or preview, time.monotonic())
-        activity.post_message(
-            ToolStarted(run_id, name, preview, is_subagent, checkpoint_ns)
-        )
-        app.post_message(ToolCountChanged(1))
-
-    elif kind == "on_tool_end":
-        run.active_tool_runs.discard(run_id)
-        if run_id in run.hidden_tool_runs:
-            run.hidden_tool_runs.discard(run_id)
-            return
-        output = event.get("data", {}).get("output")
-        error = bool(event.get("data", {}).get("error"))
-        meta = run.subagent_meta.pop(run_id, None)
-        if meta is not None:
-            # `task` is a local tool that can never return an async submission
-            # stub, so skip stub detection: its Command's str() contains the
-            # report text, and a report merely quoting a stub would otherwise
-            # defer this node forever. Keep the full report for ctrl+o.
-            description, started = meta
-            app.post_message(
-                SubagentReportCaptured(
-                    SubagentReport(
-                        run_id,
-                        description,
-                        extract_subagent_report(output),
-                        error,
-                        time.monotonic() - started,
+    for ev in stream.translate(event, run):
+        match ev:
+            case stream.ToolStart():
+                activity.post_message(
+                    ToolStarted(
+                        ev.call_id,
+                        ev.name,
+                        ev.preview,
+                        ev.is_subagent,
+                        ev.checkpoint_ns,
                     )
                 )
-            )
-            snippet = extract_output_snippet(output) if error else ""
-            activity.post_message(ToolEnded(run_id, error, snippet))
-            app.post_message(ToolCountChanged(-1))
-            return
-        # An async tool's own on_tool_end fires immediately with a submission
-        # stub, before the real result is polled. Defer its "completed" marker:
-        # remember the node by task_id and complete it on ASYNC_DONE_EVENT.
-        task_id = async_task_id(output) if not error else None
-        if task_id is not None:
-            run.pending_async[task_id] = run_id
-            return
-        snippet = extract_output_snippet(output) if error else ""
-        activity.post_message(ToolEnded(run_id, error, snippet))
-        app.post_message(ToolCountChanged(-1))
-
-    elif kind == "on_custom_event" and event.get("name") == ASYNC_DONE_EVENT:
-        task_id = event.get("data", {}).get("task_id")
-        done_run_id = run.pending_async.pop(task_id, None) if task_id else None
-        if done_run_id is not None:
-            activity.post_message(ToolEnded(done_run_id))
-            app.post_message(ToolCountChanged(-1))
-
-    elif kind == "on_chat_model_start":
-        if is_compaction:
-            app.post_message(StatusFlash("[yellow]⟳ Compacting context…[/yellow]"))
-        else:
-            activity.post_message(LLMThinking(run_id, checkpoint_ns))
-
-    elif kind == "on_chat_model_end":
-        if is_compaction:
-            app.post_message(StatusFlash("[green]✓ Context compacted[/green]"))
-        else:
-            activity.post_message(LLMDone(run_id))
-        output = event.get("data", {}).get("output")
-        # Truncation is otherwise invisible (an HTTP-success response that just
-        # stops): surface it so a run that dead-ends on a cut-off tool call is
-        # explainable from the status bar.
-        if not is_compaction and extract_stop_reason(output) in (
-            "max_tokens",
-            "length",
-        ):
-            app.post_message(
-                StatusFlash(
-                    "[red]⚠ Model response truncated at the output-token limit[/red]"
+                app.post_message(ToolCountChanged(1))
+            case stream.ToolEnd():
+                activity.post_message(ToolEnded(ev.call_id, ev.error, ev.snippet))
+                app.post_message(ToolCountChanged(-1))
+            case stream.SubagentReport():
+                # Keep the full report for ctrl+o.
+                app.post_message(SubagentReportCaptured(ev))
+            case stream.LLMStart():
+                activity.post_message(LLMThinking(ev.call_id, ev.checkpoint_ns))
+            case stream.LLMEnd():
+                activity.post_message(LLMDone(ev.call_id))
+            case stream.Compaction(phase="start"):
+                app.post_message(StatusFlash("[yellow]⟳ Compacting context…[/yellow]"))
+            case stream.Compaction():
+                app.post_message(StatusFlash("[green]✓ Context compacted[/green]"))
+            case stream.Truncated():
+                app.post_message(
+                    StatusFlash(
+                        "[red]⚠ Model response truncated at the "
+                        "output-token limit[/red]"
+                    )
                 )
-            )
-        usage = extract_usage(output)
-        if usage.input_tokens or usage.output_tokens:
-            app.post_message(TokenUpdate(usage.input_tokens, usage.output_tokens))
-        if not is_compaction and "|" not in checkpoint_ns and usage.input_tokens:
-            app.post_message(ContextUpdate(usage.input_tokens))
-        # Capture the main thread's latest message; the final one (the turn that
-        # ends the loop) wins, so the main window renders only that — not the
-        # intermediate narration accumulated mid-run.
-        if not is_compaction and "|" not in checkpoint_ns:
-            text = extract_text(output)
-            # Stash on the app synchronously so `_run_agent` can read it right
-            # after the stream loop (used as the plan text for `/approve`,
-            # independent of the async ResponseFinal/AgentDone message flow).
-            run.last_reply_text = text
-            response.post_message(ResponseFinal(text))
-
-    elif kind == "on_chat_model_stream":
-        if is_compaction:
-            return  # suppress summary tokens from the normal output panels
-        chunk = event.get("data", {}).get("chunk")
-        if chunk is None:
-            return
-        text = extract_text(chunk)
-        if text:
-            thinking.post_message(TextToken(text))
+            case stream.Usage():
+                app.post_message(TokenUpdate(ev.input_tokens, ev.output_tokens))
+            case stream.Context():
+                app.post_message(ContextUpdate(ev.input_tokens))
+            case stream.Reply():
+                response.post_message(ResponseFinal(ev.text))
+            case stream.Token():
+                thinking.post_message(TextToken(ev.text))
