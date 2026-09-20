@@ -12,6 +12,7 @@ from collections.abc import Generator
 import pytest
 
 import ghidra_deep_agent.toasts as toasts
+from ghidra_deep_agent.ghidra_script_tools import reset_deploy_cache
 from ghidra_deep_agent.mongo_util import close_mongo_clients
 from ghidra_deep_agent.toasts import ToastRequest, register_toast_sink
 
@@ -49,3 +50,11 @@ def captured_toasts() -> Generator[list[ToastRequest], None, None]:
         yield seen
     finally:
         unregister()
+
+
+@pytest.fixture(autouse=True)
+def _reset_deploy_cache() -> Generator[None, None, None]:
+    """The script deploy cache is process-global; each test starts undeployed."""
+    reset_deploy_cache()
+    yield
+    reset_deploy_cache()

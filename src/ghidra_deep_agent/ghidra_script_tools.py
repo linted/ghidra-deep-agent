@@ -12,6 +12,8 @@ default**. When it is absent, ``find_scripts_tools`` warns and returns ``None``,
 and the calling module returns no tools at all.
 """
 
+import asyncio
+import hashlib
 import json
 import re
 import sys
@@ -32,6 +34,21 @@ def script_timeout_s() -> float:
 
 # How much raw script output to echo back when no manifest could be found.
 _RAW_TAIL_CHARS = 800
+
+# Script deploys are process-wide state, not per-runner: every runner deploys
+# under the same fixed script names (`gda_recover_prototypes.java`, ...) into
+# Ghidra's one user-script directory. With several agents in one process, two
+# runners must not redeploy the same script while another agent's run of it is
+# in flight, and identical source need not be recompiled at all. The lock
+# serializes deploys; the cache (name -> (source digest, deploy output)) skips
+# a deploy whose source is already in place.
+_DEPLOY_LOCK = asyncio.Lock()
+_DEPLOYED: dict[str, tuple[str, str]] = {}
+
+
+def reset_deploy_cache() -> None:
+    """Forget every deployed script (tests, or after a Ghidra restart)."""
+    _DEPLOYED.clear()
 
 
 def manifest_pattern(mark_start: str, mark_end: str) -> re.Pattern[str]:
@@ -96,23 +113,30 @@ class GhidraScriptRunner:
     async def run(
         self, name: str, source: str, run_args: list[str] | None = None
     ) -> str:
-        """Redeploy the script and run it, returning its raw output.
+        """Deploy the script (if its source changed) and run it, returning raw output.
 
-        ``overwrite=True`` redeploys the current source each run, so a stale
-        older version can't execute and no separate delete step is needed. The
-        async task is resolved on both calls — a whole-program pass can take
-        minutes.
+        ``overwrite=True`` redeploys the current source whenever it differs from
+        what this process last deployed, so a stale older version can't execute
+        and no separate delete step is needed. The async task is resolved on
+        both calls — a whole-program pass can take minutes.
         """
-        create_args: dict[str, Any] = {
-            "action": "create",
-            "name": name,
-            "source": source,
-            "overwrite": True,
-        }
-        create_out = to_text(await self._scripts_tool.ainvoke(create_args))
-        self._last_deploy_output = await resolve_async_result(
-            create_out, self._status_tool, timeout_s=self._timeout_s
-        )
+        digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        async with _DEPLOY_LOCK:
+            cached = _DEPLOYED.get(name)
+            if cached is not None and cached[0] == digest:
+                self._last_deploy_output = cached[1]
+            else:
+                create_args: dict[str, Any] = {
+                    "action": "create",
+                    "name": name,
+                    "source": source,
+                    "overwrite": True,
+                }
+                create_out = to_text(await self._scripts_tool.ainvoke(create_args))
+                self._last_deploy_output = await resolve_async_result(
+                    create_out, self._status_tool, timeout_s=self._timeout_s
+                )
+                _DEPLOYED[name] = (digest, self._last_deploy_output)
 
         run_call: dict[str, Any] = {"action": "run", "name": name}
         if run_args:
