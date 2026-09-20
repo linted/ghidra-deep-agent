@@ -159,8 +159,17 @@ def test_resolve_override_matches_path_or_name_or_passes_through() -> None:
     assert asyncio.run(resolve_program(tools, "app.exe")) == ProgramRef(
         "app.exe", "/v1/app.exe"
     )
-    # Unknown override: used verbatim (the server's name matching may still
-    # resolve it), and the listing is not required to succeed.
+    # Unknown override with one program open: the label is kept (it is the
+    # knowledge-base key) and the open program is what gets pinned.
+    one = [FakeTool("list_binaries", ONE_OPEN)]
+    assert asyncio.run(resolve_program(one, "my-label")) == ProgramRef(
+        "my-label", "/libdxp.so"
+    )
+    # Unknown override, ambiguous or unlistable: used verbatim (the server's
+    # name matching may still resolve it).
+    assert asyncio.run(resolve_program(tools, "mystery.bin")) == ProgramRef(
+        "mystery.bin", "mystery.bin"
+    )
     broken = [FakeTool("list_binaries", RuntimeError("down"))]
     assert asyncio.run(resolve_program(broken, "mystery.bin")) == ProgramRef(
         "mystery.bin", "mystery.bin"

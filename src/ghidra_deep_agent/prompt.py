@@ -307,6 +307,14 @@ ASK_MODE_SYSTEM_PROMPT = (
 )
 
 
+# Prefixed to every user turn in ask mode (TUI `/ask` and the server's
+# mode=ask), so the read-only graph gets the same standing instruction either way.
+ASK_MODE_TURN_PREFIX = (
+    "[Ask mode — decompose the question(s), delegate investigation "
+    "to the research sub-agent, and synthesize a grounded, cited answer]"
+)
+
+
 PLAN_CONTEXT_SUMMARY_PROMPT = (
     "Below is the transcript of a reverse-engineering session with a Ghidra "
     "agent. Write a concise, factual digest of what has happened so far, for "

@@ -245,9 +245,11 @@ async def resolve_program(
     """Decide which open program this agent works on.
 
     ``override`` (``--binary-name`` / ``BINARY_NAME``) wins: matched against the
-    open programs by path or name when possible, else used verbatim as both
-    (the server's name matching still resolves it). Otherwise a single open
-    program is picked automatically; several need ``choose``.
+    open programs by path or name when possible. An override matching nothing
+    stays the knowledge label (that is what the flag has always been) and pins
+    the single open program if there is exactly one, else is used verbatim as
+    the pin too (the server's name matching may still resolve it). Otherwise a
+    single open program is picked automatically; several need ``choose``.
     """
     if override:
         try:
@@ -257,6 +259,8 @@ async def resolve_program(
         entry = find_program(programs, override)
         if entry is not None:
             return ProgramRef(entry.name, entry.project_path)
+        if len(programs) == 1:
+            return ProgramRef(override, programs[0].project_path)
         return ProgramRef(override, override)
 
     programs = await list_open_programs(tools)

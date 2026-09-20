@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from ghidra_deep_agent.prompt import ASK_MODE_TURN_PREFIX
+
 Kind = Literal["plan", "ask"]
 
 
@@ -53,9 +55,5 @@ class SideMode:
                 f"`{self.plan_path}`]\n\n{query}"
             )
         if self.is_ask:
-            return (
-                "[Ask mode — decompose the question(s), delegate investigation "
-                "to the research sub-agent, and synthesize a grounded, cited "
-                f"answer]\n\n{query}"
-            )
+            return f"{ASK_MODE_TURN_PREFIX}\n\n{query}"
         return query

@@ -21,7 +21,7 @@ from deepagents.backends import StateBackend
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.tools import BaseTool
 
-from ghidra_deep_agent.cli import _read_only_delegates
+from ghidra_deep_agent.runtime import _read_only_delegates
 from ghidra_deep_agent.subagents import (
     ALL_WRITE_ACTIONS,
     MUTATION_TOOLS,

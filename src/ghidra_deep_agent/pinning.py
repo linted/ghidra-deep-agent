@@ -20,9 +20,12 @@ from __future__ import annotations
 
 import re
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, cast
 
-from langchain_mcp_adapters.interceptors import MCPToolCallRequest
+from langchain_mcp_adapters.interceptors import (
+    MCPToolCallRequest,
+    ToolCallInterceptor,
+)
 
 from ghidra_deep_agent.async_tasks import to_text
 from ghidra_deep_agent.program_resolver import ProgramRef
@@ -82,7 +85,7 @@ def pin_program(
     *,
     verify: bool = True,
     on_mismatch: OnMismatch | None = None,
-) -> Callable[[MCPToolCallRequest, Handler], Awaitable[Any]]:
+) -> ToolCallInterceptor:
     """Build the interceptor that binds every program-targeting call to one program.
 
     ``program_name`` is always overridden, even when the model supplied one: an
@@ -107,7 +110,9 @@ def pin_program(
                 )
         return result
 
-    return interceptor
+    # The adapter's Protocol spells out its result union; this interceptor is
+    # transparent to it (it returns whatever the handler returned).
+    return cast(ToolCallInterceptor, interceptor)
 
 
 async def verify_pinned(tools: list[Any], program: ProgramRef) -> None:
