@@ -37,22 +37,53 @@ from ghidra_deep_agent.context_pruning import (
 BIG = "int x = 0;\n" * 400  # ~1.1k tokens per result under the approximate counter
 
 
-class FakeJudge:
-    """Scripted Jev: ``P(keep)`` per tool name, recording every request."""
+def _bad_request(body: Any) -> Exception:
+    """A TypeSafe 400 carrying ``body`` (which the SDK keeps out of ``str``)."""
+    import httpx2
+    from langchain_typesafe.client import TypeSafeBadRequestError
 
-    def __init__(self, keep: dict[str, float], *, fail: Exception | None = None):
+    return TypeSafeBadRequestError(400, body, httpx2.Headers(), None, "POST /x")
+
+
+def _too_large() -> Exception:
+    """The 400 Jev returns for a state over its token budget."""
+    return _bad_request({"detail": {"error_type": "max_tokens_exceeded"}})
+
+
+class FakeJudge:
+    """Scripted Jev: ``P(keep)`` per tool name, recording every request.
+
+    ``fail`` is raised on every request, or only on those that include
+    ``fail_on_tool``; ``max_keys`` makes bigger requests fail as too large.
+    """
+
+    def __init__(
+        self,
+        keep: dict[str, float],
+        *,
+        fail: Exception | None = None,
+        fail_on_tool: str | None = None,
+        max_keys: int | None = None,
+    ):
         self.keep = keep
         self.fail = fail
+        self.fail_on_tool = fail_on_tool
+        self.max_keys = max_keys
         self.calls: list[tuple[dict[str, Any], list[str]]] = []
 
     def _answer(self, state: dict[str, Any], keys: list[str]) -> Judgement:
         self.calls.append((state, keys))
-        if self.fail is not None:
+        if self.max_keys is not None and len(keys) > self.max_keys:
+            raise _too_large()
+        tools = {state["exchanges"][key]["tool"] for key in keys}
+        if self.fail is not None and (
+            self.fail_on_tool is None or self.fail_on_tool in tools
+        ):
             raise self.fail
         probs = {
             key: self.keep.get(state["exchanges"][key]["tool"], 1.0) for key in keys
         }
-        return Judgement(probs, input_tokens=100)
+        return Judgement(probs, input_tokens=100, model="fake-1.0")
 
     def judge(self, state: dict[str, Any], keys: Any) -> Judgement:
         return self._answer(state, list(keys))
@@ -131,6 +162,9 @@ def _mw(judge: FakeJudge, **kwargs: Any) -> JevContextPruningMiddleware:
     kwargs.setdefault("trigger_tokens", 1)
     kwargs.setdefault("keep_recent", 1)
     kwargs.setdefault("min_tokens", 100)
+    # Most tests pack candidates into one request to inspect a single call;
+    # the production default (one exchange per request) has its own test.
+    kwargs.setdefault("batch_questions", 16)
     return JevContextPruningMiddleware(judge=judge, **kwargs)
 
 
@@ -234,16 +268,83 @@ def test_state_sent_to_jev_carries_goal_and_excerpts() -> None:
     assert len(entry["result"]) < 400
 
 
-def test_batches_respect_the_state_budget() -> None:
+def test_default_is_one_exchange_per_request() -> None:
+    judge = FakeJudge({"get_code": 0.0})
+    mw = JevContextPruningMiddleware(
+        judge=judge, trigger_tokens=1, keep_recent=1, min_tokens=100
+    )
+    sent = _run(mw, _history(["get_code", "get_code", "get_code", "xrefs"]))
+    assert [len(keys) for _, keys in judge.calls] == [1, 1, 1]
+    assert all(_is_placeholder(sent[i]) for i in (2, 4, 6))
+
+
+def test_whole_program_scans_are_never_pruned() -> None:
+    judge = FakeJudge({}, fail=RuntimeError("should not be asked"))
+    mw = _mw(judge)  # default exclude list
+    tools = ["find_unrecovered_switches", "recover_prototypes", "deobfuscate_cff"]
+    msgs = _history([*tools, "task", "xrefs"])
+    assert _run(mw, msgs) == msgs
+    assert judge.calls == []
+
+
+def test_batches_are_sized_in_jev_tokens() -> None:
     judge = FakeJudge({})
-    mw = _mw(judge, batch_tokens=3_000, batch_questions=3)
+    mw = _mw(judge, batch_tokens=8_000, batch_questions=3)
     msgs = _history(["get_code"] * 9)
     _run(mw, msgs)
-    # 8 candidates at ~1.1k tokens each: the token budget (~2 per batch) binds
-    # before the question cap.
-    assert len(judge.calls) >= 4
-    assert all(len(keys) <= 3 for _, keys in judge.calls)
-    assert sum(len(keys) for _, keys in judge.calls) == 8
+    # 8 candidates of 4.4k chars: ~3.4k Jev tokens each at 1.3 chars/token
+    # (only ~1.1k under the model-side estimate, which would fit six). Two fit
+    # an 8k budget, so the token budget binds before the question cap.
+    assert [len(keys) for _, keys in judge.calls] == [2, 2, 2, 2]
+
+
+def test_too_large_batch_is_split_and_retried() -> None:
+    judge = FakeJudge({"get_code": 0.0}, max_keys=1)
+    log = FakeCollection()
+    mw = _mw(judge, batch_questions=4, log=PruneLog(log))  # type: ignore[arg-type]
+    msgs = _history(["get_code"] * 5)
+    sent = _run(mw, msgs)
+    # One batch of four -> two of two -> four singles: 7 requests, 3 rejected.
+    assert [len(keys) for _, keys in judge.calls] == [4, 2, 2, 1, 1, 1, 1]
+    assert all(_is_placeholder(sent[i]) for i in (2, 4, 6, 8))
+    assert mw.failures == 0 and mw.judged == 4
+    assert log.docs[0]["error"] is None
+    assert log.docs[0]["jev_requests"] == 4
+    assert log.docs[0]["jev_failed_requests"] == 3
+
+    # The sync hook splits the same way.
+    judge2 = FakeJudge({"get_code": 0.0}, max_keys=1)
+    mw2 = _mw(judge2, batch_questions=4)
+    seen: list[list[Any]] = []
+
+    def handler(req: ModelRequest) -> ModelResponse:
+        seen.append(list(req.messages))
+        return ModelResponse(result=[AIMessage(content="ok")])
+
+    mw2.wrap_model_call(_request(msgs), handler)
+    assert len(judge2.calls) == 7
+    assert all(_is_placeholder(seen[0][i]) for i in (2, 4, 6, 8))
+
+
+def test_one_failed_batch_does_not_sink_the_pass() -> None:
+    from langchain_typesafe.client import TypeSafeAPIConnectionError
+
+    judge = FakeJudge(
+        {"get_code": 0.0, "xrefs": 0.0},
+        fail=TypeSafeAPIConnectionError("no route"),
+        fail_on_tool="xrefs",
+    )
+    log = FakeCollection()
+    mw = _mw(judge, batch_questions=1, log=PruneLog(log))  # type: ignore[arg-type]
+    msgs = _history(["get_code", "xrefs", "get_code", "strings"])
+    sent = _run(mw, msgs)
+    assert _is_placeholder(sent[2]) and _is_placeholder(sent[6])
+    assert sent[4].text == BIG  # its batch failed: sent unpruned
+    assert mw.failures == 1 and mw.judged == 2
+    assert log.docs[0]["error"].startswith("TypeSafeAPIConnectionError")
+    assert log.docs[0]["jev_requests"] == 2
+    assert log.docs[0]["jev_failed_requests"] == 1
+    assert log.docs[0]["evicted"] == 2
 
 
 def test_fails_open_on_jev_error(capsys: pytest.CaptureFixture[str]) -> None:
@@ -259,6 +360,34 @@ def test_fails_open_on_jev_error(capsys: pytest.CaptureFixture[str]) -> None:
     assert capsys.readouterr().err.count("Jev context pruning failed") == 1
     assert log.docs[0]["error"].startswith("TypeSafeAPIConnectionError")
     assert log.docs[0]["evicted"] == 0
+
+
+def test_logged_error_includes_the_response_body() -> None:
+    err = _bad_request({"detail": "bad state"})
+    judge = FakeJudge({}, fail=err)
+    log = FakeCollection()
+    mw = _mw(judge, log=PruneLog(log))  # type: ignore[arg-type]
+    _run(mw, _history(["get_code", "xrefs"]))
+    assert "body=" not in str(err)  # the SDK keeps it out of str(exc)...
+    assert "body={'detail': 'bad state'}" in log.docs[0]["error"]  # ...we don't
+
+
+def test_truncation_nudge_does_not_change_the_goal() -> None:
+    from ghidra_deep_agent.resilience import _TRUNCATION_NUDGE
+
+    judge = FakeJudge({"get_code": 0.9})
+    mw = _mw(judge)
+    msgs = _history(["get_code", "xrefs"])
+    _run(mw, msgs)
+    assert len(judge.calls) == 1
+    nudged = msgs + [
+        HumanMessage(content=_TRUNCATION_NUDGE),
+        AIMessage(content="Continuing where I left off."),
+    ]
+    _run(mw, nudged)
+    assert len(judge.calls) == 1  # the kept verdict was not re-asked
+    state, _ = judge.calls[0]
+    assert state["latest_request"] == state["task"]
 
 
 def test_no_human_message_means_no_pruning() -> None:
@@ -330,12 +459,18 @@ def test_factory_reads_knobs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("JEV_PRUNE_TRIGGER_TOKENS", "12345")
     monkeypatch.setenv("JEV_PRUNE_KEEP_RECENT", "0")
     monkeypatch.setenv("JEV_PRUNE_EXCLUDE_TOOLS", "task, write_file")
+    monkeypatch.setenv("JEV_MODEL", " jev-9.9.9 ")
     mw = build_context_pruning_middleware("u", "d", "sess", "bin")
     assert mw is not None
     assert mw._threshold == 0.35
     assert mw._trigger == 12345
     assert mw._keep_recent == 0
     assert mw._exclude == {"task", "write_file"}
+    assert mw._judge._model == "jev-9.9.9"  # type: ignore[attr-defined]
+    monkeypatch.delenv("JEV_MODEL")
+    mw = build_context_pruning_middleware("u", "d", "sess", "bin")
+    assert mw is not None
+    assert mw._judge._model == "jev-1.13.0"  # type: ignore[attr-defined]
     assert mw._log is None
     assert mw._session_id == "sess" and mw._binary == "bin"
 
@@ -361,6 +496,7 @@ def test_log_document_per_pass() -> None:
     assert first["candidates"] == 2 and first["judged"] == 2
     assert first["evicted"] == 1
     assert first["jev_requests"] == 1 and first["jev_input_tokens"] == 100
+    assert first["jev_model"] == "fake-1.0"
     by_tool = {d["tool"]: d for d in first["decisions"]}
     assert by_tool["get_code"]["evicted"] and by_tool["get_code"]["p_keep"] == 0.1
     assert not by_tool["xrefs"]["evicted"]
@@ -368,6 +504,7 @@ def test_log_document_per_pass() -> None:
     # Second pass: same saving, no Jev traffic, verdicts marked memoized.
     assert second["tokens_saved"] == first["tokens_saved"]
     assert second["jev_requests"] == 0 and second["judged"] == 0
+    assert second["jev_model"] is None  # no Jev traffic this pass
     assert all(d["memoized"] for d in second["decisions"])
 
 
@@ -376,6 +513,18 @@ def test_log_failure_never_reaches_the_model_call() -> None:
     mw = _mw(judge, log=PruneLog(FakeCollection(fail=True)))  # type: ignore[arg-type]
     sent = _run(mw, _history(["get_code", "xrefs"]))
     assert _is_placeholder(sent[2])
+
+
+def _decision(
+    tool: str, p_keep: float, evicted: bool, memoized: bool = False
+) -> dict[str, Any]:
+    return {
+        "tool": tool,
+        "tokens": 5_000,
+        "p_keep": p_keep,
+        "evicted": evicted,
+        "memoized": memoized,
+    }
 
 
 def _doc(session: str, ts: datetime, **overrides: Any) -> dict[str, Any]:
@@ -395,11 +544,12 @@ def _doc(session: str, ts: datetime, **overrides: Any) -> dict[str, Any]:
         "jev_requests": 1,
         "jev_input_tokens": 20_000,
         "jev_latency_ms": 300,
+        "jev_model": "jev-1.13.0",
         "decisions": [
-            {"tool": "get_code", "p_keep": 0.05, "evicted": True, "memoized": False},
-            {"tool": "get_code", "p_keep": 0.12, "evicted": True, "memoized": False},
-            {"tool": "xrefs", "p_keep": 0.15, "evicted": True, "memoized": False},
-            {"tool": "xrefs", "p_keep": 0.95, "evicted": False, "memoized": False},
+            _decision("get_code", 0.05, True),
+            _decision("get_code", 0.12, True),
+            _decision("xrefs", 0.15, True),
+            _decision("xrefs", 0.95, False),
         ],
         "error": None,
     }
@@ -418,9 +568,7 @@ def test_report_aggregates_the_log() -> None:
             judged=0,
             jev_requests=0,
             jev_input_tokens=0,
-            decisions=[
-                {"tool": "get_code", "p_keep": 0.05, "evicted": True, "memoized": True}
-            ],
+            decisions=[_decision("get_code", 0.05, True, memoized=True)],
         ),
         _doc(
             "s2",
@@ -441,10 +589,15 @@ def test_report_aggregates_the_log() -> None:
     assert "evictions in effect: 6 summed over passes (20% of exchanges seen)" in text
     assert "saved ~30,000" in text
     assert "20,000 input tokens ≈ $0.0008" in text
+    assert "models: jev-1.13.0 (3 passes)" in text
     assert "s1: 2 passes, 6 evicted, saved ~30,000 of ~80,000 (38%)" in text
     assert "get_code: 2 judged, 2 evicted (100%)" in text  # memoized not re-counted
     assert "xrefs: 2 judged, 1 evicted (50%)" in text
     assert "0.0–0.1" in text and "0.9–1.0" in text
+    # Sweep counts every decision in effect (memoized too), like the headline.
+    assert "0.2: ~20,000 (17%)" in text
+    assert "0.7: ~20,000 (17%)" in text
+    assert "Fail-open causes (passes):\n      1  TypeSafeAPITimeoutError: 10s" in text
 
     assert "sessions: 1" in report(coll, session_id="s2")  # type: ignore[arg-type]
     assert "sessions: 1" in report(coll, since=timedelta(days=1))  # type: ignore[arg-type]
@@ -456,7 +609,12 @@ def test_report_aggregates_the_log() -> None:
 
 @pytest.mark.integration
 def test_live_jev_separates_stale_from_needed() -> None:
-    """Needs TYPESAFE_API_KEY. One tiny history, two obvious verdicts."""
+    """Needs TYPESAFE_API_KEY. One tiny history, two obvious verdicts.
+
+    The activity must leave the decompilation still in use: an earlier version
+    said "I will rename it aes_key_expand", and Jev (rightly) scored the result
+    as already acted on (P(keep) ≈ 0.25).
+    """
     if not os.environ.get("TYPESAFE_API_KEY"):
         pytest.skip("TYPESAFE_API_KEY not set")
     from ghidra_deep_agent.context_pruning import JevJudge
@@ -465,8 +623,8 @@ def test_live_jev_separates_stale_from_needed() -> None:
     state = {
         "task": "Rename the function at 0x401000 based on what it does.",
         "latest_request": "Rename the function at 0x401000 based on what it does.",
-        "recent_activity": "The decompilation at 0x401000 shows an AES key "
-        "schedule; I will rename it aes_key_expand.",
+        "recent_activity": "I have the decompilation of 0x401000 and still need "
+        "to trace its loop structure and constants before I can pick a name.",
         "exchanges": {
             "x0": {
                 "tool": "get_code",

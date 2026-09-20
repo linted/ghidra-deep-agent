@@ -59,10 +59,11 @@ All configuration is done via environment variables (`.env` file or shell export
 | `COMPACT_MAIN_KEEP_TOKENS` | *(deepagents default: 6 messages)* | **Coordinator:** recent history kept after a compaction (`COMPACT_MAIN_KEEP_MESSAGES` also accepted) |
 | `TYPESAFE_API_KEY` | *(unset)* | Enables [context pruning with TypeSafe Jev](#context-pruning-with-typesafe-jev-optional): stale tool results are blanked from each model call |
 | `JEV_PRUNE` | `1` | Set to `0` to keep the key configured but leave pruning off |
-| `JEV_PRUNE_THRESHOLD` | `0.2` | Evict a tool result when Jev's P(still needed) is below this |
+| `JEV_PRUNE_THRESHOLD` | `0.5` | Evict a tool result when Jev's P(still needed) is below this |
 | `JEV_PRUNE_TRIGGER_TOKENS` | `20000` | Message-history size (system prompt excluded) at which pruning starts |
 | `JEV_PRUNE_KEEP_RECENT` | `4` | Most recent tool exchanges that are never judged |
-| `JEV_PRUNE_EXCLUDE_TOOLS` | `task` | Comma-separated tools whose results are never pruned (sub-agent reports by default) |
+| `JEV_PRUNE_EXCLUDE_TOOLS` | `task,find_unrecovered_switches,recover_prototypes,deobfuscate_cff` | Comma-separated tools whose results are never pruned: sub-agent reports and the whole-program scans, whose results are worklists that cost minutes to regenerate |
+| `JEV_MODEL` | `jev-1.13.0` | Jev version asked; pinned because the threshold was tuned against it (`jev-latest` moves on release) |
 | `JEV_PRUNE_DEBUG` | *(unset)* | Set to print one `[jev-prune]` line per pass to stderr |
 | `JEV_PRUNE_LOG` | `1` | Set to `0` to skip the MongoDB savings log |
 | `MONGODB_PRUNE_LOG_COLLECTION` | `jev_prune_log` | Collection the savings log is written to |
@@ -110,7 +111,7 @@ call long after the agent is done with them. With a `TYPESAFE_API_KEY` set
 (`pip`-free: the `langchain-typesafe` package is already a dependency), a
 middleware asks [Jev](https://typesafe.ai) — a classification model that
 returns calibrated probabilities, not text — one yes/no question per older tool
-result on every model call: *does the agent still need this to finish the task?*
+result on every model call, one result per request so nothing else distracts it: *does the agent still need this to finish the task?*
 Results judged stale are replaced, **for that request only**, by a one-line
 placeholder naming the tool so the model can re-run it. Everything else is sent
 verbatim; nothing is summarized and the checkpoint is never modified. A pass over
@@ -122,8 +123,11 @@ summarizes, and offloads the *raw* history at its usual thresholds, so once
 pruning proves out you may want to raise `COMPACT_TRIGGER_TOKENS`. `/compact`
 is unaffected. Verdicts are memoized per tool call — an eviction is permanent,
 and a "keep" is re-asked only when the task or the latest user message changes —
-so the prompt prefix stays stable for provider-side caching. Any Jev failure
-fails open and the request goes out unpruned.
+so the prompt prefix stays stable for provider-side caching. Batches are sized
+in Jev's own tokens (it counts disassembly at roughly 1.3 characters per token,
+three times denser than the model-side estimate); a batch Jev still rejects as
+too large is split and retried, and any other Jev failure fails open for that
+batch alone, with the rest of the request still pruned.
 
 Every pass is recorded to MongoDB (`jev_prune_log`, one document per model
 call with `tokens_before`/`tokens_after`/`tokens_saved`, counts, Jev usage, and
@@ -136,8 +140,11 @@ uv run python -m ghidra_deep_agent.context_pruning report --session <id>
 ```
 
 The report shows tokens saved (summed over passes, since the whole context is
-resent each call), the eviction rate per tool, Jev's own cost, and a histogram
-of P(keep) verdicts for tuning `JEV_PRUNE_THRESHOLD`.
+resent each call), the eviction rate per tool, Jev's own cost, a histogram of
+P(keep) verdicts, what each alternative `JEV_PRUNE_THRESHOLD` would have saved,
+and the causes of any fail-open passes. On the first measured session Jev put
+results the agent had already acted on at P(keep) 0.3–0.5 and ones it was still
+using at 0.55+, hence the 0.5 default.
 
 ### Using Ollama
 

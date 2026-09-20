@@ -18,9 +18,12 @@ How it works, per model call (``wrap_model_call``):
    probabilities rather than text — one ``Noul`` question per candidate:
    *does the agent still need this result in working memory to finish the
    task?* Candidates are packed into batched requests under Jev's state budget
-   and judged concurrently. Decisions are memoized per ``tool_call_id``:
+   (counted in *Jev's* tokens — it tokenizes disassembly at ~1.3 chars/token,
+   three times denser than the model-side estimate) and judged concurrently.
+   A batch Jev rejects as too large is split and retried; any other failure
+   drops only that batch. Decisions are memoized per ``tool_call_id``:
    eviction is permanent, and a "keep" is re-asked only when the goal (first +
-   latest human message) changes.
+   latest human message, ignoring the truncation-recovery nudge) changes.
 4. Replace each evicted ``ToolMessage``'s content with a short placeholder that
    names the tool so the model can re-run it (cheap where the MCP read cache
    serves it). The ``AIMessage`` and every identity field stay intact.
@@ -28,7 +31,7 @@ How it works, per model call (``wrap_model_call``):
 The rewrite is **per request only**: ``state["messages"]`` is never touched, so
 the checkpoint, ``/compact``, and the summarizer (which sits outside this
 middleware and still counts, summarizes, and offloads the raw history) are all
-unaffected. Any Jev failure fails open — the request goes out unpruned.
+unaffected. Any Jev failure fails open — the affected results go out unpruned.
 
 Every pass above the trigger is recorded to a MongoDB collection (one document
 per model call, with per-exchange decisions) so the saving can be measured;
@@ -37,10 +40,14 @@ per model call, with per-exchange decisions) so the saving can be measured;
 Configuration (env):
   TYPESAFE_API_KEY               enables pruning (unset: middleware not installed)
   JEV_PRUNE                      ``0`` disables pruning even with a key
-  JEV_PRUNE_THRESHOLD            evict when P(keep) is below this (default 0.2)
+  JEV_PRUNE_THRESHOLD            evict when P(keep) is below this (default 0.5)
   JEV_PRUNE_TRIGGER_TOKENS       history size that starts pruning (default 20000)
   JEV_PRUNE_KEEP_RECENT          most recent exchanges never judged (default 4)
-  JEV_PRUNE_EXCLUDE_TOOLS        comma-separated tools never pruned (default: task)
+  JEV_PRUNE_EXCLUDE_TOOLS        comma-separated tools never pruned (default: task
+                                 plus the whole-program scans, whose results are
+                                 worklists and cost minutes to regenerate)
+  JEV_MODEL                      Jev version to ask (default ``jev-1.13.0``, the
+                                 one the threshold was tuned against)
   JEV_PRUNE_DEBUG                set to log each pass to stderr
   JEV_PRUNE_LOG                  ``0`` disables the MongoDB savings log
   MONGODB_PRUNE_LOG_COLLECTION   savings-log collection (default ``jev_prune_log``)
@@ -69,19 +76,53 @@ from pymongo.collection import Collection
 
 from ghidra_deep_agent.defaults import env_float, env_int
 from ghidra_deep_agent.mongo_util import get_mongo_client, mongo_write_with_retry
+from ghidra_deep_agent.resilience import is_truncation_nudge
 
-DEFAULT_THRESHOLD = 0.2
+# Jev's P(keep) sits at 0.3–0.5 for results the agent has already acted on
+# (mutation confirmations, notes it has read) and at 0.55+ for ones it is still
+# working from, on the first measured session (2026-09-20: 33 of 57 verdicts in
+# 0.4–0.5; a 0.2 threshold evicted 2). Evicting below 0.5 — "Jev does not lean
+# keep" — separates those; a wrong eviction costs one re-run of the tool.
+DEFAULT_THRESHOLD = 0.5
 DEFAULT_TRIGGER_TOKENS = 20_000
 DEFAULT_KEEP_RECENT = 4
 DEFAULT_MIN_TOKENS = 500
-DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset({"task"})
-# Jev's budget is 32k tokens for the state plus the longest question, 64k per
-# request in total. The excerpt cap keeps one dump from eating a batch, and
-# the batch caps keep a request comfortably under both limits.
-DEFAULT_RESULT_EXCERPT_TOKENS = 6_000
+# Never pruned: sub-agent reports, and the whole-program scans whose output is
+# the worklist the agent works from and whose re-run costs minutes (they share
+# GHIDRA_RECOVER_TIMEOUT). Jev sits near 0.5 on a partly worked-through
+# worklist, so the placeholder's "re-run it" would be an expensive mistake.
+DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
+    {"task", "find_unrecovered_switches", "recover_prototypes", "deobfuscate_cff"}
+)
+# Jev tokenizes decompiler and disassembly output at ~1.33 chars per token
+# (measured), three times denser than the ~4 chars/token the model-side counter
+# assumes. Every Jev-facing budget below is in Jev tokens via this ratio.
+JEV_CHARS_PER_TOKEN = 1.3
+# Jev's state budget is 32k of its tokens (plus the longest question); requests
+# over it are rejected with a 400 ``max_tokens_exceeded``. The batch cap keeps
+# the fixed fields, every excerpt, and JSON overhead well under it; a batch that
+# still overflows is split and retried.
 DEFAULT_BATCH_TOKENS = 20_000
-DEFAULT_BATCH_QUESTIONS = 16
+# One exchange per request. Jev's accuracy drops as the state fills with
+# material unrelated to the question (docs: "large state full of irrelevant
+# detail"), and packing exchanges together measurably pulled verdicts toward
+# the undecided middle: on the same 11 results, solo vs. 16-per-request moved
+# P(keep) by up to 0.17 with run-to-run noise under 0.03. Requests run
+# concurrently, so latency is unchanged; the fixed fields are re-sent per
+# request, about a quarter more Jev tokens.
+DEFAULT_BATCH_QUESTIONS = 1
+# The Jev version to ask. Pinned rather than ``jev-latest`` because the
+# threshold above was tuned against this version's calibration and the alias
+# moves on release; the responding model is logged with every pass.
+DEFAULT_MODEL = "jev-1.13.0"
+# Excerpt cap per result, in model tokens (~4 chars each): 1,500 is ~4.6k Jev
+# tokens, and verdicts measured within ±0.05 of those from 6,000-token excerpts.
+DEFAULT_RESULT_EXCERPT_TOKENS = 1_500
 DEFAULT_TIMEOUT = 10.0
+# Fixed per-batch overhead in Jev tokens: JSON structure plus one question's
+# instructions and criteria for each member.
+_BATCH_OVERHEAD_TOKENS = 200
+_QUESTION_OVERHEAD_TOKENS = 250
 _GOAL_MAX_CHARS = 2_000
 _ARGS_MAX_CHARS = 1_000
 _ACTIVITY_MAX_CHARS = 1_000
@@ -119,6 +160,7 @@ class Judgement:
 
     keep_probabilities: dict[str, float]
     input_tokens: int | None = None
+    model: str | None = None  # the versioned model id that answered
 
 
 class Judge(Protocol):
@@ -149,9 +191,12 @@ class JevJudge:
     connection pool is not.
     """
 
-    def __init__(self, *, timeout: float = DEFAULT_TIMEOUT) -> None:
+    def __init__(
+        self, *, model: str = DEFAULT_MODEL, timeout: float = DEFAULT_TIMEOUT
+    ) -> None:
         import httpx2
 
+        self._model = model
         self._timeout = timeout
         self._client = httpx2.Client(timeout=timeout)
         self._async_client = httpx2.AsyncClient(timeout=timeout)
@@ -166,6 +211,7 @@ class JevJudge:
             warnings.simplefilter("ignore", LangChainBetaWarning)
             return TypeSafeClassifier(
                 questions=_questions(keys),
+                model=self._model,
                 timeout=self._timeout,
                 client=self._client,
                 async_client=self._async_client,
@@ -176,13 +222,31 @@ class JevJudge:
         nouls = response.nouls
         # A key Jev did not answer is treated as "keep": never evict on silence.
         probs = {key: nouls[key].noul for key in keys if key in nouls}
-        return Judgement(probs, response.usage.input_tokens)
+        return Judgement(probs, response.usage.input_tokens, response.model)
 
     def judge(self, state: dict[str, Any], keys: Sequence[str]) -> Judgement:
         return self._judgement(self._classifier(keys).invoke(state), keys)
 
     async def ajudge(self, state: dict[str, Any], keys: Sequence[str]) -> Judgement:
         return self._judgement(await self._classifier(keys).ainvoke(state), keys)
+
+
+def _is_too_large(exc: Exception) -> bool:
+    """Jev's 400 for a state over its token budget (``max_tokens_exceeded``)."""
+    body = getattr(exc, "body", None)
+    detail = body.get("detail") if isinstance(body, dict) else None
+    return (
+        isinstance(detail, dict) and detail.get("error_type") == "max_tokens_exceeded"
+    )
+
+
+def _describe(exc: Exception) -> str:
+    """``str(exc)`` plus the response body the TypeSafe SDK keeps out of it."""
+    text = f"{type(exc).__name__}: {exc}"
+    body = getattr(exc, "body", None)
+    if body is not None:
+        text += f" body={str(body)[:300]}"
+    return text
 
 
 # --- Savings log ------------------------------------------------------------------
@@ -251,12 +315,14 @@ class _Pass:
     candidates: int = 0
     judged: int = 0
     jev_requests: int = 0
+    jev_failed_requests: int = 0
     jev_input_tokens: int = 0
     jev_latency_ms: int = 0
+    jev_model: str | None = None  # versioned id that answered this pass
     decisions: list[dict[str, Any]] = field(default_factory=list)
     # tool_call_ids whose verdict was made in this pass (vs. memoized earlier).
     judged_ids: set[str] = field(default_factory=set)
-    error: str | None = None
+    error: str | None = None  # first failure; the pass carries on without it
     tokens_after: int = 0
 
     @property
@@ -276,8 +342,12 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _excerpt(text: str, max_tokens: int) -> str:
-    """Head-and-tail excerpt so one dump can't eat a Jev batch."""
-    limit = max_tokens * 4  # the same chars-per-token estimate the counter uses
+    """Head-and-tail excerpt so one dump can't eat a Jev batch.
+
+    ``max_tokens`` is in model tokens (the ~4 chars/token the counter assumes);
+    the batch packer converts the excerpt's length to Jev tokens itself.
+    """
+    limit = max_tokens * 4
     if len(text) <= limit:
         return text
     head = int(limit * 0.7)
@@ -286,9 +356,25 @@ def _excerpt(text: str, max_tokens: int) -> str:
     return f"{text[:head]}\n…[{omitted} characters omitted]…\n{text[-tail:]}"
 
 
+def _jev_tokens(text: str) -> int:
+    """Estimate of how many tokens Jev will count ``text`` as."""
+    return int(len(text) / JEV_CHARS_PER_TOKEN) + 1
+
+
 def _goal(messages: Sequence[AnyMessage]) -> tuple[str, str] | None:
-    """(task, latest request): first and last non-summary human messages."""
-    humans = [m for m in messages if isinstance(m, HumanMessage) and not _is_summary(m)]
+    """(task, latest request): first and last real human messages.
+
+    Summaries and the truncation-recovery nudge are skipped: the nudge is an
+    automated "carry on" that changes nothing about the goal, and letting it
+    change the goal key re-judged every kept result at once on the first run.
+    """
+    humans = [
+        m
+        for m in messages
+        if isinstance(m, HumanMessage)
+        and not _is_summary(m)
+        and not is_truncation_nudge(m)
+    ]
     if not humans:
         return None
     return _clip(humans[0].text, _GOAL_MAX_CHARS), _clip(
@@ -386,6 +472,7 @@ class JevContextPruningMiddleware(AgentMiddleware):
         result_excerpt_tokens: int = DEFAULT_RESULT_EXCERPT_TOKENS,
         batch_tokens: int = DEFAULT_BATCH_TOKENS,
         batch_questions: int = DEFAULT_BATCH_QUESTIONS,
+        model: str = DEFAULT_MODEL,
         timeout: float = DEFAULT_TIMEOUT,
         debug: bool = False,
         judge: Judge | None = None,
@@ -403,7 +490,9 @@ class JevContextPruningMiddleware(AgentMiddleware):
         self._batch_tokens = batch_tokens
         self._batch_questions = batch_questions
         self._debug = debug
-        self._judge: Judge = judge if judge is not None else JevJudge(timeout=timeout)
+        self._judge: Judge = (
+            judge if judge is not None else JevJudge(model=model, timeout=timeout)
+        )
         self._log = log
         self._session_id = session_id
         self._binary = binary_name
@@ -434,13 +523,22 @@ class JevContextPruningMiddleware(AgentMiddleware):
         return pending
 
     def _batches(
-        self, messages: Sequence[AnyMessage], pending: Sequence[_Exchange]
+        self,
+        messages: Sequence[AnyMessage],
+        pending: Sequence[_Exchange],
+        fixed_tokens: int,
     ) -> list[_Batch]:
-        """Pack pending exchanges into Jev requests under the state budget."""
+        """Pack pending exchanges into Jev requests under the state budget.
+
+        Costs are in Jev tokens: ``fixed_tokens`` covers the goal and activity
+        fields every batch carries, and each member pays for its excerpt, its
+        arguments, and one question's prompt.
+        """
         batches: list[_Batch] = []
         current: dict[str, Any] = {}
         members: list[tuple[str, _Exchange]] = []
-        used = 0
+        base = fixed_tokens + _BATCH_OVERHEAD_TOKENS
+        used = base
         for ex in pending:
             tool_msg = messages[ex.index]
             excerpt = _excerpt(tool_msg.text, self._excerpt_tokens)
@@ -453,13 +551,18 @@ class JevContextPruningMiddleware(AgentMiddleware):
                 "arguments": _clip(args_text, _ARGS_MAX_CHARS),
                 "result": excerpt,
             }
-            cost = (len(excerpt) + len(entry["arguments"])) // 4 + 50
+            cost = (
+                _jev_tokens(excerpt)
+                + _jev_tokens(entry["arguments"])
+                + _jev_tokens(ex.tool)
+                + _QUESTION_OVERHEAD_TOKENS
+            )
             if members and (
                 used + cost > self._batch_tokens
                 or len(members) >= self._batch_questions
             ):
                 batches.append((current, members))
-                current, members, used = {}, [], 0
+                current, members, used = {}, [], base
             key = f"x{len(members)}"
             current[key] = entry
             members.append((key, ex))
@@ -467,6 +570,19 @@ class JevContextPruningMiddleware(AgentMiddleware):
         if members:
             batches.append((current, members))
         return batches
+
+    @staticmethod
+    def _halves(batch: _Batch) -> list[_Batch]:
+        """Split a batch Jev rejected as too large into two smaller requests."""
+        state, members = batch
+        mid = len(members) // 2
+        return [
+            (
+                {**state, "exchanges": {k: state["exchanges"][k] for k, _ in part}},
+                list(part),
+            )
+            for part in (members[:mid], members[mid:])
+        ]
 
     def _state(
         self, task: str, latest: str, activity: str, exchanges: dict[str, Any]
@@ -487,6 +603,7 @@ class JevContextPruningMiddleware(AgentMiddleware):
     ) -> None:
         run.jev_requests += 1
         run.jev_input_tokens += judgement.input_tokens or 0
+        run.jev_model = judgement.model or run.jev_model
         for key, ex in members:
             p_keep = judgement.keep_probabilities.get(key)
             if p_keep is None:
@@ -497,6 +614,41 @@ class JevContextPruningMiddleware(AgentMiddleware):
             run.judged_ids.add(ex.tool_call_id)
             run.judged += 1
             self.judged += 1
+
+    # --- judging -----------------------------------------------------------------
+    #
+    # One batch failing must not sink the pass: a too-large batch is halved and
+    # retried (down to single questions), and any other error fails open for
+    # that batch alone while the rest are still judged.
+
+    def _judge_batch(self, batch: _Batch, goal_key: str, run: _Pass) -> None:
+        state, members = batch
+        try:
+            judgement = self._judge.judge(state, [key for key, _ in members])
+        except Exception as exc:  # any Jev/network failure: never block the model
+            if _is_too_large(exc) and len(members) > 1:
+                run.jev_failed_requests += 1
+                for half in self._halves(batch):
+                    self._judge_batch(half, goal_key, run)
+                return
+            self._fail_open(run, exc)
+            return
+        self._record_judgement(judgement, members, goal_key, run)
+
+    async def _ajudge_batch(self, batch: _Batch, goal_key: str, run: _Pass) -> None:
+        state, members = batch
+        try:
+            judgement = await self._judge.ajudge(state, [key for key, _ in members])
+        except Exception as exc:  # any Jev/network failure: never block the model
+            if _is_too_large(exc) and len(members) > 1:
+                run.jev_failed_requests += 1
+                await asyncio.gather(
+                    *(self._ajudge_batch(h, goal_key, run) for h in self._halves(batch))
+                )
+                return
+            self._fail_open(run, exc)
+            return
+        self._record_judgement(judgement, members, goal_key, run)
 
     # --- applying ----------------------------------------------------------------
 
@@ -555,20 +707,26 @@ class JevContextPruningMiddleware(AgentMiddleware):
             "judged": run.judged,
             "evicted": run.evicted,
             "jev_requests": run.jev_requests,
+            "jev_failed_requests": run.jev_failed_requests,
             "jev_input_tokens": run.jev_input_tokens,
             "jev_latency_ms": run.jev_latency_ms,
+            "jev_model": run.jev_model,
             "decisions": run.decisions,
             "error": run.error,
         }
 
     def _fail_open(self, run: _Pass, exc: Exception) -> None:
+        """Record a failed batch; its results go out unpruned this pass."""
         self.failures += 1
-        run.error = f"{type(exc).__name__}: {exc}"
+        run.jev_failed_requests += 1
+        error = _describe(exc)
+        if run.error is None:
+            run.error = error
         if not self._warned:
             self._warned = True
             print(
-                f"Warning: Jev context pruning failed ({run.error}); sending the "
-                "request unpruned. Further failures are counted silently.",
+                f"Warning: Jev context pruning failed ({error}); sending those "
+                "results unpruned. Further failures are counted silently.",
                 file=sys.stderr,
             )
 
@@ -587,9 +745,10 @@ class JevContextPruningMiddleware(AgentMiddleware):
         pending = self._candidates(exchanges, goal_key)
         run.candidates = len(pending)
         activity = _recent_activity(messages)
+        fixed = _jev_tokens(task) + _jev_tokens(latest) + _jev_tokens(activity)
         batches = [
             (self._state(task, latest, activity, state), members)
-            for state, members in self._batches(messages, pending)
+            for state, members in self._batches(messages, pending, fixed)
         ]
         return run, exchanges, goal_key, batches
 
@@ -605,14 +764,8 @@ class JevContextPruningMiddleware(AgentMiddleware):
             return handler(request)
         run, exchanges, goal_key, batches = plan
         started = time.monotonic()
-        try:
-            for state, members in batches:
-                keys = [key for key, _ in members]
-                self._record_judgement(
-                    self._judge.judge(state, keys), members, goal_key, run
-                )
-        except Exception as exc:  # any Jev/network failure: never block the model
-            self._fail_open(run, exc)
+        for batch in batches:
+            self._judge_batch(batch, goal_key, run)
         run.jev_latency_ms = int((time.monotonic() - started) * 1000)
         pruned = self._apply(request.messages, exchanges, run)
         doc = self._finish(run, pruned)
@@ -633,17 +786,9 @@ class JevContextPruningMiddleware(AgentMiddleware):
             return await handler(request)
         run, exchanges, goal_key, batches = plan
         started = time.monotonic()
-        try:
-            results = await asyncio.gather(
-                *(
-                    self._judge.ajudge(state, [key for key, _ in members])
-                    for state, members in batches
-                )
-            )
-            for judgement, (_, members) in zip(results, batches, strict=True):
-                self._record_judgement(judgement, members, goal_key, run)
-        except Exception as exc:  # any Jev/network failure: never block the model
-            self._fail_open(run, exc)
+        await asyncio.gather(
+            *(self._ajudge_batch(batch, goal_key, run) for batch in batches)
+        )
         run.jev_latency_ms = int((time.monotonic() - started) * 1000)
         pruned = self._apply(request.messages, exchanges, run)
         doc = self._finish(run, pruned)
@@ -687,6 +832,7 @@ def build_context_pruning_middleware(
             "JEV_PRUNE_KEEP_RECENT", DEFAULT_KEEP_RECENT, positive=False
         ),
         exclude_tools=_exclude_tools_from_env(),
+        model=os.environ.get("JEV_MODEL", "").strip() or DEFAULT_MODEL,
         debug=bool(os.environ.get("JEV_PRUNE_DEBUG")),
         log=log,
         session_id=session_id,
@@ -728,6 +874,12 @@ def report(
     )
     per_tool: dict[str, list[int]] = defaultdict(lambda: [0, 0])
     histogram: Counter[int] = Counter()
+    errors: Counter[str] = Counter()
+    models: Counter[str] = Counter()
+    # Tokens that would have been saved (summed over passes, like the headline)
+    # had the threshold been each of these instead — the tuning table.
+    sweep_thresholds = (0.2, 0.3, 0.4, 0.5, 0.6, 0.7)
+    sweep: Counter[float] = Counter()
     totals = {
         "passes": 0,
         "exchanges": 0,
@@ -756,14 +908,23 @@ def report(
         totals["saved"] += doc.get("tokens_saved", 0)
         totals["jev_tokens"] += doc.get("jev_input_tokens", 0)
         totals["jev_requests"] += doc.get("jev_requests", 0)
-        totals["failures"] += 1 if doc.get("error") else 0
+        if doc.get("jev_model"):
+            models[str(doc["jev_model"])] += 1
+        if doc.get("error"):
+            totals["failures"] += 1
+            # "Type: endpoint: 400 Bad Request (request_id=…) body=…" -> kind
+            errors[str(doc["error"]).split(" (request_id")[0][:100]] += 1
         for d in doc.get("decisions", []):
+            p_keep = float(d.get("p_keep", 1.0))
+            for t in sweep_thresholds:
+                if p_keep < t:
+                    sweep[t] += int(d.get("tokens", 0))
             if d.get("memoized"):
                 continue  # count each verdict once, when it was made
             tally = per_tool[d.get("tool", "?")]
             tally[0] += 1
             tally[1] += 1 if d.get("evicted") else 0
-            histogram[min(int(float(d.get("p_keep", 1.0)) * 10), 9)] += 1
+            histogram[min(int(p_keep * 10), 9)] += 1
 
     def pct(num: int, den: int) -> str:
         return f"{100 * num / den:.0f}%" if den else "n/a"
@@ -779,9 +940,13 @@ def report(
         f"(saved ~{totals['saved']:,}, {pct(totals['saved'], totals['before'])})",
         f"  Jev: {totals['jev_requests']} requests, {totals['jev_tokens']:,} input "
         f"tokens ≈ ${totals['jev_tokens'] * JEV_USD_PER_INPUT_TOKEN:.4f}",
-        "",
-        "Per session (tokens saved / sent before pruning):",
     ]
+    if models:
+        lines.append(
+            "  models: "
+            + ", ".join(f"{m} ({n} passes)" for m, n in models.most_common())
+        )
+    lines += ["", "Per session (tokens saved / sent before pruning):"]
     for sid, s in sorted(per_session.items(), key=lambda kv: -kv[1]["saved"]):
         lines.append(
             f"  {sid}: {s['passes']} passes, {s['evicted']} evicted, "
@@ -799,6 +964,15 @@ def report(
             n = histogram.get(bucket, 0)
             bar = "#" * int(40 * n / total) if total else ""
             lines.append(f"  {bucket / 10:.1f}–{(bucket + 1) / 10:.1f}  {n:5d}  {bar}")
+        lines += ["", "Tokens saved had JEV_PRUNE_THRESHOLD been (summed over passes):"]
+        for t in sweep_thresholds:
+            lines.append(
+                f"  {t:.1f}: ~{sweep[t]:,} ({pct(sweep[t], totals['before'])})"
+            )
+    if errors:
+        lines += ["", "Fail-open causes (passes):"]
+        for kind, n in errors.most_common():
+            lines.append(f"  {n:5d}  {kind}")
     return "\n".join(lines)
 
 

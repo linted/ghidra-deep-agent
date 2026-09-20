@@ -50,7 +50,12 @@
   `TYPESAFE_API_KEY`): stale tool results are blanked per model call, so the "no effective
   compaction across 40 iterations" evidence above predates it. Re-measure a research run
   with pruning on (`python -m ghidra_deep_agent.context_pruning report`) before sizing
-  this item — the 40–60% target may already be met.
+  this item — the 40–60% target may already be met. *Update (2026-09-20):* first measured
+  run (3 sub-agents, 76 passes) saved 1%: a third of passes hit Jev's request cap (the
+  batch budget assumed 4 chars/token; Jev counts disassembly at ~1.3) and the 0.2 threshold
+  sat below where Jev's verdicts cluster (0.3–0.5). Both fixed (Jev-token batching, split
+  retry, threshold 0.5); replaying that run's largest failing state now saves 41% per
+  call. Still needs a fresh end-to-end measurement.
 
 ### From the deepagents 0.7 upgrade (2026-07-30)
 
