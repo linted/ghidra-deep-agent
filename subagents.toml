@@ -12,7 +12,7 @@
 # Point AGENT_CONFIG at a different file to override this one.
 
 # Optional fallback model for any agent without its own `model`.
-default = "deepseek:deepseek-v4-flash"
+default = "deepseek:deepseek-flash"
 # z.ai GLM direct (OpenAI-compatible endpoint; needs ZAI_API_KEY):
 # default = "zai:glm-5.2"
 
@@ -64,7 +64,7 @@ name = "program-recon"
 # tools in its allowlist, so the tier grants it nothing else.
 write_policy = "annotations"
 description = "Reconnaissance. Delegate at the start of a session to get a compact brief on an unfamiliar binary (format, architecture, entry points, notable imports/exports/strings, prior knowledge)."
-model = "deepseek:deepseek-v4-flash"
+model = "deepseek:deepseek-flash"
 tools = [
   "get_binary_info",
   "get_functions",
@@ -108,7 +108,7 @@ base. Do NOT paste full catalog listings or raw tool dumps — summarize.
 [[subagents]]
 name = "function-analyst"
 description = "Deep analysis of one function (or a few related ones). It decompiles, traces data flow, applies the warranted renames/retypes/comments/prototype in Ghidra, saves findings to the knowledge base, and returns a compact summary. Delegate per function; several may run in parallel."
-model = "deepseek:deepseek-v4-flash"
+model = "deepseek:deepseek-flash"
 tools = [
   # analysis (read)
   "get_code",             # decompiler / disassembly / pcode (format arg)
