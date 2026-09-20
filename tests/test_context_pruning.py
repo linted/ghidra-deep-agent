@@ -83,7 +83,7 @@ class FakeJudge:
         probs = {
             key: self.keep.get(state["exchanges"][key]["tool"], 1.0) for key in keys
         }
-        return Judgement(probs, input_tokens=100)
+        return Judgement(probs, input_tokens=100, model="fake-1.0")
 
     def judge(self, state: dict[str, Any], keys: Any) -> Judgement:
         return self._answer(state, list(keys))
@@ -162,6 +162,9 @@ def _mw(judge: FakeJudge, **kwargs: Any) -> JevContextPruningMiddleware:
     kwargs.setdefault("trigger_tokens", 1)
     kwargs.setdefault("keep_recent", 1)
     kwargs.setdefault("min_tokens", 100)
+    # Most tests pack candidates into one request to inspect a single call;
+    # the production default (one exchange per request) has its own test.
+    kwargs.setdefault("batch_questions", 16)
     return JevContextPruningMiddleware(judge=judge, **kwargs)
 
 
@@ -263,6 +266,25 @@ def test_state_sent_to_jev_carries_goal_and_excerpts() -> None:
     assert "0x0" in entry["arguments"]
     assert "characters omitted" in entry["result"]
     assert len(entry["result"]) < 400
+
+
+def test_default_is_one_exchange_per_request() -> None:
+    judge = FakeJudge({"get_code": 0.0})
+    mw = JevContextPruningMiddleware(
+        judge=judge, trigger_tokens=1, keep_recent=1, min_tokens=100
+    )
+    sent = _run(mw, _history(["get_code", "get_code", "get_code", "xrefs"]))
+    assert [len(keys) for _, keys in judge.calls] == [1, 1, 1]
+    assert all(_is_placeholder(sent[i]) for i in (2, 4, 6))
+
+
+def test_whole_program_scans_are_never_pruned() -> None:
+    judge = FakeJudge({}, fail=RuntimeError("should not be asked"))
+    mw = _mw(judge)  # default exclude list
+    tools = ["find_unrecovered_switches", "recover_prototypes", "deobfuscate_cff"]
+    msgs = _history([*tools, "task", "xrefs"])
+    assert _run(mw, msgs) == msgs
+    assert judge.calls == []
 
 
 def test_batches_are_sized_in_jev_tokens() -> None:
@@ -437,12 +459,18 @@ def test_factory_reads_knobs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("JEV_PRUNE_TRIGGER_TOKENS", "12345")
     monkeypatch.setenv("JEV_PRUNE_KEEP_RECENT", "0")
     monkeypatch.setenv("JEV_PRUNE_EXCLUDE_TOOLS", "task, write_file")
+    monkeypatch.setenv("JEV_MODEL", " jev-9.9.9 ")
     mw = build_context_pruning_middleware("u", "d", "sess", "bin")
     assert mw is not None
     assert mw._threshold == 0.35
     assert mw._trigger == 12345
     assert mw._keep_recent == 0
     assert mw._exclude == {"task", "write_file"}
+    assert mw._judge._model == "jev-9.9.9"  # type: ignore[attr-defined]
+    monkeypatch.delenv("JEV_MODEL")
+    mw = build_context_pruning_middleware("u", "d", "sess", "bin")
+    assert mw is not None
+    assert mw._judge._model == "jev-1.13.0"  # type: ignore[attr-defined]
     assert mw._log is None
     assert mw._session_id == "sess" and mw._binary == "bin"
 
@@ -468,6 +496,7 @@ def test_log_document_per_pass() -> None:
     assert first["candidates"] == 2 and first["judged"] == 2
     assert first["evicted"] == 1
     assert first["jev_requests"] == 1 and first["jev_input_tokens"] == 100
+    assert first["jev_model"] == "fake-1.0"
     by_tool = {d["tool"]: d for d in first["decisions"]}
     assert by_tool["get_code"]["evicted"] and by_tool["get_code"]["p_keep"] == 0.1
     assert not by_tool["xrefs"]["evicted"]
@@ -475,6 +504,7 @@ def test_log_document_per_pass() -> None:
     # Second pass: same saving, no Jev traffic, verdicts marked memoized.
     assert second["tokens_saved"] == first["tokens_saved"]
     assert second["jev_requests"] == 0 and second["judged"] == 0
+    assert second["jev_model"] is None  # no Jev traffic this pass
     assert all(d["memoized"] for d in second["decisions"])
 
 
@@ -514,6 +544,7 @@ def _doc(session: str, ts: datetime, **overrides: Any) -> dict[str, Any]:
         "jev_requests": 1,
         "jev_input_tokens": 20_000,
         "jev_latency_ms": 300,
+        "jev_model": "jev-1.13.0",
         "decisions": [
             _decision("get_code", 0.05, True),
             _decision("get_code", 0.12, True),
@@ -558,6 +589,7 @@ def test_report_aggregates_the_log() -> None:
     assert "evictions in effect: 6 summed over passes (20% of exchanges seen)" in text
     assert "saved ~30,000" in text
     assert "20,000 input tokens ≈ $0.0008" in text
+    assert "models: jev-1.13.0 (3 passes)" in text
     assert "s1: 2 passes, 6 evicted, saved ~30,000 of ~80,000 (38%)" in text
     assert "get_code: 2 judged, 2 evicted (100%)" in text  # memoized not re-counted
     assert "xrefs: 2 judged, 1 evicted (50%)" in text

@@ -62,7 +62,8 @@ All configuration is done via environment variables (`.env` file or shell export
 | `JEV_PRUNE_THRESHOLD` | `0.5` | Evict a tool result when Jev's P(still needed) is below this |
 | `JEV_PRUNE_TRIGGER_TOKENS` | `20000` | Message-history size (system prompt excluded) at which pruning starts |
 | `JEV_PRUNE_KEEP_RECENT` | `4` | Most recent tool exchanges that are never judged |
-| `JEV_PRUNE_EXCLUDE_TOOLS` | `task` | Comma-separated tools whose results are never pruned (sub-agent reports by default) |
+| `JEV_PRUNE_EXCLUDE_TOOLS` | `task,find_unrecovered_switches,recover_prototypes,deobfuscate_cff` | Comma-separated tools whose results are never pruned: sub-agent reports and the whole-program scans, whose results are worklists that cost minutes to regenerate |
+| `JEV_MODEL` | `jev-1.13.0` | Jev version asked; pinned because the threshold was tuned against it (`jev-latest` moves on release) |
 | `JEV_PRUNE_DEBUG` | *(unset)* | Set to print one `[jev-prune]` line per pass to stderr |
 | `JEV_PRUNE_LOG` | `1` | Set to `0` to skip the MongoDB savings log |
 | `MONGODB_PRUNE_LOG_COLLECTION` | `jev_prune_log` | Collection the savings log is written to |
@@ -110,7 +111,7 @@ call long after the agent is done with them. With a `TYPESAFE_API_KEY` set
 (`pip`-free: the `langchain-typesafe` package is already a dependency), a
 middleware asks [Jev](https://typesafe.ai) — a classification model that
 returns calibrated probabilities, not text — one yes/no question per older tool
-result on every model call: *does the agent still need this to finish the task?*
+result on every model call, one result per request so nothing else distracts it: *does the agent still need this to finish the task?*
 Results judged stale are replaced, **for that request only**, by a one-line
 placeholder naming the tool so the model can re-run it. Everything else is sent
 verbatim; nothing is summarized and the checkpoint is never modified. A pass over

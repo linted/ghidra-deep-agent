@@ -43,7 +43,11 @@ Configuration (env):
   JEV_PRUNE_THRESHOLD            evict when P(keep) is below this (default 0.5)
   JEV_PRUNE_TRIGGER_TOKENS       history size that starts pruning (default 20000)
   JEV_PRUNE_KEEP_RECENT          most recent exchanges never judged (default 4)
-  JEV_PRUNE_EXCLUDE_TOOLS        comma-separated tools never pruned (default: task)
+  JEV_PRUNE_EXCLUDE_TOOLS        comma-separated tools never pruned (default: task
+                                 plus the whole-program scans, whose results are
+                                 worklists and cost minutes to regenerate)
+  JEV_MODEL                      Jev version to ask (default ``jev-1.13.0``, the
+                                 one the threshold was tuned against)
   JEV_PRUNE_DEBUG                set to log each pass to stderr
   JEV_PRUNE_LOG                  ``0`` disables the MongoDB savings log
   MONGODB_PRUNE_LOG_COLLECTION   savings-log collection (default ``jev_prune_log``)
@@ -83,7 +87,13 @@ DEFAULT_THRESHOLD = 0.5
 DEFAULT_TRIGGER_TOKENS = 20_000
 DEFAULT_KEEP_RECENT = 4
 DEFAULT_MIN_TOKENS = 500
-DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset({"task"})
+# Never pruned: sub-agent reports, and the whole-program scans whose output is
+# the worklist the agent works from and whose re-run costs minutes (they share
+# GHIDRA_RECOVER_TIMEOUT). Jev sits near 0.5 on a partly worked-through
+# worklist, so the placeholder's "re-run it" would be an expensive mistake.
+DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
+    {"task", "find_unrecovered_switches", "recover_prototypes", "deobfuscate_cff"}
+)
 # Jev tokenizes decompiler and disassembly output at ~1.33 chars per token
 # (measured), three times denser than the ~4 chars/token the model-side counter
 # assumes. Every Jev-facing budget below is in Jev tokens via this ratio.
@@ -93,7 +103,18 @@ JEV_CHARS_PER_TOKEN = 1.3
 # the fixed fields, every excerpt, and JSON overhead well under it; a batch that
 # still overflows is split and retried.
 DEFAULT_BATCH_TOKENS = 20_000
-DEFAULT_BATCH_QUESTIONS = 16
+# One exchange per request. Jev's accuracy drops as the state fills with
+# material unrelated to the question (docs: "large state full of irrelevant
+# detail"), and packing exchanges together measurably pulled verdicts toward
+# the undecided middle: on the same 11 results, solo vs. 16-per-request moved
+# P(keep) by up to 0.17 with run-to-run noise under 0.03. Requests run
+# concurrently, so latency is unchanged; the fixed fields are re-sent per
+# request, about a quarter more Jev tokens.
+DEFAULT_BATCH_QUESTIONS = 1
+# The Jev version to ask. Pinned rather than ``jev-latest`` because the
+# threshold above was tuned against this version's calibration and the alias
+# moves on release; the responding model is logged with every pass.
+DEFAULT_MODEL = "jev-1.13.0"
 # Excerpt cap per result, in model tokens (~4 chars each): 1,500 is ~4.6k Jev
 # tokens, and verdicts measured within ±0.05 of those from 6,000-token excerpts.
 DEFAULT_RESULT_EXCERPT_TOKENS = 1_500
@@ -139,6 +160,7 @@ class Judgement:
 
     keep_probabilities: dict[str, float]
     input_tokens: int | None = None
+    model: str | None = None  # the versioned model id that answered
 
 
 class Judge(Protocol):
@@ -169,9 +191,12 @@ class JevJudge:
     connection pool is not.
     """
 
-    def __init__(self, *, timeout: float = DEFAULT_TIMEOUT) -> None:
+    def __init__(
+        self, *, model: str = DEFAULT_MODEL, timeout: float = DEFAULT_TIMEOUT
+    ) -> None:
         import httpx2
 
+        self._model = model
         self._timeout = timeout
         self._client = httpx2.Client(timeout=timeout)
         self._async_client = httpx2.AsyncClient(timeout=timeout)
@@ -186,6 +211,7 @@ class JevJudge:
             warnings.simplefilter("ignore", LangChainBetaWarning)
             return TypeSafeClassifier(
                 questions=_questions(keys),
+                model=self._model,
                 timeout=self._timeout,
                 client=self._client,
                 async_client=self._async_client,
@@ -196,7 +222,7 @@ class JevJudge:
         nouls = response.nouls
         # A key Jev did not answer is treated as "keep": never evict on silence.
         probs = {key: nouls[key].noul for key in keys if key in nouls}
-        return Judgement(probs, response.usage.input_tokens)
+        return Judgement(probs, response.usage.input_tokens, response.model)
 
     def judge(self, state: dict[str, Any], keys: Sequence[str]) -> Judgement:
         return self._judgement(self._classifier(keys).invoke(state), keys)
@@ -292,6 +318,7 @@ class _Pass:
     jev_failed_requests: int = 0
     jev_input_tokens: int = 0
     jev_latency_ms: int = 0
+    jev_model: str | None = None  # versioned id that answered this pass
     decisions: list[dict[str, Any]] = field(default_factory=list)
     # tool_call_ids whose verdict was made in this pass (vs. memoized earlier).
     judged_ids: set[str] = field(default_factory=set)
@@ -445,6 +472,7 @@ class JevContextPruningMiddleware(AgentMiddleware):
         result_excerpt_tokens: int = DEFAULT_RESULT_EXCERPT_TOKENS,
         batch_tokens: int = DEFAULT_BATCH_TOKENS,
         batch_questions: int = DEFAULT_BATCH_QUESTIONS,
+        model: str = DEFAULT_MODEL,
         timeout: float = DEFAULT_TIMEOUT,
         debug: bool = False,
         judge: Judge | None = None,
@@ -462,7 +490,9 @@ class JevContextPruningMiddleware(AgentMiddleware):
         self._batch_tokens = batch_tokens
         self._batch_questions = batch_questions
         self._debug = debug
-        self._judge: Judge = judge if judge is not None else JevJudge(timeout=timeout)
+        self._judge: Judge = (
+            judge if judge is not None else JevJudge(model=model, timeout=timeout)
+        )
         self._log = log
         self._session_id = session_id
         self._binary = binary_name
@@ -573,6 +603,7 @@ class JevContextPruningMiddleware(AgentMiddleware):
     ) -> None:
         run.jev_requests += 1
         run.jev_input_tokens += judgement.input_tokens or 0
+        run.jev_model = judgement.model or run.jev_model
         for key, ex in members:
             p_keep = judgement.keep_probabilities.get(key)
             if p_keep is None:
@@ -679,6 +710,7 @@ class JevContextPruningMiddleware(AgentMiddleware):
             "jev_failed_requests": run.jev_failed_requests,
             "jev_input_tokens": run.jev_input_tokens,
             "jev_latency_ms": run.jev_latency_ms,
+            "jev_model": run.jev_model,
             "decisions": run.decisions,
             "error": run.error,
         }
@@ -800,6 +832,7 @@ def build_context_pruning_middleware(
             "JEV_PRUNE_KEEP_RECENT", DEFAULT_KEEP_RECENT, positive=False
         ),
         exclude_tools=_exclude_tools_from_env(),
+        model=os.environ.get("JEV_MODEL", "").strip() or DEFAULT_MODEL,
         debug=bool(os.environ.get("JEV_PRUNE_DEBUG")),
         log=log,
         session_id=session_id,
@@ -842,6 +875,7 @@ def report(
     per_tool: dict[str, list[int]] = defaultdict(lambda: [0, 0])
     histogram: Counter[int] = Counter()
     errors: Counter[str] = Counter()
+    models: Counter[str] = Counter()
     # Tokens that would have been saved (summed over passes, like the headline)
     # had the threshold been each of these instead — the tuning table.
     sweep_thresholds = (0.2, 0.3, 0.4, 0.5, 0.6, 0.7)
@@ -874,6 +908,8 @@ def report(
         totals["saved"] += doc.get("tokens_saved", 0)
         totals["jev_tokens"] += doc.get("jev_input_tokens", 0)
         totals["jev_requests"] += doc.get("jev_requests", 0)
+        if doc.get("jev_model"):
+            models[str(doc["jev_model"])] += 1
         if doc.get("error"):
             totals["failures"] += 1
             # "Type: endpoint: 400 Bad Request (request_id=…) body=…" -> kind
@@ -904,9 +940,13 @@ def report(
         f"(saved ~{totals['saved']:,}, {pct(totals['saved'], totals['before'])})",
         f"  Jev: {totals['jev_requests']} requests, {totals['jev_tokens']:,} input "
         f"tokens ≈ ${totals['jev_tokens'] * JEV_USD_PER_INPUT_TOKEN:.4f}",
-        "",
-        "Per session (tokens saved / sent before pruning):",
     ]
+    if models:
+        lines.append(
+            "  models: "
+            + ", ".join(f"{m} ({n} passes)" for m, n in models.most_common())
+        )
+    lines += ["", "Per session (tokens saved / sent before pruning):"]
     for sid, s in sorted(per_session.items(), key=lambda kv: -kv[1]["saved"]):
         lines.append(
             f"  {sid}: {s['passes']} passes, {s['evicted']} evicted, "
