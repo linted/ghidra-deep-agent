@@ -2,20 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from textual.message import Message
 
-
-@dataclass(frozen=True)
-class SubagentReport:
-    """What one `task` run returned to the main agent."""
-
-    run_id: str
-    description: str
-    text: str
-    error: bool
-    elapsed: float
+# The report itself is a stream event (shared with the HTTP server); it is
+# re-exported here so the TUI's message vocabulary stays in one place.
+from ghidra_deep_agent.stream import SubagentReport as SubagentReport
 
 
 class SubagentReportCaptured(Message):

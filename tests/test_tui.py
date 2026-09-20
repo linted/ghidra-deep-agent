@@ -362,7 +362,7 @@ def test_subagent_report_captured() -> None:
             await pilot.pause()
             assert app.run_state.subagent_meta == {}
             [report] = app._subagent_reports
-            assert report.run_id == "task1"
+            assert report.call_id == "task1"
             assert report.description == description  # untruncated
             assert report.text == "## Findings\n- entry at 0x1000"
             assert report.error is False
@@ -460,7 +460,7 @@ def test_report_screen_opens_and_closes() -> None:
             assert isinstance(app.screen, SubagentReportScreen)
             # Most recent run is listed and selected first.
             screen = app.screen
-            assert screen._reports[0].run_id == "r2"
+            assert screen._reports[0].call_id == "r2"
             assert screen._selected() is screen._reports[0]
             await pilot.press("escape")
             await pilot.pause()

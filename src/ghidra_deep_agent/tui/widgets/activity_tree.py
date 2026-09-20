@@ -5,8 +5,8 @@ import time
 from textual.widgets import Tree
 from textual.widgets.tree import TreeNode
 
-from ghidra_deep_agent.tui.events import parse_checkpoint_ns
-from ghidra_deep_agent.tui.formatting import fmt_duration
+from ghidra_deep_agent.formatting import fmt_duration
+from ghidra_deep_agent.stream import parse_checkpoint_ns
 from ghidra_deep_agent.tui.messages import LLMDone, LLMThinking, ToolEnded, ToolStarted
 
 

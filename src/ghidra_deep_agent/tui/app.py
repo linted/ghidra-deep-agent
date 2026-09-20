@@ -24,6 +24,7 @@ from ghidra_deep_agent.defaults import (
     DEFAULT_MAX_CONTEXT_TOKENS,
     DEFAULT_RECURSION_LIMIT,
 )
+from ghidra_deep_agent.formatting import extract_text
 from ghidra_deep_agent.prompt import (
     APPROVED_PLAN_INSTRUCTION,
     MARKED_BACKGROUND,
@@ -31,10 +32,10 @@ from ghidra_deep_agent.prompt import (
 )
 from ghidra_deep_agent.resilience import UsageLimitError
 from ghidra_deep_agent.sessions import SessionStore
+from ghidra_deep_agent.stream import RunState
 from ghidra_deep_agent.toasts import ToastRequest, notify_toast, register_toast_sink
 from ghidra_deep_agent.tui.commands import COMMANDS_BY_NAME
 from ghidra_deep_agent.tui.events import handle_event
-from ghidra_deep_agent.tui.formatting import extract_text
 from ghidra_deep_agent.tui.help_screen import HelpScreen
 from ghidra_deep_agent.tui.messages import (
     AgentDone,
@@ -46,7 +47,6 @@ from ghidra_deep_agent.tui.messages import (
     ToolCountChanged,
 )
 from ghidra_deep_agent.tui.report_screen import SubagentReportScreen
-from ghidra_deep_agent.tui.run_state import RunState
 from ghidra_deep_agent.tui.session_select import SessionSelectScreen
 from ghidra_deep_agent.tui.side_mode import Kind, SideMode
 from ghidra_deep_agent.tui.widgets import (

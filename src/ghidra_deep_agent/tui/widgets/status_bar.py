@@ -5,7 +5,7 @@ from textual.timer import Timer
 from textual.widgets import Static
 
 from ghidra_deep_agent.defaults import DEFAULT_MAX_CONTEXT_TOKENS
-from ghidra_deep_agent.tui.formatting import fmt_tokens
+from ghidra_deep_agent.formatting import fmt_tokens
 
 
 class StatusBar(Static):
