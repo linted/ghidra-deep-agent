@@ -516,10 +516,15 @@ def test_log_failure_never_reaches_the_model_call() -> None:
 
 
 def _decision(
-    tool: str, p_keep: float, evicted: bool, memoized: bool = False
+    tool: str,
+    p_keep: float,
+    evicted: bool,
+    memoized: bool = False,
+    tool_call_id: str = "",
 ) -> dict[str, Any]:
     return {
         "tool": tool,
+        "tool_call_id": tool_call_id or f"{tool}-{p_keep}",
         "tokens": 5_000,
         "p_keep": p_keep,
         "evicted": evicted,
@@ -602,6 +607,68 @@ def test_report_aggregates_the_log() -> None:
     assert "sessions: 1" in report(coll, session_id="s2")  # type: ignore[arg-type]
     assert "sessions: 1" in report(coll, since=timedelta(days=1))  # type: ignore[arg-type]
     assert "No pruning passes" in report(coll, session_id="nope")  # type: ignore[arg-type]
+    assert "fetched again" not in text  # no history loader: section omitted
+
+
+def test_report_counts_evicted_results_fetched_again() -> None:
+    now = datetime.now(UTC)
+    coll = FakeCollection()
+    coll.docs = [
+        _doc(
+            "s1",
+            now,
+            checkpoint_ns="tools:g1|model:m1",
+            decisions=[
+                _decision("get_code", 0.1, True, tool_call_id="c1"),
+                _decision("get_code", 0.2, True, tool_call_id="c2"),
+                _decision("xrefs", 0.3, True, tool_call_id="c3"),
+                _decision("xrefs", 0.9, False, tool_call_id="c4"),
+            ],
+        ),
+        # A later pass of the same graph: memoized evictions count once.
+        _doc(
+            "s1",
+            now + timedelta(minutes=1),
+            checkpoint_ns="tools:g1|model:m1",
+            decisions=[_decision("get_code", 0.1, True, True, tool_call_id="c1")],
+        ),
+        _doc(
+            "s1",
+            now,
+            checkpoint_ns="tools:g2|model:m2",
+            decisions=[_decision("strings", 0.1, True, tool_call_id="c9")],
+        ),
+    ]
+
+    def call(call_id: str, name: str, addr: str) -> AIMessage:
+        return AIMessage(
+            content="",
+            tool_calls=[{"name": name, "args": {"addr": addr}, "id": call_id}],
+        )
+
+    histories = {
+        ("s1", "tools:g1"): [
+            HumanMessage(content="task"),
+            call("c1", "get_code", "0x1"),
+            call("c2", "get_code", "0x2"),
+            call("c3", "xrefs", "0x3"),
+            call("c4", "xrefs", "0x4"),
+            call("later-1", "get_code", "0x1"),  # c1 fetched again
+            call("later-2", "get_code", "0x9"),  # different args: not a re-run
+            call("later-3", "xrefs", "0x3"),  # c3 fetched again
+        ],
+    }
+    asked: list[tuple[str, str]] = []
+
+    def load(session: str, ns: str) -> list[Any] | None:
+        asked.append((session, ns))
+        return histories.get((session, ns))
+
+    text = report(coll, messages=load)  # type: ignore[arg-type]
+    assert sorted(asked) == [("s1", "tools:g1"), ("s1", "tools:g2")]
+    assert "fetched again: 2 of 3 (67%), ~10,000 tokens re-sent once" in text
+    assert "get_code: 1 of 2   xrefs: 1 of 1" in text
+    assert "(1 eviction(s) not checked: graph history unavailable)" in text
 
 
 # --- live ---------------------------------------------------------------------
