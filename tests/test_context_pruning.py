@@ -671,6 +671,35 @@ def test_report_counts_evicted_results_fetched_again() -> None:
     assert "(1 eviction(s) not checked: graph history unavailable)" in text
 
 
+def test_goal_keeps_the_tail_of_a_long_task_and_recent_reasoning() -> None:
+    judge = FakeJudge({})
+    mw = _mw(judge)
+    context = "Context: " + "x" * 5_000
+    task = context + "\nReturn a COMPACT report with the answer and evidence."
+    msgs: list[Any] = [HumanMessage(content=task)]
+    msgs += _exchange(0, "get_code")
+    msgs.append(AIMessage(content="First I will read the pipeline entry."))
+    msgs += _exchange(1, "xrefs")
+    msgs.append(AIMessage(content="The entry calls a builder at 0x2000."))
+    msgs.append(AIMessage(content=""))  # tool-call-only turn: no text
+    msgs.append(AIMessage(content="Now let me check the xrefs."))
+    msgs += _exchange(2, "get_code")
+    _run(mw, msgs)
+    state, _ = judge.calls[0]
+    # Head and tail survive a 4k clip; the deliverable was past the old 2k head.
+    assert state["task"].startswith("Context: xxxx")
+    assert state["task"].endswith(
+        "Return a COMPACT report with the answer and evidence."
+    )
+    assert "\n…\n" in state["task"] and len(state["task"]) <= 4_000
+    # The last three reasoning texts, oldest first, skipping text-less turns.
+    assert state["recent_activity"] == (
+        "First I will read the pipeline entry.\n---\n"
+        "The entry calls a builder at 0x2000.\n---\n"
+        "Now let me check the xrefs."
+    )
+
+
 # --- live ---------------------------------------------------------------------
 
 
