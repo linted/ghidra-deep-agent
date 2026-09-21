@@ -126,16 +126,24 @@ DEFAULT_TIMEOUT = 10.0
 # instructions and criteria for each member.
 _BATCH_OVERHEAD_TOKENS = 200
 _QUESTION_OVERHEAD_TOKENS = 250
-_GOAL_MAX_CHARS = 2_000
+# The task and latest request are sent head *and* tail: sub-agent prompts run
+# 3–4k chars and state the deliverable last ("Return a compact report of…"),
+# and with a 2k head clip Jev never saw it. Replaying one session with the full
+# task moved every decompilation the agent later had to re-fetch from P(keep)
+# 0.33–0.45 to 0.57–0.73 while the correctly dropped results stayed put.
+_GOAL_MAX_CHARS = 4_000
 _ARGS_MAX_CHARS = 1_000
-_ACTIVITY_MAX_CHARS = 1_000
+# Recent activity is the agent's last few reasoning texts, newest last, so a
+# one-line "let me check the xrefs" does not hide what it is working on.
+_ACTIVITY_TEXTS = 3
+_ACTIVITY_MAX_CHARS = 2_500
 # TypeSafe bills Jev input at $0.042 per million tokens; output is free.
 JEV_USD_PER_INPUT_TOKEN = 0.042 / 1_000_000
 
 _QUESTION_INSTRUCTIONS = (
     "An autonomous reverse-engineering agent is working on the task in `task`; "
     "its most recent request from the user is `latest_request` and its latest "
-    "reasoning is `recent_activity`. Earlier it called the tool named in "
+    "reasoning, newest last, is `recent_activity`. Earlier it called the tool named in "
     "`exchanges.{key}.tool` with `exchanges.{key}.arguments` and received "
     "`exchanges.{key}.result`. Does the agent still need that result in its "
     "working memory to finish the task? Answer yes only if it is likely to read "
@@ -337,6 +345,17 @@ def _clip(text: str, limit: int) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
+def _head_tail(text: str, limit: int) -> str:
+    """Clip keeping both ends: prompts open with context and close with the ask."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    separator = "\n…\n"
+    head = limit // 2
+    tail = limit - head - len(separator)
+    return text[:head].rstrip() + separator + text[-tail:].lstrip()
+
+
 def _excerpt(text: str, max_tokens: int) -> str:
     """Head-and-tail excerpt so one dump can't eat a Jev batch.
 
@@ -373,16 +392,20 @@ def _goal(messages: Sequence[AnyMessage]) -> tuple[str, str] | None:
     ]
     if not humans:
         return None
-    return _clip(humans[0].text, _GOAL_MAX_CHARS), _clip(
+    return _head_tail(humans[0].text, _GOAL_MAX_CHARS), _head_tail(
         humans[-1].text, _GOAL_MAX_CHARS
     )
 
 
 def _recent_activity(messages: Sequence[AnyMessage]) -> str:
+    """The agent's last ``_ACTIVITY_TEXTS`` reasoning texts, oldest first."""
+    texts: list[str] = []
     for msg in reversed(messages):
         if isinstance(msg, AIMessage) and msg.text.strip():
-            return _clip(msg.text, _ACTIVITY_MAX_CHARS)
-    return ""
+            texts.append(msg.text.strip())
+            if len(texts) == _ACTIVITY_TEXTS:
+                break
+    return _head_tail("\n---\n".join(reversed(texts)), _ACTIVITY_MAX_CHARS)
 
 
 def _exchanges(messages: Sequence[AnyMessage]) -> list[_Exchange]:
