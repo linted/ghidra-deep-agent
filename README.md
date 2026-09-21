@@ -142,7 +142,10 @@ uv run python -m ghidra_deep_agent.context_pruning report --session <id>
 The report shows tokens saved (summed over passes, since the whole context is
 resent each call), the eviction rate per tool, Jev's own cost, a histogram of
 P(keep) verdicts, what each alternative `JEV_PRUNE_THRESHOLD` would have saved,
-and the causes of any fail-open passes. On the first measured session Jev put
+the causes of any fail-open passes, and — by joining evictions against the
+checkpointed histories in the same database — how many pruned results the agent
+went on to fetch again (`--no-reruns` skips that join). The re-run rate is the
+best single check on whether the threshold is too aggressive. On the first measured session Jev put
 results the agent had already acted on at P(keep) 0.3–0.5 and ones it was still
 using at 0.55+, hence the 0.5 default.
 

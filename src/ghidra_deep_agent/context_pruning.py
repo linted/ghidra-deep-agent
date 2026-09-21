@@ -849,13 +849,119 @@ def _parse_since(text: str) -> timedelta:
     return timedelta(**{units[unit]: int(text[:-1])})
 
 
+# (session_id, checkpoint namespace) -> that graph's message history, or None
+# when it cannot be read. The report joins evictions against it.
+MessageLoader = Callable[[str, str], Sequence[AnyMessage] | None]
+
+
+def checkpoint_message_loader(mongodb_uri: str, mongodb_db: str) -> MessageLoader:
+    """Read a graph's latest checkpointed messages from the MongoDB saver.
+
+    The auto-summarizer condenses history through a summary event rather than
+    deleting messages, so the latest checkpoint still holds every tool call
+    the graph ever made.
+    """
+    from langgraph.checkpoint.mongodb import MongoDBSaver
+
+    saver = MongoDBSaver(get_mongo_client(mongodb_uri), db_name=mongodb_db)
+
+    def load(session_id: str, checkpoint_ns: str) -> Sequence[AnyMessage] | None:
+        config: Any = {
+            "configurable": {"thread_id": session_id, "checkpoint_ns": checkpoint_ns}
+        }
+        try:
+            found = saver.get_tuple(config)
+        except Exception:  # unreadable history: report it as unchecked
+            return None
+        if found is None:
+            return None
+        messages = found.checkpoint.get("channel_values", {}).get("messages")
+        return list(messages) if messages else None
+
+    return load
+
+
+@dataclass
+class _ReRuns:
+    """Evicted results the agent later fetched again, by re-issuing the call."""
+
+    evicted: int = 0
+    rerun: int = 0
+    rerun_tokens: int = 0
+    unchecked: int = 0  # evictions whose graph history could not be read
+    per_tool: Counter[str] = field(default_factory=Counter)
+    evicted_per_tool: Counter[str] = field(default_factory=Counter)
+
+
+def _rerun_stats(docs: Sequence[dict[str, Any]], load: MessageLoader) -> _ReRuns:
+    """Join each first-time eviction against its graph's later tool calls.
+
+    A re-run is a later ``tool_calls`` entry with the same name and arguments
+    as the evicted exchange: the placeholder told the model to re-run the tool
+    and it did, so that saving was partly given back. The rate is the best
+    single check on whether the threshold is too aggressive.
+    """
+    stats = _ReRuns()
+    # tool_call_id -> (session, graph namespace, tool, tokens); first eviction only
+    evicted: dict[str, tuple[str, str, str, int]] = {}
+    for doc in docs:
+        # The pass logs the model node's namespace ("tools:…|model:…"); the
+        # graph's messages are checkpointed under the outer part.
+        ns = str(doc.get("checkpoint_ns") or "").split("|")[0]
+        session = str(doc.get("session_id") or "")
+        for d in doc.get("decisions", []):
+            call_id = d.get("tool_call_id")
+            if d.get("evicted") and call_id and call_id not in evicted:
+                evicted[call_id] = (
+                    session,
+                    ns,
+                    d.get("tool", "?"),
+                    int(d.get("tokens", 0)),
+                )
+    stats.evicted = len(evicted)
+    by_graph: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for call_id, (session, ns, tool, _) in evicted.items():
+        by_graph[(session, ns)].append(call_id)
+        stats.evicted_per_tool[tool] += 1
+    for (session, ns), call_ids in by_graph.items():
+        messages = load(session, ns)
+        if messages is None:
+            stats.unchecked += len(call_ids)
+            continue
+        calls: list[tuple[int, str, str, str]] = []  # (index, id, name, args)
+        for i, msg in enumerate(messages):
+            if isinstance(msg, AIMessage):
+                for call in msg.tool_calls:
+                    args = json.dumps(call["args"], sort_keys=True, default=str)
+                    calls.append((i, call["id"] or "", call["name"], args))
+        by_id = {c[1]: c for c in calls}
+        for call_id in call_ids:
+            origin = by_id.get(call_id)
+            if origin is None:
+                stats.unchecked += 1
+                continue
+            index, _, name, args = origin
+            if any(c[0] > index and c[2] == name and c[3] == args for c in calls):
+                tool, tokens = evicted[call_id][2], evicted[call_id][3]
+                stats.rerun += 1
+                stats.rerun_tokens += tokens
+                stats.per_tool[tool] += 1
+    return stats
+
+
 def report(
     collection: Collection[dict[str, Any]],
     *,
     session_id: str | None = None,
     since: timedelta | None = None,
+    messages: MessageLoader | None = None,
 ) -> str:
-    """Aggregate the savings log into a readable summary."""
+    """Aggregate the savings log into a readable summary.
+
+    With ``messages`` (a :data:`MessageLoader`), evictions are joined against
+    the graphs' checkpointed histories to count how many results the agent
+    fetched again after they were pruned.
+    """
     query: dict[str, Any] = {}
     if session_id:
         query["session_id"] = session_id
@@ -969,6 +1075,28 @@ def report(
         lines += ["", "Fail-open causes (passes):"]
         for kind, n in errors.most_common():
             lines.append(f"  {n:5d}  {kind}")
+    if messages is not None:
+        reruns = _rerun_stats(docs, messages)
+        checked = reruns.evicted - reruns.unchecked
+        lines += [
+            "",
+            f"Evicted results the agent fetched again: {reruns.rerun} of "
+            f"{checked} ({pct(reruns.rerun, checked)}), "
+            f"~{reruns.rerun_tokens:,} tokens re-sent once",
+        ]
+        if reruns.per_tool:
+            lines.append(
+                "  "
+                + "   ".join(
+                    f"{tool}: {n} of {reruns.evicted_per_tool[tool]}"
+                    for tool, n in reruns.per_tool.most_common()
+                )
+            )
+        if reruns.unchecked:
+            lines.append(
+                f"  ({reruns.unchecked} eviction(s) not checked: graph history "
+                "unavailable)"
+            )
     return "\n".join(lines)
 
 
@@ -984,6 +1112,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     rep.add_argument(
         "--since", type=_parse_since, help="only passes newer than e.g. 7d, 12h"
     )
+    rep.add_argument(
+        "--no-reruns",
+        action="store_true",
+        help="skip joining evictions against the checkpointed histories",
+    )
     args = parser.parse_args(argv)
     # Same defaults as the CLI's storage config; kept inline so the report does
     # not import the TUI stack.
@@ -991,7 +1124,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     db = os.environ.get("MONGODB_DB", "checkpointing_db")
     coll_name = os.environ.get("MONGODB_PRUNE_LOG_COLLECTION", "jev_prune_log")
     collection = get_mongo_client(uri)[db][coll_name]
-    print(report(collection, session_id=args.session, since=args.since))
+    loader = None if args.no_reruns else checkpoint_message_loader(uri, db)
+    print(
+        report(collection, session_id=args.session, since=args.since, messages=loader)
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover
