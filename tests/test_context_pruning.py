@@ -700,6 +700,30 @@ def test_goal_keeps_the_tail_of_a_long_task_and_recent_reasoning() -> None:
     )
 
 
+def test_jev_judge_reads_the_sdk_response_shape() -> None:
+    """Built from the real SDK model, so an SDK shape change fails here.
+
+    Every other test uses ``FakeJudge``, and the middleware fails open on any
+    Jev error, so without this an upgrade that broke ``_judgement`` would pass
+    the suite and silently stop all pruning.
+    """
+    from langchain_typesafe import ClassifierResponse
+
+    from ghidra_deep_agent.context_pruning import JevJudge
+
+    response = ClassifierResponse.model_validate(
+        {
+            "model": "jev-1",
+            "answers": {"x0": {"type": "noul", "noul": 0.25}},
+            "usage": {"input_tokens": 42, "output_tokens": 1},
+            "request_id": "req-1",
+        }
+    )
+    result = JevJudge._judgement(response, ["x0", "x1"])
+    # x1 went unanswered: absent, so the middleware keeps it.
+    assert result == Judgement({"x0": 0.25}, 42, "jev-1")
+
+
 # --- live ---------------------------------------------------------------------
 
 
