@@ -9,9 +9,9 @@ objects ``create_deep_agent`` expects.
 How much of the program each sub-agent may change is a ``WritePolicy`` tier
 rather than a read-only boolean — see ``WRITE_POLICIES`` below for why the middle
 tier exists. A tier is enforced two ways: blocked tools are dropped from the
-agent's tool set, and blocked ``action``s (plus the provisional-rename prefix) are
-rejected per call by ``ArgumentValidationMiddleware``. The tier also *writes its
-own prompt text*, so what the model is told always matches what it can do.
+agent's tool set, and the provisional-rename prefix is checked per call by
+``ArgumentValidationMiddleware``. The tier also *writes its own prompt text*, so
+what the model is told always matches what it can do.
 
 Why config-driven: models can be right-sized per agent (a cheap model for recon,
 a capable one for analysis) without code edits, and the coordinator's tool set is
@@ -53,60 +53,75 @@ _CONFIG_FILENAME = "subagents.toml"
 # `tools = "*"` in the config means "every available tool".
 _ALL_TOOLS = "*"
 
-# Every write-only tool: each mutates the program/project (or the knowledge base)
-# with no read mode to preserve, so a restricted context drops it entirely.
-# "Read-only" is then "everything else", meaning newly added *read* tools are
-# auto-covered. Dual read/write tools (``variables``, ``comments``, ``types``,
-# ``struct``, ``bookmarks``) are NOT listed here — they keep their read actions
-# and have their write actions blocked per-call via ``ALL_WRITE_ACTIONS`` (see
-# ``validation.py``).
+# Every Ghidra tool that mutates the program/project (or the knowledge base). A
+# restricted context drops these from its tool set entirely. GhidrAssistMCP 3.x
+# exposes each read and write operation as its own tool, so "read-only" is then
+# "everything else", and newly added *read* tools are auto-covered.
 MUTATION_TOOLS = frozenset(
     {
-        "rename_symbol",
-        "batch_rename",
+        # symbols
+        "rename_function",
+        "rename_label",
+        "rename_local_variable",
+        "rename_global_variable",
+        "rename_symbols_batch",
+        # comments / bookmarks
+        "set_comment",
+        "set_function_comment",
+        "remove_comment",
+        "set_bookmark",
+        "remove_bookmark",
+        # variables / prototypes / types / structs
+        "set_local_variable_type",
+        "set_function_prototype",
+        "set_data_type",
+        "create_enum",
+        "create_typedef",
+        "delete_data_type",
+        "create_structure",
+        "replace_structure",
+        "merge_structure",
+        "set_structure_field",
+        "name_structure_gap",
+        "infer_structure_from_variable",
+        "rename_structure_field",
+        # listing / bytes
         "create_function",
-        "create_data_var",
-        "assemble_code",
+        "create_data_variable",
+        "disassemble_bytes",  # converts undefined bytes to instructions / clears units
+        "patch_instructions",
         "patch_bytes",
-        "disassemble_at",  # converts undefined bytes to instructions / clears units
+        # programs / project
         "open_program",
         "close_program",
         "import_file",
         "export_program",
-        "scripts",
-        "recover_prototypes",  # local tool: commits recovered prototypes (mutates)
-        "apply_switch_override",  # local tool: writes jump-table overrides (mutates)
-        "deobfuscate_cff",  # local tool: rewrites flattened control flow (apply=True)
-        "project_files",  # has a `delete` action
-        "analysis_options",
-        "analysis_control",
-        "save_knowledge",  # KB writes blocked too
+        "delete_project_file",
+        "delete_project_folder",
+        "create_project",
+        "open_project",
+        "save_project",
+        "close_project",
+        # analysis
+        "set_analysis_options",
+        "reset_analysis_options",
+        "save_analysis_preset",
+        "apply_analysis_preset",
+        "delete_analysis_preset",
+        "cancel_analysis",
+        # Ghidra scripts
+        "create_script",
+        "delete_script",
+        "run_script",
+        # local script-driven tools
+        "recover_prototypes",  # commits recovered prototypes
+        "apply_switch_override",  # writes jump-table overrides
+        "deobfuscate_cff",  # rewrites flattened control flow (apply=True)
+        # knowledge base
+        "save_knowledge",
         "update_knowledge",
     }
 )
-# Write ``action`` values on GhidrAssistMCP's consolidated read/write tools. A
-# restricted context rejects these via the argument-validation middleware while
-# the tool's read actions (list/get/field_xrefs) still work.
-# Action strings verified against the live server's tool schemas.
-ALL_WRITE_ACTIONS: dict[str, frozenset[str]] = {
-    "variables": frozenset({"rename", "retype", "set_prototype"}),
-    "comments": frozenset({"set", "remove"}),
-    "types": frozenset(
-        {"set", "delete", "create_struct", "create_enum", "create_typedef"}
-    ),
-    "struct": frozenset(
-        {
-            "create",
-            "modify",
-            "merge",
-            "set_field",
-            "name_gap",
-            "auto_create",
-            "rename_field",
-        }
-    ),
-    "bookmarks": frozenset({"set", "remove"}),
-}
 
 # --- Write policy tiers --------------------------------------------------------
 #
@@ -119,29 +134,31 @@ ALL_WRITE_ACTIONS: dict[str, frozenset[str]] = {
 # comments, bookmarks, knowledge-base entries — while heavyweight, hard-to-undo
 # mutations stay with the specialists that own them.
 #
-# The restricted tiers are defined by SUBTRACTION from the full-lockdown sets
-# above, so a write tool or write action added later is blocked by default in
-# every restricted tier (fail closed) until it is explicitly allowed.
+# The restricted tiers are defined by SUBTRACTION from the full-lockdown set
+# above, so a write tool added to it later is blocked by default in every
+# restricted tier (fail closed) until it is explicitly allowed.
 
-# Write-only tools the ``annotations`` tier keeps. Renames are metadata and
-# trivially reversible; KB writes never touch the program at all.
+# Write tools the ``annotations`` tier keeps. Renames are metadata and trivially
+# reversible; comments and bookmarks are annotations; KB writes never touch the
+# program at all. Notably absent: retypes, prototypes, and every type/struct
+# tool — type and signature surgery is program-global and stays with
+# ``type-fixer`` / ``prototype-fixer``.
 ANNOTATION_TOOLS = frozenset(
     {
-        "rename_symbol",
-        "batch_rename",
+        "rename_function",
+        "rename_label",
+        "rename_local_variable",
+        "rename_global_variable",
+        "rename_symbols_batch",
+        "set_comment",
+        "set_function_comment",
+        "remove_comment",
+        "set_bookmark",
+        "remove_bookmark",
         "save_knowledge",
         "update_knowledge",
     }
 )
-# Write ``action``s the ``annotations`` tier keeps on the dual read/write tools.
-# Notably absent: ``variables:retype``/``set_prototype`` and everything on
-# ``types``/``struct`` — type and signature surgery is program-global and stays
-# with ``type-fixer`` / ``prototype-fixer``.
-ANNOTATION_ACTIONS: dict[str, frozenset[str]] = {
-    "variables": frozenset({"rename"}),
-    "comments": frozenset({"set", "remove"}),
-    "bookmarks": frozenset({"set", "remove"}),
-}
 
 # A rename applied by an ``annotations``-tier agent must carry this prefix. The
 # tier is for *provisional* conclusions, so the uncertainty is encoded in the name
@@ -154,10 +171,11 @@ _PENDING_PROTOCOL = f"""
 ## Your write scope in this session
 You may apply CHEAP, REVISABLE annotations directly in Ghidra as you work, and you
 SHOULD — what you persist is what the next sub-agent sees instead of re-deriving:
-- rename functions, variables, and parameters (`rename_symbol`, `batch_rename`,
-  `variables` with `action: rename`),
-- add comments (`comments` with `action: set`),
-- drop bookmarks (`bookmarks` with `action: set`),
+- rename functions, labels, variables, and parameters (`rename_function`,
+  `rename_label`, `rename_local_variable`, `rename_global_variable`,
+  `rename_symbols_batch`),
+- add comments (`set_comment`, `set_function_comment`),
+- drop bookmarks (`set_bookmark`),
 - record findings in the knowledge base (`save_knowledge`, `update_knowledge`).
 
 Every rename you apply MUST start with `{PROVISIONAL_RENAME_PREFIX}` — the tool
@@ -173,14 +191,12 @@ or assemble bytes, run scripts, or apply switch/CFF overrides.
 
 ## PENDING protocol — how a change you cannot apply gets made
 When the evidence supports a change outside your scope, do BOTH of these:
-1. File it in Ghidra: `bookmarks` with `action: set`, `category: pending-change`,
+1. File it in Ghidra: `set_bookmark` with `category: pending-change`,
    at the relevant address, with the comment
    `pending <retype|prototype|struct|switch|patch|other>: <target> -> <detail>`.
    This is a durable queue — it survives this delegation, and the coordinator
    drains it to the specialist that owns the change.
 2. List it in your summary under a `PENDING:` heading, one line per item.
-A `read_only_error` result means the change is out of scope: file it as pending.
-Never retry the blocked call.
 """.strip()
 
 _READ_ONLY_SECTION = """
@@ -191,8 +207,7 @@ prototypes, types, structs, patches, or scripts. Do not ask for those tools.
 
 State the concrete changes you would recommend (renames, retypes, comments,
 prototypes, knowledge-base entries) in your summary instead of applying them, so
-the coordinator can fold them into its plan or answer. A `read_only_error` result
-means the tool is blocked here — do not retry it.
+the coordinator can fold them into its plan or answer.
 """.strip()
 
 
@@ -200,9 +215,8 @@ means the tool is blocked here — do not retry it.
 class WritePolicy:
     """How much of the program a sub-agent may mutate.
 
-    ``blocked_tools`` are dropped from the agent's tool set entirely;
-    ``blocked_actions`` are rejected per-call by the argument-validation
-    middleware. ``prompt_section`` and ``description_suffix`` are appended in
+    ``blocked_tools`` are dropped from the agent's tool set entirely.
+    ``prompt_section`` and ``description_suffix`` are appended in
     ``build_subagents`` rather than written into ``subagents.toml``, so the text
     the model sees can never drift from what the middleware enforces, and one
     TOML entry can describe itself correctly under different policies (the same
@@ -212,23 +226,10 @@ class WritePolicy:
 
     name: str
     blocked_tools: frozenset[str]
-    blocked_actions: Mapping[str, frozenset[str]]
     # Rename calls must use this prefix; None disables the check.
     rename_prefix: str | None
     prompt_section: str
     description_suffix: str
-
-
-def _actions_minus(
-    allowed: Mapping[str, frozenset[str]],
-) -> dict[str, frozenset[str]]:
-    """``ALL_WRITE_ACTIONS`` minus ``allowed``, dropping now-empty entries."""
-    remaining: dict[str, frozenset[str]] = {}
-    for tool, actions in ALL_WRITE_ACTIONS.items():
-        blocked = actions - allowed.get(tool, frozenset())
-        if blocked:
-            remaining[tool] = blocked
-    return remaining
 
 
 WRITE_POLICIES: dict[str, WritePolicy] = {
@@ -236,7 +237,6 @@ WRITE_POLICIES: dict[str, WritePolicy] = {
     "full": WritePolicy(
         name="full",
         blocked_tools=frozenset(),
-        blocked_actions={},
         rename_prefix=None,
         prompt_section="",
         description_suffix="",
@@ -245,7 +245,6 @@ WRITE_POLICIES: dict[str, WritePolicy] = {
     "annotations": WritePolicy(
         name="annotations",
         blocked_tools=MUTATION_TOOLS - ANNOTATION_TOOLS,
-        blocked_actions=_actions_minus(ANNOTATION_ACTIONS),
         rename_prefix=PROVISIONAL_RENAME_PREFIX,
         prompt_section=_PENDING_PROTOCOL,
         description_suffix=(
@@ -259,7 +258,6 @@ WRITE_POLICIES: dict[str, WritePolicy] = {
     "none": WritePolicy(
         name="none",
         blocked_tools=MUTATION_TOOLS,
-        blocked_actions=ALL_WRITE_ACTIONS,
         rename_prefix=None,
         prompt_section=_READ_ONLY_SECTION,
         description_suffix=" Read-only: applies no changes of any kind.",
@@ -280,11 +278,20 @@ READ_ONLY_WRITE_POLICY = "none"
 #     receive it as a callable tool, or it starts manual polling — the very
 #     context-bloating spin-loop the middleware exists to prevent. Withholding is
 #     safe because the middleware and ``recover_prototypes`` look the tool up in
-#     the *raw* MCP tool list (cli.py), upstream of this filter.
+#     the *raw* MCP tool list (cli.py), upstream of this filter. ``list_tasks`` and
+#     ``cancel_task`` are the rest of that job API and are withheld with it.
+#   ``create_project`` / ``open_project`` / ``close_project`` replace or close the
+#     active Ghidra project. A session is bound to one program in it, so every
+#     later tool call would fail; that is the human's call, not an agent's.
 WITHHELD_TOOLS = frozenset(
     {
         "analyze_program",
         "get_task_status",
+        "list_tasks",
+        "cancel_task",
+        "create_project",
+        "open_project",
+        "close_project",
     }
 )
 
@@ -634,14 +641,12 @@ def build_subagents(
             excluded = set(sub.exclude)
             tools = [tool for tool in tools if tool.name not in excluded]
         policy = WRITE_POLICIES[policy_override or sub.write_policy]
-        # Drop the tier's blocked write-only tools outright; its blocked write
-        # `action`s on the dual read/write tools are rejected per call by the
-        # middleware, which also enforces the provisional-rename prefix.
+        # Drop the tier's blocked write tools outright; the middleware enforces
+        # the provisional-rename prefix on the renames the tier keeps.
         if policy.blocked_tools:
             tools = [tool for tool in tools if tool.name not in policy.blocked_tools]
         validation_mw = create_argument_validation_middleware(
-            policy.blocked_actions or None,
-            rename_prefix=policy.rename_prefix,
+            rename_prefix=policy.rename_prefix
         )
         model = resolve_model(sub.model, sub.max_tokens)
         spec: SubAgent = {

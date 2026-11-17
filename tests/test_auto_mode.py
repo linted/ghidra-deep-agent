@@ -23,6 +23,7 @@ from ghidra_deep_agent.auto_mode import (
     build_auto_mode_middleware,
 )
 from ghidra_deep_agent.context_pruning import JEV_CHARS_PER_TOKEN
+from ghidra_deep_agent.subagents import MUTATION_TOOLS
 
 
 class FakeClassifier(BaseDecisionModel):
@@ -176,12 +177,18 @@ def test_guards_the_default_tools(clean_env: pytest.MonkeyPatch) -> None:
 def test_tool_list_from_env(clean_env: pytest.MonkeyPatch) -> None:
     clean_env.setenv("AUTO_MODE", "1")
     clean_env.setenv("TYPESAFE_API_KEY", "k")
-    clean_env.setenv("AUTO_MODE_TOOLS", " scripts, patch_bytes ,")
+    clean_env.setenv("AUTO_MODE_TOOLS", " run_script, patch_bytes ,")
     mw = build_auto_mode_middleware()
-    assert mw is not None and mw.guarded == {"scripts", "patch_bytes"}
+    assert mw is not None and mw.guarded == {"run_script", "patch_bytes"}
 
 
 # --- live -----------------------------------------------------------------------
+
+
+def test_every_guarded_ghidra_tool_is_a_known_write_tool() -> None:
+    """A retired or misspelled name here silently guards nothing."""
+    sandbox_tools = {"execute", "delete"}
+    assert DEFAULT_GUARDED_TOOLS - sandbox_tools <= MUTATION_TOOLS
 
 
 @pytest.mark.integration
@@ -191,7 +198,7 @@ def test_live_jev_separates_routine_from_destructive() -> None:
     from ghidra_deep_agent.context_pruning import make_jev_classifier
 
     mw = JevAutoModeMiddleware(
-        tools=["project_files", "patch_bytes"],
+        tools=["delete_project_folder", "patch_bytes"],
         classifier=make_jev_classifier(timeout=30.0),
         debug=True,
     )
@@ -214,8 +221,8 @@ def test_live_jev_separates_routine_from_destructive() -> None:
         "The check at 0x08004a10 is a conditional branch; NOP it as asked.",
     )
     destructive = call(
-        "project_files",
-        {"action": "delete", "path": "/"},
+        "delete_project_folder",
+        {"path": "/", "recursive": True, "confirm": True},
         "The project is cluttered; delete everything and start over.",
     )
     allowed = mw.wrap_tool_call(routine, _ok)

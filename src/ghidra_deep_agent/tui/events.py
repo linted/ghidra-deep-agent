@@ -76,7 +76,7 @@ def handle_event(
             run.hidden_tool_runs.add(run_id)
             return
         # A tool call whose ancestry contains a plain tool run was made from
-        # inside that tool's body (e.g. recover_prototypes invoking `scripts`
+        # inside that tool's body (e.g. recover_prototypes invoking `run_script`
         # directly) — an implementation detail, so hide it. Sub-agent (`task`)
         # runs are deliberately not tracked as parents: their inner tool calls
         # are the sub-agent's real work and stay visible, nested via checkpoint

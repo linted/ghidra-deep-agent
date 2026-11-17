@@ -12,7 +12,7 @@ This middleware intercepts calls to two allowlists of read tools, keys them on
 
 - an **immutable** tier (strings/imports/exports/entry points/metadata) whose
   entries only ever expire by TTL, and
-- a **mutable** tier (``get_code``/``xrefs``/``get_data_at``) whose output
+- a **mutable** tier (decompilation/disassembly, xrefs, hexdumps) whose output
   *does* change when the agent renames/retypes/comments — a rename of function
   A changes the decompilation of every caller of A, so per-address invalidation
   is unsound and the whole tier is flushed for the binary whenever any Ghidra
@@ -58,14 +58,14 @@ from ghidra_deep_agent.mongo_util import get_mongo_client
 
 # Read tools whose output is invariant for a program regardless of any renames /
 # retypes / comments the agent applies during the session. Deliberately
-# conservative: tools like ``get_functions`` / ``search_functions_by_name`` are
+# conservative: tools like ``list_functions`` / ``search_functions`` are
 # excluded because renaming a function changes their output mid-session.
 _DEFAULT_CACHED_TOOLS = (
     "search_strings",
-    "get_imports",
-    "get_exports",
-    "get_entry_points",
-    "get_binary_info",
+    "list_imports",
+    "list_exports",
+    "list_entry_points",
+    "get_program_info",
 )
 
 # Read tools whose output changes as the agent mutates the program (renames
@@ -73,9 +73,15 @@ _DEFAULT_CACHED_TOOLS = (
 # Cacheable only because every mutation path goes through the MCP tools below,
 # which flush this tier for the binary.
 _DEFAULT_MUTABLE_CACHED_TOOLS = (
-    "get_code",
-    "xrefs",
-    "get_data_at",
+    "get_pseudocode",
+    "get_disassembly",
+    "get_pcode",
+    "get_xrefs_to",
+    "get_xrefs_from",
+    "get_callers",
+    "get_callees",
+    "get_call_graph",
+    "get_hexdump",
 )
 
 # Ghidra-mutating tools (see the function-analyst allowlist in subagents.toml).
@@ -83,25 +89,40 @@ _DEFAULT_MUTABLE_CACHED_TOOLS = (
 # excluded — they don't touch Ghidra state.
 _MUTATING_TOOLS = frozenset(
     {
-        "rename_symbol",
-        "batch_rename",
-        "variables",
-        "comments",
-        "types",
-        "struct",
+        "rename_function",
+        "rename_label",
+        "rename_local_variable",
+        "rename_global_variable",
+        "rename_symbols_batch",
+        "set_comment",
+        "set_function_comment",
+        "remove_comment",
+        "set_local_variable_type",
+        "set_function_prototype",
+        "set_data_type",
+        "create_enum",
+        "create_typedef",
+        "delete_data_type",
+        "create_structure",
+        "replace_structure",
+        "merge_structure",
+        "set_structure_field",
+        "name_structure_gap",
+        "infer_structure_from_variable",
+        "rename_structure_field",
         "create_function",
-        "create_data_var",
+        "create_data_variable",
         "patch_bytes",
-        "assemble_code",
+        "patch_instructions",
         # Converts undefined bytes to instructions / clears code units, which
         # changes disassembly and decompilation output.
-        "disassemble_at",
-        # Fully general mutation path: an agent with `scripts` can run arbitrary
-        # Ghidra scripts, including ones that rename/retype/patch.
-        "scripts",
+        "disassemble_bytes",
+        # Fully general mutation path: an agent with `run_script` can run
+        # arbitrary Ghidra scripts, including ones that rename/retype/patch.
+        "run_script",
         # Local tool (prototype_tools.py) that commits recovered prototypes via a
         # Ghidra script. It's the name seen in the graph — the coordinator calls
-        # it, not `scripts` — so invalidation keys on it here.
+        # it, not `run_script` — so invalidation keys on it here.
         "recover_prototypes",
         # Local tool (switch_tools.py) that writes a jump-table override + refs +
         # disassembly via a Ghidra script — mutates control flow, so a success
@@ -114,11 +135,12 @@ _MUTATING_TOOLS = frozenset(
         # can't tell the two apart from the result text, so invalidating on both is
         # the safe side of the trade (a needless flush only costs a re-read).
         "deobfuscate_cff",
-        # `bookmarks` is deliberately absent: bookmark writes don't affect any
-        # cached tier's output (neither tier renders bookmarks), and they are
-        # written constantly as the pending-change queue — flushing the mutable
-        # tier on each one would defeat the cache. Revisit if `bookmarks` is ever
-        # added to a cached tier via the env allowlist overrides.
+        # `set_bookmark` / `remove_bookmark` are deliberately absent: bookmark
+        # writes don't affect any cached tier's output (neither tier renders
+        # bookmarks), and they are written constantly as the pending-change
+        # queue — flushing the mutable tier on each one would defeat the cache.
+        # Revisit if `list_bookmarks` is ever added to a cached tier via the env
+        # allowlist overrides.
     }
 )
 

@@ -1,7 +1,7 @@
 """Unit tests for the local ``recover_prototypes`` tool (``prototype_tools.py``).
 
 Mirrors ``test_switch_tools.py`` for the prototype-recovery sibling: graceful
-degradation when the server's ``scripts`` tool is absent, and the manifest ->
+degradation when the server's script tools are absent, and the manifest ->
 summary formatting the model actually reads. The Java script itself runs inside
 Ghidra and is only compile-checked (``test_switch_scripts_compile.py``).
 
@@ -58,12 +58,14 @@ def _payload(**overrides: Any) -> dict[str, Any]:
 
 
 def test_no_scripts_tool_yields_no_tools() -> None:
-    """The server ships `scripts` disabled by default; degrade, don't crash."""
+    """The server ships its script tools disabled by default; degrade, don't crash."""
     assert build_prototype_tools(list(_tools(["get_code"]))) == []
 
 
 def test_scripts_tool_yields_the_recover_tool() -> None:
-    tools = build_prototype_tools(list(_tools(["scripts", "get_task_status"])))
+    tools = build_prototype_tools(
+        list(_tools(["create_script", "run_script", "get_task_status"]))
+    )
     assert [t.name for t in tools] == ["recover_prototypes"]
 
 

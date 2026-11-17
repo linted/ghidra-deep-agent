@@ -23,21 +23,32 @@ MARK_END = "GDA_JSON>>>"
 PATTERN = manifest_pattern(MARK_START, MARK_END)
 
 
-class FakeScriptsTool:
-    """Records the `scripts` calls and replays a canned run output."""
+class FakeScriptTool:
+    """One of `create_script` / `run_script`, logging into a shared call list."""
 
-    name = "scripts"
+    def __init__(self, scripts: FakeScripts, name: str) -> None:
+        self._scripts = scripts
+        self.name = name
+
+    async def ainvoke(self, args: dict[str, Any]) -> str:
+        self._scripts.calls.append((self.name, args))
+        if self.name == "create_script":
+            return self._scripts.create_output
+        return self._scripts.run_output
+
+
+class FakeScripts:
+    """Records the script-tool calls in order and replays canned outputs."""
 
     def __init__(self, run_output: str) -> None:
         self.run_output = run_output
         self.create_output = "created"
-        self.calls: list[dict[str, Any]] = []
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.create = FakeScriptTool(self, "create_script")
+        self.run = FakeScriptTool(self, "run_script")
 
-    async def ainvoke(self, args: dict[str, Any]) -> str:
-        self.calls.append(args)
-        if args["action"] == "create":
-            return self.create_output
-        return self.run_output
+    def runner(self) -> GhidraScriptRunner:
+        return GhidraScriptRunner(cast(Any, self.create), cast(Any, self.run), None)
 
 
 class FakeNamedTool:
@@ -45,9 +56,9 @@ class FakeNamedTool:
         self.name = name
 
 
-def _runner(run_output: str) -> tuple[GhidraScriptRunner, FakeScriptsTool]:
-    scripts = FakeScriptsTool(run_output)
-    return GhidraScriptRunner(cast(Any, scripts), None), scripts
+def _runner(run_output: str) -> tuple[GhidraScriptRunner, FakeScripts]:
+    scripts = FakeScripts(run_output)
+    return scripts.runner(), scripts
 
 
 def _manifest(body: str) -> str:
@@ -57,25 +68,33 @@ def _manifest(body: str) -> str:
 # ── tool discovery ────────────────────────────────────────────────────────────
 
 
-def test_missing_scripts_tool_returns_none() -> None:
+def test_missing_script_tools_return_none() -> None:
     assert find_scripts_tools([], "widgets disabled.") is None
-    others = [cast(Any, FakeNamedTool("get_code"))]
+    others = [cast(Any, FakeNamedTool("get_pseudocode"))]
     assert find_scripts_tools(others, "widgets disabled.") is None
 
 
-def test_finds_scripts_and_optional_status_tool() -> None:
-    tools = [cast(Any, FakeNamedTool(n)) for n in ("scripts", "get_task_status")]
-    found = find_scripts_tools(tools, "n/a")
+def test_both_script_tools_are_required() -> None:
+    """Either one alone is useless: a deploy with no run, or a run of nothing."""
+    for name in ("create_script", "run_script"):
+        assert find_scripts_tools([cast(Any, FakeNamedTool(name))], "n/a") is None
+
+
+def test_finds_script_tools_and_optional_status_tool() -> None:
+    names = ("create_script", "run_script", "get_task_status")
+    found = find_scripts_tools([cast(Any, FakeNamedTool(n)) for n in names], "n/a")
     assert found is not None
-    scripts_tool, status_tool = found
-    assert scripts_tool.name == "scripts"
+    create_tool, run_tool, status_tool = found
+    assert create_tool.name == "create_script"
+    assert run_tool.name == "run_script"
     assert status_tool is not None and status_tool.name == "get_task_status"
 
 
 def test_status_tool_is_optional() -> None:
-    found = find_scripts_tools([cast(Any, FakeNamedTool("scripts"))], "n/a")
+    names = ("create_script", "run_script")
+    found = find_scripts_tools([cast(Any, FakeNamedTool(n)) for n in names], "n/a")
     assert found is not None
-    assert found[1] is None
+    assert found[2] is None
 
 
 # ── deploy + run ──────────────────────────────────────────────────────────────
@@ -87,25 +106,23 @@ def test_script_is_redeployed_with_overwrite_then_run() -> None:
     asyncio.run(runner.run("x.java", "class X {}"))
 
     create, run = scripts.calls
-    assert create == {
-        "action": "create",
-        "name": "x.java",
-        "source": "class X {}",
-        "overwrite": True,
-    }
-    assert run == {"action": "run", "name": "x.java"}
+    assert create == (
+        "create_script",
+        {"name": "x.java", "source": "class X {}", "overwrite": True},
+    )
+    assert run == ("run_script", {"name": "x.java"})
 
 
 def test_run_args_are_forwarded() -> None:
     runner, scripts = _runner(_manifest("{}"))
     asyncio.run(runner.run("x.java", "src", ["dry_run"]))
-    assert scripts.calls[1]["args"] == ["dry_run"]
+    assert scripts.calls[1][1]["args"] == ["dry_run"]
 
 
 def test_empty_run_args_are_omitted() -> None:
     runner, scripts = _runner(_manifest("{}"))
     asyncio.run(runner.run("x.java", "src", []))
-    assert "args" not in scripts.calls[1]
+    assert "args" not in scripts.calls[1][1]
 
 
 # ── manifest parsing ──────────────────────────────────────────────────────────
@@ -182,9 +199,9 @@ def test_missing_manifest_surfaces_the_deploy_output() -> None:
     is by far the likeliest reason a run produced no manifest — the model can't
     act on it unless it is shown.
     """
-    scripts = FakeScriptsTool("no manifest here")
+    scripts = FakeScripts("no manifest here")
     scripts.create_output = "error: cannot find symbol\n  symbol: class Addr"
-    runner = GhidraScriptRunner(cast(Any, scripts), None)
+    runner = scripts.runner()
 
     _payload, _raw, error = asyncio.run(
         runner.run_manifest("x.java", "src", PATTERN, "my_tool")

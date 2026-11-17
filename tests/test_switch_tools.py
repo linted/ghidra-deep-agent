@@ -1,7 +1,7 @@
 """Unit tests for the local jump-table tools (``switch_tools.py``).
 
 These cover the parts that run in *this* process — graceful degradation when the
-server's ``scripts`` tool is absent, the JSON-manifest extraction/formatting, and
+server's script tools are absent, the JSON-manifest extraction/formatting, and
 the ``apply_switch_override`` argument validation — without a live Ghidra. The
 Java scripts themselves run inside Ghidra and are exercised by the end-to-end
 check in the plan, not here.
@@ -54,14 +54,16 @@ def _tools(names: list[str]) -> Sequence[BaseTool]:
 
 
 def test_returns_empty_when_scripts_tool_absent() -> None:
-    # No `scripts` tool from the server -> the feature disables itself, matching
+    # No script tools from the server -> the feature disables itself, matching
     # build_prototype_tools' contract.
     assert build_switch_tools([]) == []
     assert build_switch_tools(list(_tools(["get_code", "xrefs"]))) == []
 
 
 def test_builds_both_tools_when_scripts_present() -> None:
-    tools = build_switch_tools(list(_tools(["scripts", "get_task_status"])))
+    tools = build_switch_tools(
+        list(_tools(["create_script", "run_script", "get_task_status"]))
+    )
     names = {t.name for t in tools}
     assert names == {
         "find_unrecovered_switches",
@@ -178,7 +180,9 @@ def test_apply_summary_reports_failure() -> None:
 
 
 def _apply_tool() -> BaseTool:
-    tools = build_switch_tools(list(_tools(["scripts", "get_task_status"])))
+    tools = build_switch_tools(
+        list(_tools(["create_script", "run_script", "get_task_status"]))
+    )
     tool = next(t for t in tools if t.name == "apply_switch_override")
     return tool
 

@@ -17,8 +17,8 @@ from langchain_core.messages import ToolMessage
 
 from ghidra_deep_agent.mcp_cache import _MUTATING_TOOLS, MCPReadCacheMiddleware
 
-CACHED = frozenset({"get_binary_info"})
-MUTABLE = frozenset({"get_code"})
+CACHED = frozenset({"get_program_info"})
+MUTABLE = frozenset({"get_pseudocode"})
 
 
 class FakeCollection:
@@ -69,7 +69,7 @@ def test_every_listing_mutating_local_tool_is_registered() -> None:
     """The local Ghidra-script tools that write must all flush the cache.
 
     `deobfuscate_cff` patches indirect branches into direct ones with apply=True;
-    it was added (#40) without being registered here, so `get_code` kept serving
+    it was added (#40) without being registered here, so `get_pseudocode` kept serving
     pre-patch decompilation for the whole TTL.
     """
     for name in ("recover_prototypes", "apply_switch_override", "deobfuscate_cff"):
@@ -83,18 +83,20 @@ def test_read_only_switch_tool_is_not_registered() -> None:
 def test_general_mutation_paths_are_registered() -> None:
     """Tools that change bytes or code units invalidate the decompilation too.
 
-    `scripts` is the widest hole of the set: an agent holding it can run any
+    `run_script` is the widest hole of the set: an agent holding it can run any
     Ghidra script, including one that renames or patches, so leaving it out let
-    `get_code` serve pre-mutation output for the full TTL.
+    `get_pseudocode` serve pre-mutation output for the full TTL.
     """
     for name in (
-        "scripts",
+        "run_script",
         "patch_bytes",
-        "assemble_code",
-        "disassemble_at",
-        "create_data_var",
+        "patch_instructions",
+        "disassemble_bytes",
+        "create_data_variable",
     ):
         assert name in _MUTATING_TOOLS
+    # Assembling without patching changes nothing.
+    assert "assemble_instructions" not in _MUTATING_TOOLS
 
 
 def test_bookmarks_do_not_flush_the_cache() -> None:
@@ -104,12 +106,13 @@ def test_bookmarks_do_not_flush_the_cache() -> None:
     the decompilation cache for nothing — precisely the re-read cost the cache
     exists to avoid.
     """
-    assert "bookmarks" not in _MUTATING_TOOLS
+    assert "set_bookmark" not in _MUTATING_TOOLS
+    assert "remove_bookmark" not in _MUTATING_TOOLS
 
     mw, coll = _middleware()
-    mw.wrap_tool_call(_request("get_code"), lambda r: _ok("get_code", "v1"))
+    mw.wrap_tool_call(_request("get_pseudocode"), lambda r: _ok("get_pseudocode", "v1"))
 
-    mw.wrap_tool_call(_request("bookmarks"), lambda r: _ok("bookmarks", "added"))
+    mw.wrap_tool_call(_request("set_bookmark"), lambda r: _ok("set_bookmark", "added"))
 
     assert coll.docs != {}
     assert mw.invalidations == 0
@@ -124,10 +127,10 @@ def test_repeated_read_is_served_from_cache() -> None:
 
     def handler(req: Any) -> ToolMessage:
         calls.append(req)
-        return _ok("get_code", "decompiled v1")
+        return _ok("get_pseudocode", "decompiled v1")
 
-    mw.wrap_tool_call(_request("get_code"), handler)
-    result = mw.wrap_tool_call(_request("get_code"), handler)
+    mw.wrap_tool_call(_request("get_pseudocode"), handler)
+    result = mw.wrap_tool_call(_request("get_pseudocode"), handler)
 
     assert len(calls) == 1
     assert mw.hits == 1
@@ -137,7 +140,7 @@ def test_repeated_read_is_served_from_cache() -> None:
 
 def test_mutation_flushes_the_mutable_tier() -> None:
     mw, coll = _middleware()
-    mw.wrap_tool_call(_request("get_code"), lambda r: _ok("get_code", "v1"))
+    mw.wrap_tool_call(_request("get_pseudocode"), lambda r: _ok("get_pseudocode", "v1"))
     assert coll.docs
 
     mw.wrap_tool_call(
@@ -150,7 +153,7 @@ def test_mutation_flushes_the_mutable_tier() -> None:
 
 def test_failed_mutation_does_not_flush() -> None:
     mw, coll = _middleware()
-    mw.wrap_tool_call(_request("get_code"), lambda r: _ok("get_code", "v1"))
+    mw.wrap_tool_call(_request("get_pseudocode"), lambda r: _ok("get_pseudocode", "v1"))
 
     def failing(req: Any) -> ToolMessage:
         msg = _ok("deobfuscate_cff", "boom")
@@ -170,7 +173,7 @@ def test_read_flushed_while_in_flight_is_not_stored() -> None:
     """A slow read must not resurrect pre-mutation output after a flush.
 
     One middleware instance is shared by the coordinator and every sub-agent, so
-    a `get_code` taking tens of seconds can return *after* a concurrent rename
+    a `get_pseudocode` taking tens of seconds can return *after* a concurrent rename
     flushed the tier. Without the generation check its stale result would be
     written back and outlive the flush for the full TTL.
     """
@@ -179,11 +182,11 @@ def test_read_flushed_while_in_flight_is_not_stored() -> None:
     def slow_read(req: Any) -> ToolMessage:
         # A mutation lands while this read is still running.
         mw.wrap_tool_call(
-            _request("rename_symbol"), lambda r: _ok("rename_symbol", "renamed")
+            _request("rename_function"), lambda r: _ok("rename_function", "renamed")
         )
-        return _ok("get_code", "pre-rename decompilation")
+        return _ok("get_pseudocode", "pre-rename decompilation")
 
-    mw.wrap_tool_call(_request("get_code"), slow_read)
+    mw.wrap_tool_call(_request("get_pseudocode"), slow_read)
 
     assert coll.docs == {}, "stale read was stored after the flush"
 
@@ -194,11 +197,11 @@ def test_immutable_tier_read_is_stored_even_across_a_flush() -> None:
 
     def slow_read(req: Any) -> ToolMessage:
         mw.wrap_tool_call(
-            _request("rename_symbol"), lambda r: _ok("rename_symbol", "renamed")
+            _request("rename_function"), lambda r: _ok("rename_function", "renamed")
         )
-        return _ok("get_binary_info", "ELF 32-bit ARM")
+        return _ok("get_program_info", "ELF 32-bit ARM")
 
-    mw.wrap_tool_call(_request("get_binary_info"), slow_read)
+    mw.wrap_tool_call(_request("get_program_info"), slow_read)
 
     assert len(coll.docs) == 1
 
@@ -212,8 +215,8 @@ def test_async_path_also_skips_a_flushed_read() -> None:
             _request("apply_switch_override"),
             lambda r: _ok("apply_switch_override", "applied"),
         )
-        return _ok("get_code", "pre-patch decompilation")
+        return _ok("get_pseudocode", "pre-patch decompilation")
 
-    asyncio.run(mw.awrap_tool_call(_request("get_code"), slow_read))
+    asyncio.run(mw.awrap_tool_call(_request("get_pseudocode"), slow_read))
 
     assert coll.docs == {}

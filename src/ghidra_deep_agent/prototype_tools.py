@@ -2,27 +2,26 @@
 
 This is a normal LangChain tool that runs the prototype-recovery *GhidraScript*
 (``recover_prototypes_script.SCRIPT_SOURCE``) inside the running Ghidra via
-GhidrAssistMCP's ``scripts`` executor, then hands the model back only the
+GhidrAssistMCP's script tools, then hands the model back only the
 ambiguous cases that still need judgement.
 
-Why a wrapper instead of letting the model drive ``scripts`` directly: the whole
+Why a wrapper instead of letting the model drive ``run_script`` directly: the whole
 point is to keep the deterministic, mechanical work (decompiler parameter
 recovery, comparing committed vs recovered prototypes, and committing the
 clear-cut fixes) out of the LLM. The script does that work in one Ghidra-side
 pass; this tool just deploys it, runs it, resolves the async task, and shrinks the
 JSON manifest to a compact summary + the review list.
 
-Server prerequisite: GhidrAssistMCP ships the ``scripts`` tool **disabled by
-default** — it must be enabled server-side for this tool to appear. When it is
-absent, ``build_prototype_tools`` returns ``[]`` (with a warning) and the agent
-runs exactly as before.
+Server prerequisite: GhidrAssistMCP ships ``create_script`` / ``run_script``
+**disabled by default** — both must be enabled server-side for this tool to
+appear. When either is absent, ``build_prototype_tools`` returns ``[]`` (with a
+warning) and the agent runs exactly as before.
 
-The ``scripts`` tool is action-based (verified against GhidrAssistMCP): ``create``
-takes ``name`` + ``source`` (+ ``overwrite``), ``run`` executes a script by name
-(+ optional ``args``). The script returns its result on stdout, which the server
-surfaces in the run result; if that ever stops being true this tool reports it
-plainly (there is no file fallback: the server may be remote, so no shared
-filesystem is assumed).
+``create_script`` takes ``name`` + ``source`` (+ ``overwrite``); ``run_script``
+executes a script by name (+ optional ``args``). The script returns its result
+on stdout, which the server surfaces in the run result; if that ever stops being
+true this tool reports it plainly (there is no file fallback: the server may be
+remote, so no shared filesystem is assumed).
 """
 
 from typing import Any
@@ -123,7 +122,7 @@ def _format_summary(payload: dict[str, Any]) -> str:
 def build_prototype_tools(mcp_tools: list[BaseTool]) -> list[BaseTool]:
     """Build the ``recover_prototypes`` tool, or ``[]`` if unsupported.
 
-    Requires the GhidrAssistMCP ``scripts`` tool (disabled by default server-side);
+    Requires GhidrAssistMCP's ``create_script``/``run_script`` (disabled by default);
     without it the tool is omitted with a warning. ``get_task_status`` is used to
     resolve the script's async task when present.
     """

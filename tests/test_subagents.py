@@ -1,7 +1,7 @@
 """
 Unit tests for the config-driven sub-agent builder, focused on the write-policy
-tiers: each tier must drop the right write-only tools from the tool set, hand the
-validation middleware the right blocked actions and rename prefix, and append its
+tiers: each tier must drop the right write tools from the tool set, hand the
+validation middleware the right rename prefix, and append its
 generated write-scope text — while ``policy_override`` beats whatever the config
 asked for (that override is what makes plan/ask mode read-only by construction).
 
@@ -22,7 +22,6 @@ from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.tools import BaseTool
 
 from ghidra_deep_agent.subagents import (
-    ALL_WRITE_ACTIONS,
     MUTATION_TOOLS,
     PROVISIONAL_RENAME_PREFIX,
     READ_ONLY_WRITE_POLICY,
@@ -32,13 +31,19 @@ from ghidra_deep_agent.subagents import (
 )
 from ghidra_deep_agent.validation import ArgumentValidationMiddleware
 
-# A mix of write-only tools (dropped for restricted agents) and read tools (kept).
+# A mix of write tools (dropped for restricted agents) and read tools (kept).
 _TOOL_NAMES = [
-    "rename_symbol",
-    "get_code",
-    "xrefs",
+    "rename_function",
+    "rename_local_variable",
+    "set_comment",
+    "set_bookmark",
+    "set_local_variable_type",
+    "set_function_prototype",
+    "create_structure",
+    "get_pseudocode",
+    "get_xrefs_to",
+    "list_bookmarks",
     "save_knowledge",
-    "variables",
     "recover_prototypes",
 ]
 
@@ -61,7 +66,7 @@ def _resolver(model: str | None, max_tokens: int | None = None) -> FakeListChatM
 def _write_config(tmp_path: Path, body: str) -> Path:
     path = tmp_path / "subagents.toml"
     path.write_text(
-        '[main]\ntools = ["get_code"]\n\n' + body,
+        '[main]\ntools = ["get_pseudocode"]\n\n' + body,
         encoding="utf-8",
     )
     return path
@@ -104,32 +109,24 @@ def _entry(name: str, *, policy_line: str = "") -> str:
 # --- tier: none (read-only) ----------------------------------------------------
 
 
-def test_read_only_subagent_drops_write_tools_and_blocks_write_actions(
-    tmp_path: Path,
-) -> None:
+def test_read_only_subagent_drops_write_tools(tmp_path: Path) -> None:
     specs = _build(tmp_path, _entry("research", policy_line="read_only = true\n"))
     spec = specs["research"]
 
     tool_names = _tool_names(spec)
-    # A blocked write-only tool is gone; read tools remain.
-    assert "rename_symbol" not in tool_names
-    assert "rename_symbol" in MUTATION_TOOLS  # guards against list drift
-    assert {"get_code", "xrefs"} <= tool_names
+    # Every write tool is gone; read tools remain.
+    assert not tool_names & MUTATION_TOOLS
+    assert "rename_function" in MUTATION_TOOLS  # guards against list drift
+    assert tool_names == {"get_pseudocode", "get_xrefs_to", "list_bookmarks"}
 
-    # The validation middleware rejects every write action on dual read/write tools.
-    mw = _validation_mw(spec)
-    assert mw._write_actions == ALL_WRITE_ACTIONS
     # No prefix rule: it cannot rename at all, so there is nothing to prefix.
-    assert mw._rename_prefix is None
+    assert _validation_mw(spec)._rename_prefix is None
 
 
 def test_write_policy_none_is_equivalent_to_read_only(tmp_path: Path) -> None:
     by_flag = _build(tmp_path, _entry("a", policy_line="read_only = true\n"))["a"]
     by_name = _build(tmp_path, _entry("a", policy_line='write_policy = "none"\n'))["a"]
     assert _tool_names(by_flag) == _tool_names(by_name)
-    assert (
-        _validation_mw(by_flag)._write_actions == _validation_mw(by_name)._write_actions
-    )
 
 
 # --- tier: annotations ---------------------------------------------------------
@@ -143,20 +140,21 @@ def test_annotations_tier_keeps_cheap_writes_and_drops_heavy_ones(
     )["research"]
 
     tool_names = _tool_names(spec)
-    # Renames and KB writes survive; heavyweight mutation tools do not.
-    assert {"rename_symbol", "save_knowledge"} <= tool_names
-    assert "recover_prototypes" not in tool_names
-
-    blocked = _validation_mw(spec)._write_actions
-    # `variables` keeps rename, loses type/signature surgery.
-    assert "rename" not in blocked["variables"]
-    assert {"retype", "set_prototype"} <= blocked["variables"]
-    # Comments and bookmarks are fully allowed, so they drop out of the map.
-    assert "comments" not in blocked
-    assert "bookmarks" not in blocked
-    # Types and structs stay entirely blocked.
-    assert blocked["types"] == ALL_WRITE_ACTIONS["types"]
-    assert blocked["struct"] == ALL_WRITE_ACTIONS["struct"]
+    # Renames, comments, bookmarks and KB writes survive.
+    assert {
+        "rename_function",
+        "rename_local_variable",
+        "set_comment",
+        "set_bookmark",
+        "save_knowledge",
+    } <= tool_names
+    # Type/signature surgery and script-driven passes do not.
+    assert not tool_names & {
+        "set_local_variable_type",
+        "set_function_prototype",
+        "create_structure",
+        "recover_prototypes",
+    }
 
 
 def test_annotations_tier_requires_the_provisional_rename_prefix(
@@ -174,11 +172,9 @@ def test_annotations_tier_requires_the_provisional_rename_prefix(
 def test_normal_subagent_keeps_write_tools_and_allows_actions(tmp_path: Path) -> None:
     spec = _build(tmp_path, _entry("analyst"))["analyst"]
 
-    assert "rename_symbol" in _tool_names(spec)
-    mw = _validation_mw(spec)
-    # No action blocking and no prefix rule: a full-write agent may settle names.
-    assert mw._write_actions == {}
-    assert mw._rename_prefix is None
+    assert set(_TOOL_NAMES) == _tool_names(spec)
+    # No prefix rule: a full-write agent may settle names.
+    assert _validation_mw(spec)._rename_prefix is None
 
 
 # --- generated prompt / description text ---------------------------------------
@@ -219,7 +215,6 @@ def test_policy_override_forces_lockdown_regardless_of_config(tmp_path: Path) ->
         assert not (_tool_names(spec) & MUTATION_TOOLS), (
             f"{name} kept a mutation tool despite the read-only override"
         )
-        assert _validation_mw(spec)._write_actions == ALL_WRITE_ACTIONS
         assert "STRICTLY READ-ONLY" in spec["system_prompt"]
 
 
@@ -235,7 +230,8 @@ def test_write_policy_defaults_to_full(tmp_path: Path) -> None:
     config = load_agent_config(
         _write_config(
             tmp_path,
-            '[[subagents]]\nname = "a"\ndescription = "d"\ntools = ["get_code"]\n',
+            '[[subagents]]\nname = "a"\ndescription = "d"\n'
+            'tools = ["get_pseudocode"]\n',
         )
     )
     assert config.subagents[0].write_policy == "full"
@@ -284,7 +280,7 @@ def test_max_tokens_parses_at_every_level(tmp_path: Path) -> None:
     path = tmp_path / "subagents.toml"
     path.write_text(
         "max_tokens = 32768\n"
-        '[main]\ntools = ["get_code"]\nmax_tokens = 20000\n\n'
+        '[main]\ntools = ["get_pseudocode"]\nmax_tokens = 20000\n\n'
         + _entry("a")
         + "max_tokens = 10000\n"
         + _entry("b"),

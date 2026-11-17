@@ -2,10 +2,10 @@
 
 These are the jump-table siblings of ``recover_prototypes`` (``prototype_tools.py``)
 — read that module's docstring for the shared rationale. Each tool runs a Java
-*GhidraScript* inside the running Ghidra via GhidrAssistMCP's ``scripts`` executor,
+*GhidraScript* inside the running Ghidra via GhidrAssistMCP's script tools,
 resolves the async task, and shrinks the JSON manifest to a compact result.
 
-Why a wrapper instead of letting the model drive ``scripts`` directly: GhidrAssistMCP
+Why a wrapper instead of letting the model drive ``run_script`` directly: GhidrAssistMCP
 exposes no tool to add references, set data mutability, or set a jump-table override,
 so the ONLY way to apply the fix is a Java script using the Ghidra API. The scripts
 here own that deterministic, error-prone work (writing the ``JumpTable`` override,
@@ -13,10 +13,11 @@ adding ``COMPUTED_JUMP`` refs, disassembling targets, re-decompiling to verify) 
 the LLM only supplies the case targets (or the table shape) it worked out from the
 disassembly.
 
-Server prerequisite: GhidrAssistMCP ships the ``scripts`` tool **disabled by
-default** — it must be enabled server-side for these tools to appear. When it is
-absent, ``build_switch_tools`` returns ``[]`` (with a warning) and the agent runs
-exactly as before, just without programmatic jump-table recovery.
+Server prerequisite: GhidrAssistMCP ships ``create_script`` / ``run_script``
+**disabled by default** — both must be enabled server-side for these tools to
+appear. When either is absent, ``build_switch_tools`` returns ``[]`` (with a
+warning) and the agent runs exactly as before, just without programmatic
+jump-table recovery.
 """
 
 import json
@@ -223,7 +224,7 @@ def _format_ollvm_summary(payload: dict[str, Any], report: str) -> str:
 def build_switch_tools(mcp_tools: list[BaseTool]) -> list[BaseTool]:
     """Build the jump-table tools, or ``[]`` if unsupported.
 
-    Requires the GhidrAssistMCP ``scripts`` tool (disabled by default server-side);
+    Requires GhidrAssistMCP's ``create_script``/``run_script`` (disabled by default);
     without it the tools are omitted with a warning. ``get_task_status`` is used to
     resolve each script's async task when present.
     """

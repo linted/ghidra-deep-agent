@@ -1,6 +1,6 @@
 """Transparently resolve GhidrAssistMCP async task results.
 
-GhidrAssistMCP offloads long-running operations (e.g. ``get_code``) to async
+GhidrAssistMCP offloads long-running operations (e.g. ``get_pseudocode``) to async
 tasks: the tool call returns a *stub* — "Task submitted for async execution.
 Task ID: <uuid> ... Status: RUNNING" — instead of the result, and the caller is
 expected to poll ``get_task_status`` with that id until the task finishes.
@@ -37,7 +37,7 @@ from ghidra_deep_agent.defaults import env_float
 # The submission stubs are very specific; require a marker phrase plus an id to
 # avoid ever mistaking real tool output (decompilation, disassembly) for a stub.
 # Two known shapes: the generic async-tool stub ("Task submitted for async
-# execution. ... Task ID: <id>") and the `scripts` run stub ("Script task
+# execution. ... Task ID: <id>") and the `run_script` stub ("Script task
 # submitted: <id> ...").
 _STUB_MARKERS = ("Task submitted for async execution", "Script task submitted")
 _TASK_ID_RE = re.compile(r"(?:Task ID:|Script task submitted:)\s*([0-9A-Za-z._-]{6,})")
@@ -132,7 +132,7 @@ async def resolve_async_result(
     """Resolve an async submission stub the same way ``AsyncTaskMiddleware`` does.
 
     ``AsyncTaskMiddleware`` only wraps tool calls made *through the agent graph*.
-    A local tool that invokes an MCP tool directly (e.g. ``scripts``) gets the raw
+    A local tool that invokes an MCP tool directly (e.g. ``run_script``) gets the raw
     submission stub back with no middleware to poll it, so it calls this helper on
     the result: if ``text`` is a stub and ``status_tool`` is available, poll
     ``get_task_status`` until the task finishes and return the final text;
