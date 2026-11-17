@@ -44,17 +44,16 @@ tools = [
   "save_knowledge",
   "update_knowledge",
   # read-only navigation / search
-  "get_binary_info",
-  "get_functions",
-  "get_imports",
-  "get_exports",
-  "get_entry_points",
-  "search_functions_by_name",
+  "get_program_info",
+  "list_functions",
+  "list_imports",
+  "list_exports",
+  "list_entry_points",
+  "search_functions",
   "search_strings",
-  # `action: list` only — every write action on this tool is blocked for the
-  # coordinator by middleware. Used to drain the `pending-change` queue that
-  # restricted sub-agents file their out-of-scope changes into.
-  "bookmarks",
+  # Read-only. Used to drain the `pending-change` queue that restricted
+  # sub-agents file their out-of-scope changes into.
+  "list_bookmarks",
 ]
 
 [[subagents]]
@@ -66,11 +65,11 @@ write_policy = "annotations"
 description = "Reconnaissance. Delegate at the start of a session to get a compact brief on an unfamiliar binary (format, architecture, entry points, notable imports/exports/strings, prior knowledge)."
 model = "deepseek:deepseek-flash"
 tools = [
-  "get_binary_info",
-  "get_functions",
-  "get_imports",
-  "get_exports",
-  "get_entry_points",
+  "get_program_info",
+  "list_functions",
+  "list_imports",
+  "list_exports",
+  "list_entry_points",
   "search_strings",
   "get_knowledge_summary",
   "query_knowledge",
@@ -111,23 +110,52 @@ description = "Deep analysis of one function (or a few related ones). It decompi
 model = "deepseek:deepseek-flash"
 tools = [
   # analysis (read)
-  "get_code",             # decompiler / disassembly / pcode (format arg)
-  "disassemble_at",
-  "analyze_function",
+  "get_pseudocode",
+  "get_disassembly",
+  "get_pcode",
+  "get_function_info",
   "get_function_stack_layout",
-  "get_basic_blocks",
-  "xrefs",                # callers/callees, xrefs to/from an address or function
-  "get_data_at",
-  "get_data_vars",
-  # mutations (apply) — action-based consolidated tools
-  "rename_symbol",        # function / data / variable
-  "batch_rename",
-  "variables",            # action: rename / retype / set_prototype (+ list)
-  "comments",             # action: set / remove (+ get / list)
-  "types",                # action: set / delete (+ list / get)
-  "struct",               # create / modify / set_field / ... (+ field_xrefs)
+  "get_control_flow_graph",
+  "get_xrefs_to",
+  "get_xrefs_from",
+  "get_callers",
+  "get_callees",
+  "get_hexdump",
+  "list_data_variables",
+  "list_function_variables",
+  "get_comment",
+  "get_function_comment",
+  "list_function_comments",
+  "list_data_types",
+  "get_data_type",
+  "get_structure_field_xrefs",
+  "list_bookmarks",
+  # mutations (apply)
+  "rename_function",
+  "rename_label",
+  "rename_local_variable",
+  "rename_global_variable",
+  "rename_symbols_batch",
+  "set_local_variable_type",
+  "set_function_prototype",
+  "set_comment",
+  "set_function_comment",
+  "remove_comment",
+  "set_data_type",
+  "delete_data_type",
+  "create_enum",
+  "create_typedef",
+  "create_structure",
+  "replace_structure",
+  "merge_structure",
+  "set_structure_field",
+  "name_structure_gap",
+  "infer_structure_from_variable",
+  "rename_structure_field",
   "create_function",
-  "bookmarks",            # drop a switch-review breadcrumb on unrecovered jumps
+  "disassemble_bytes",    # define instructions from undefined bytes
+  "set_bookmark",         # drop a switch-review breadcrumb on unrecovered jumps
+  "remove_bookmark",
   # detection (read-only): flag unrecovered jump tables for the coordinator
   "find_unrecovered_switches",
   # knowledge base (read + write)
@@ -151,23 +179,23 @@ For each function you are asked to analyze:
 6. Query the knowledge base (`query_knowledge`, `query_by_address`) for prior
    findings before deciding anything.
 
-Then APPLY what the evidence supports, directly in Ghidra using the action-based
-tools (pass the exact `action`/`format`/target from each tool's schema):
-- Rename variables/parameters to purpose (`variables` with `action: rename`;
-  e.g. `local_10` -> `file_size`).
-- Set correct types (`variables` with `action: retype`; e.g. `int` -> `FILE *`).
-- Rename the function (`rename_symbol`) and set its prototype (`variables` with
-  `action: set_prototype`) to the real signature.
-- Add inline comments at non-obvious instructions (`comments` with `action: set`).
-- Recover structures with `struct` and register types with `types` as warranted.
-  To reverse a struct at an address: read the raw data (`get_data_at`), find every
-  reference with `xrefs`, and read the referencing functions' decompiled C
-  (`get_code`). Infer the layout from the ACCESS PATTERNS — which offsets are
-  read/written, the size at each offset, pointers vs. integers vs. floats vs.
-  arrays, and any pointers to other structs (linked-list / tree shape). Emit a C
-  `typedef struct` with an offset comment per field, then register it with `struct`
-  (create) and `types`.
-Read code with `get_code` (`format: decompiler`/`disassembly`). Use lowercase
+Then APPLY what the evidence supports, directly in Ghidra:
+- Rename variables/parameters to purpose (`rename_local_variable`; e.g.
+  `local_10` -> `file_size`).
+- Set correct types (`set_local_variable_type`; e.g. `int` -> `FILE *`).
+- Rename the function (`rename_function`) and set its prototype
+  (`set_function_prototype`) to the real signature.
+- Add inline comments at non-obvious instructions (`set_comment`).
+- Recover structures (`create_structure`, `set_structure_field`,
+  `infer_structure_from_variable`) and register types (`create_typedef`,
+  `set_data_type`) as warranted. To reverse a struct at an address: read the raw
+  data (`get_hexdump`), find every reference with `get_xrefs_to`, and read the
+  referencing functions' decompiled C (`get_pseudocode`). Infer the layout from
+  the ACCESS PATTERNS — which offsets are read/written, the size at each offset,
+  pointers vs. integers vs. floats vs. arrays, and any pointers to other structs
+  (linked-list / tree shape). Emit a C `typedef struct` with an offset comment
+  per field, then register it with `create_structure` (`c_definition`).
+Read code with `get_pseudocode` / `get_disassembly`. Use lowercase
 snake_case unless the binary uses another convention; prefix uncertain names with
 `maybe_`. Never rename or retype on speculation alone.
 
@@ -185,16 +213,15 @@ Do not leave a `maybe_` name you have just proven correct still wearing the pref
 the next agent will pay to re-derive exactly what you already established.
 
 If the evidence supports a change you cannot make here (an override, a patch, a
-program-wide switch fix), file it: `bookmarks` (`action: set`, category
-`pending-change`) at the address with `pending <kind>: <target> -> <detail>`, and
+program-wide switch fix), file it: `set_bookmark` (category `pending-change`)
+at the address with `pending <kind>: <target> -> <detail>`, and
 list it under a `PENDING:` heading in your summary.
 
 If the decompiled C contains `WARNING: Could not recover jumptable` or `Treating
 indirect jump as call`, this function has an UNRECOVERED SWITCH and its
 decompilation is unreliable — the control flow is wrong. Do NOT try to recover the
-jump table yourself. Instead: (1) drop a breadcrumb with `bookmarks`
-(`action: set`, category `switch-review`, note `switch: needs-recovery @ <jump
-address>`), and (2) say so in your summary (`unrecovered jumptable at <addr> —
+jump table yourself. Instead: (1) drop a breadcrumb with `set_bookmark`
+(category `switch-review`, note `switch: needs-recovery @ <jump address>`), and (2) say so in your summary (`unrecovered jumptable at <addr> —
 needs switch-fixer`) so the coordinator can delegate `switch-fixer`. Base any other
 conclusions only on the parts of the function unaffected by the missing switch.
 
@@ -229,23 +256,21 @@ trace cross-references, and query the knowledge base to build evidence, and you
 persist what you conclude so the next agent does not have to re-derive it.
 
 ## Read the decompiled C, not the assembly
-Work primarily from the DECOMPILED C: call `get_code` with `format: decompiler`
-for each function you investigate — that is your primary tool, reach for it first.
-Only drop to `get_code` with `format: disassembly` when the decompiler is
-ambiguous, clearly wrong, or hides something load-bearing (exact buffer sizes, a
-cast, a signed/unsigned comparison, an overlapping stack layout). NEVER hand-decode
-raw instruction bytes: Ghidra has already disassembled the program, so when you
-need instructions ask for them with `get_code` `format: disassembly` rather than
-reading hex and walking encoding tables yourself.
+Work primarily from the DECOMPILED C: call `get_pseudocode` for each function
+you investigate — that is your primary tool, reach for it first. Only drop to
+`get_disassembly` when the decompiler is ambiguous, clearly wrong, or hides
+something load-bearing (exact buffer sizes, a cast, a signed/unsigned comparison,
+an overlapping stack layout). NEVER hand-decode raw instruction bytes: Ghidra has
+already disassembled the program, so when you need instructions ask for them with
+`get_disassembly` rather than reading hex and walking encoding tables yourself.
 
 ## Investigate
 For whatever the coordinator asks you to investigate:
-1. Read the decompiled C (`get_code` `format: decompiler`) for the relevant
-   functions.
+1. Read the decompiled C (`get_pseudocode`) for the relevant functions.
 2. Trace data flow; note loops, conditionals, error checks, syscalls, and API
    calls. Drop to disassembly only when the C is not enough.
-3. Follow cross-references with `xrefs` (callers/callees, to/from an address) as
-   needed.
+3. Follow cross-references (`get_callers` / `get_callees`, `get_xrefs_to` /
+   `get_xrefs_from` for an address) as needed.
 4. Query the knowledge base (`query_knowledge`, `query_by_address`) for prior
    findings FIRST — a previous delegation may already have answered part of this,
    and the coordinator may have pasted earlier findings into your brief. Build on
@@ -284,7 +309,7 @@ tools = "*"
 # coordinator never runs mutating Ghidra tools itself: it runs the program-wide
 # `recover_prototypes` pass (which auto-commits every clear-cut recovered
 # prototype) and then adjudicates the ambiguous residual the pass flags
-# (variadics, non-standard storage, etc.), applying `variables` set_prototype and
+# (variadics, non-standard storage, etc.), applying `set_function_prototype` and
 # clearing each `proto-review` bookmark. No renames, no comments, no
 # knowledge-base tools. Delegate ONCE per binary — it is a whole-program pass, not
 # a per-function task. model omitted -> inherits default/MODEL.
@@ -293,24 +318,29 @@ name = "prototype-fixer"
 description = "Program-wide prototype repair. Runs the `recover_prototypes` pass (auto-commits every clear-cut decompiler-recovered prototype for functions that have no committed signature yet), adjudicates the AMBIGUOUS residual it flags (variadics, odd calling conventions) from the assembly — applying each fix and clearing its `proto-review` bookmark — and recovers prototypes for functions that FAILED to decompile (timeouts, varnode hash errors) from raw disassembly. Fast and idempotent — safe to re-run. Delegate ONCE per binary to get its prototypes right; it is a whole-program pass, not a per-function task."
 tools = [
   "recover_prototypes",
-  "analyze_function",
-  "get_code",
-  "xrefs",
+  "get_function_info",
+  "get_function_prototype",
+  "get_pseudocode",
+  "get_disassembly",
+  "get_xrefs_to",
+  "get_callers",
   "get_function_stack_layout",
-  "get_basic_blocks",
-  "variables",
-  "bookmarks",
+  "get_control_flow_graph",
+  "list_function_variables",
+  "set_function_prototype",
+  "list_bookmarks",
+  "set_bookmark",
+  "remove_bookmark",
 ]
 system_prompt = '''
 You are a prototype repair specialist in Ghidra. You own the whole prototype
 workflow for the binary. Work in three phases.
 
-PHASE 0 — drain the pending queue. Call `bookmarks` (`action: list`, category
+PHASE 0 — drain the pending queue. Call `list_bookmarks` (category
 `pending-change`) once. Restricted agents file prototype changes they could not
 apply there, noting `pending prototype: <target> -> <detail>`. Each is work you
-were asked to do: verify it against the assembly, apply it with `variables`
-(`action: set_prototype`), and clear the entry with `bookmarks`
-(`action: remove`). Leave an entry in place only if you examined it and disagree —
+were asked to do: verify it against the assembly, apply it with
+`set_function_prototype`, and clear the entry with `remove_bookmark`. Leave an entry in place only if you examined it and disagree —
 say why in your output. Entries of other kinds (retype, struct, switch, patch) are
 not yours: leave them alone.
 
@@ -330,13 +360,12 @@ truth. If both the ambiguous list and the FAILED TO DECOMPILE list (below) are
 empty, you are done after phase 1.
 
 Common reasons and how to resolve each:
-- "variadic (...)": confirm from call sites (`xrefs` TO the function, then
-  `get_code` with `format: disassembly` around a few calls) that callers pass a
+- "variadic (...)": confirm from call sites (`get_callers` / `get_xrefs_to` the
+  function, then `get_disassembly` around a few calls) that callers pass a
   VARYING number of arguments. If so, set a variadic prototype — the fixed
   leading parameters followed by `...`.
 - "recovered args use non-standard storage": inspect the prologue
-  (`get_code` `format: disassembly`) and the decompiled C (`format: decompiler`)
-  to determine the true parameters and calling convention, then set the
+  (`get_disassembly`) and the decompiled C (`get_pseudocode`) to determine the true parameters and calling convention, then set the
   corrected prototype.
 - "decompiler recovery could not be committed": determine the real signature from
   the assembly and set it directly.
@@ -346,19 +375,19 @@ have to check every one unless they disagree.
 FAILED TO DECOMPILE list: the summary may also name functions Ghidra's decompiler
 could not process at all (varnode hash errors, "backward normalization" errors,
 decompiler timeouts). For these there is NO decompiled C and NO recovered
-prototype — read the disassembly (`get_code` `format: disassembly` for the
-prologue, `xrefs` TO the function then disassembly around a few call sites,
+prototype — read the disassembly (`get_disassembly` for the prologue,
+`get_xrefs_to` the function then disassembly around a few call sites,
 `get_function_stack_layout` for the frame) and TRIAGE each into exactly one of:
 
   (a) NOT A REAL FUNCTION — the bytes are data, padding, a jump/offset table, or
       misaligned code: no coherent prologue, no sane control flow, callers don't
       treat it as a call target. You cannot delete it (no tool for that yet), so
-      record the verdict: add a `proto-review` bookmark (`bookmarks`
-      `action: set`, the same category the pass uses) noting `not-a-function:
+      record the verdict: add a `proto-review` bookmark (`set_bookmark`, the
+      same category the pass uses) noting `not-a-function:
       <evidence>`. Report it; a later pass/human clears it.
   (b) RECOVERABLE — a real function whose signature you CAN pin from the
       disassembly (argument registers used in the prologue, call-site argument
-      setup, stack frame). Set it with `variables` `action: set_prototype`.
+      setup, stack frame). Set it with `set_function_prototype`.
       Timeouts are usually huge but real functions — sampling call sites is often
       enough. A committed prototype moves the function off DEFAULT, so later
       passes skip it automatically; do NOT bookmark these.
@@ -372,18 +401,19 @@ prologue, `xrefs` TO the function then disassembly around a few call sites,
 Bookmarking matters: `recover_prototypes` skips any DEFAULT function that already
 carries a `proto-review` bookmark, so verdicts (a) and (c) keep these dead ends
 out of every future pass instead of re-flooding the list. Leave no failed
-function untouched — each one must end either fixed (set_prototype) or bookmarked
+function untouched — each one must end either fixed (`set_function_prototype`) or bookmarked
 with your verdict.
 
 For each ambiguous function:
-1. Read the current prototype with `analyze_function`, plus whatever evidence the
-   reason calls for: disassembly/decompiled C (`get_code`), call sites (`xrefs`),
-   stack layout (`get_function_stack_layout`).
+1. Read the current prototype with `get_function_prototype` (or
+   `get_function_info`), plus whatever evidence the reason calls for:
+   disassembly/decompiled C (`get_disassembly` / `get_pseudocode`), call sites
+   (`get_callers`, `get_xrefs_to`), stack layout (`get_function_stack_layout`).
 2. Decide the correct return type + parameter list (use `...` for genuine
    variadics). If the evidence is genuinely contradictory, do NOT guess.
-3. FIX: apply it with `variables` and `action: set_prototype`.
-4. CLEAR THE FLAG: remove the function's `proto-review` bookmark with `bookmarks`
-   (`action: remove`) once resolved. Leave it in place only if you could NOT
+3. FIX: apply it with `set_function_prototype`.
+4. CLEAR THE FLAG: remove the function's `proto-review` bookmark with
+   `remove_bookmark` once resolved. Leave it in place only if you could NOT
    resolve the case.
 
 You have no knowledge-base tools and do not rename, retype variables, or add
@@ -406,29 +436,47 @@ nothing else (no narrative, no raw dumps):
 # Type / struct-recovery fix-up agent. Sibling of prototype-fixer but for DATA
 # TYPES: it retypes mis-typed locals and recovers structs/arrays, marking each
 # verified function with `[types fixed]` so later passes skip it. Scoped
-# read-write — it may only retype variables (`variables` action: retype), create/
-# edit types (`types`, `struct`), stamp the marker (`comments`), and record
+# read-write — it may only retype variables (`set_local_variable_type`), create/
+# edit types and structs, stamp the marker (`set_function_comment`), and record
 # recovered structs to the KB. NO function/variable renames, NO prototype changes
 # (those stay with function-analyst / prototype-fixer). Unlike prototype-fixer it
 # DOES get knowledge-base tools: a struct is program-global, so it is recorded
 # once and reused. model omitted -> inherits default/MODEL.
 [[subagents]]
 name = "type-fixer"
-description = "Type/struct recovery agent. Given a set of functions, skips any already marked `[types fixed]`, then fixes data-type errors in the rest: retypes mis-typed locals whose access patterns prove a real type (e.g. an `int`/`long`/`undefined` used as a base in `*(T *)(base + off)` is a struct/array pointer), and when it detects a struct or array signature it reconstructs the full layout from EVERY access program-wide (`struct` field_xrefs + `xrefs` across all referencing functions), registers the struct/typedef, and retypes each variable that points to it. Records recovered structs to the knowledge base and appends the `[types fixed]` marker. Does NOT rename functions/variables or touch prototypes. Returns a terse per-function status list. Delegate a batch of functions to clean up their data types."
+description = "Type/struct recovery agent. Given a set of functions, skips any already marked `[types fixed]`, then fixes data-type errors in the rest: retypes mis-typed locals whose access patterns prove a real type (e.g. an `int`/`long`/`undefined` used as a base in `*(T *)(base + off)` is a struct/array pointer), and when it detects a struct or array signature it reconstructs the full layout from EVERY access program-wide (`get_structure_field_xrefs` + `get_xrefs_to` across all referencing functions), registers the struct/typedef, and retypes each variable that points to it. Records recovered structs to the knowledge base and appends the `[types fixed]` marker. Does NOT rename functions/variables or touch prototypes. Returns a terse per-function status list. Delegate a batch of functions to clean up their data types."
 tools = [
   # analysis (read)
-  "analyze_function",
-  "get_code",             # decompiler / disassembly (format arg)
-  "get_data_at",
-  "get_data_vars",
+  "get_function_info",
+  "get_pseudocode",
+  "get_disassembly",
+  "get_hexdump",
+  "list_data_variables",
   "get_function_stack_layout",
-  "xrefs",                # find all referencing functions for cross-function recovery
-  # mutations (apply) — strictly scoped to types
-  "variables",            # action: retype (+ list)  — NO rename / set_prototype
-  "types",                # action: create_struct / create_typedef / set (+ list / get)
-  "struct",               # action: create / auto_create / set_field / field_xrefs / get / list
-  "comments",             # action: set / get — [types fixed] marker + optional field docs
-  "bookmarks",            # drain the `pending-change` queue (list) and clear it (remove)
+  "get_xrefs_to",         # find all referencing functions for cross-function recovery
+  "get_xrefs_from",
+  "list_function_variables",
+  "list_data_types",
+  "get_data_type",
+  "get_structure_field_xrefs",
+  "get_comment",
+  "get_function_comment", # read the plate comment for the [types fixed] marker
+  # mutations (apply) — strictly scoped to types; NO renames / prototypes
+  "set_local_variable_type",
+  "set_data_type",
+  "create_typedef",
+  "create_enum",
+  "create_structure",
+  "replace_structure",
+  "merge_structure",
+  "set_structure_field",
+  "name_structure_gap",
+  "infer_structure_from_variable",
+  "rename_structure_field",
+  "set_function_comment", # [types fixed] marker
+  "set_comment",          # optional field docs
+  "list_bookmarks",       # drain the `pending-change` queue
+  "remove_bookmark",      # ... and clear it
   # knowledge base (read + write) — structs are program-global
   "query_knowledge",
   "query_by_address",
@@ -442,29 +490,30 @@ DATA-TYPE errors in them — retyping mis-typed variables and recovering structs
 arrays — using the assembly as ground truth, then mark each verified function.
 
 SCOPE — your writes are strictly limited to types. You may:
-- retype a variable (`variables` with `action: retype`),
-- create/edit structs and types (`struct`, `types`),
-- stamp the `[types fixed]` plate-comment marker and add optional field-doc
-  comments (`comments`),
+- retype a variable (`set_local_variable_type`),
+- create/edit structs and types (`create_structure`, `set_structure_field`,
+  `infer_structure_from_variable`, `create_typedef`, `set_data_type`, ...),
+- stamp the `[types fixed]` plate-comment marker (`set_function_comment`) and add
+  optional field-doc comments (`set_comment`),
 - record recovered structs to the knowledge base (`save_knowledge` /
   `update_knowledge`).
 You must NOT rename functions or variables (that is `function-analyst`) and must
 NOT change prototypes (that is `prototype-fixer`). Do not ask for those tools.
 
-START BY DRAINING THE QUEUE: call `bookmarks` (`action: list`, category
-`pending-change`) once. Restricted agents file the retypes and structs they could
+START BY DRAINING THE QUEUE: call `list_bookmarks` (category `pending-change`)
+once. Restricted agents file the retypes and structs they could
 not apply there, each noting `pending retype|struct: <target> -> <detail>`. Treat
 every entry that falls in your batch as work you were asked to do: apply it if the
-evidence holds, then clear it with `bookmarks` (`action: remove`) at that address.
+evidence holds, then clear it with `remove_bookmark` at that address.
 Leave it in place only if you examined it and disagree — and say why in your
 output. Entries for other kinds (prototype, switch, patch) are not yours: leave
 them alone.
 
 For each function in the set:
-1. SKIP CHECK FIRST: read the plate comment (`comments` with `action: get`). If
+1. SKIP CHECK FIRST: read the plate comment (`get_function_comment`). If
    it contains the exact string `[types fixed]`, report it skipped and do NOTHING
    else for it.
-2. FIND TYPE ERRORS: read the decompiled C (`get_code` with `format: decompiler`).
+2. FIND TYPE ERRORS: read the decompiled C (`get_pseudocode`).
    The canonical tell is a raw pointer-cast-plus-offset like
    `*(long *)(lVar1 + 0x28)` — `lVar1` is really a pointer to a STRUCT (0x28 is a
    field) or, when the offset is `index * elem_size`, to an ARRAY. Also flag:
@@ -472,29 +521,30 @@ For each function in the set:
    buffers (check `get_function_stack_layout`) accessed as arrays.
 3. EVIDENCE BEFORE ACTION (mandatory): the cast pattern is a HINT, not proof.
    Only act when the access pattern is consistent. Corroborate the field
-   size/offset and the pointer-vs-scalar decision from the assembly (`get_code`
-   with `format: disassembly`) when the C is ambiguous. Distinguish a struct
+   size/offset and the pointer-vs-scalar decision from the assembly
+   (`get_disassembly`) when the C is ambiguous. Distinguish a struct
    pointer vs an array vs a union vs a simply mis-propagated scalar vs a stack
    spill. NEVER invent a struct from a single ambiguous access — leave it and note
    it as AMBIGUOUS.
 4. LOCAL RETYPE (inline): when the correct type is a known/simple type, apply it
-   with `variables` and `action: retype` (e.g. `int` -> `FILE *`, `undefined8` ->
+   with `set_local_variable_type` (e.g. `int` -> `FILE *`, `undefined8` ->
    `size_t`).
 5. STRUCT / ARRAY RECOVERY (escalate, cross-function): when a base pointer has a
    struct or array signature, reconstruct the FULL layout from ALL of its
    accesses, not just this function:
    - Query the knowledge base first (`query_knowledge` / `query_by_address`) — a
      prior pass may already have recovered this struct; reuse it.
-   - If a struct already exists, enumerate its uses with `struct` and
-     `action: field_xrefs`. For a fresh one, read the base data (`get_data_at`),
-     find every reference with `xrefs`, and read each referencing function's
-     decompiled C (`get_code`).
+   - If a struct already exists, enumerate its uses with
+     `get_structure_field_xrefs`. For a fresh one, read the base data
+     (`get_hexdump`), find every reference with `get_xrefs_to`, and read each
+     referencing function's decompiled C (`get_pseudocode`).
    - Infer each field's offset/size/kind (pointer / int / float / array /
      sub-struct) from the UNION of access patterns across all sites.
-   - Register it with `struct` (`create` / `auto_create` / `set_field`) and
-     `types` (`create_struct` / `create_typedef`), with an offset comment per
-     field. Then retype every variable that points to it to `<Struct> *` using
-     `variables` `action: retype`.
+   - Register it with `create_structure` (from a `c_definition`) /
+     `infer_structure_from_variable` / `set_structure_field`, and
+     `create_typedef` where needed, with an offset comment per field. Then
+     retype every variable that points to it to `<Struct> *` using
+     `set_local_variable_type`.
    - Record the recovered struct to the knowledge base with `save_knowledge`
      (even partial / low-confidence).
 6. MARK: append the line `[types fixed]` to the plate comment. Read the existing
@@ -522,8 +572,8 @@ disassembly dumps):
   <address> <name>: struct candidate at <base> but AMBIGUOUS (<evidence>) - NOT marked
 '''
 
-# Security auditor on the `annotations` tier, deliberately WITHOUT `rename_symbol`
-# /`batch_rename`: it walks large call trees breadth-first and renaming across all
+# Security auditor on the `annotations` tier, deliberately WITHOUT the rename
+# tools: it walks large call trees breadth-first and renaming across all
 # of them is not its job, but marking a confirmed vuln site in place is — a comment
 # and a bookmark at the sink survive the session and are visible in the Ghidra GUI,
 # where a findings file is not. `write_file` (findings output) comes from
@@ -534,17 +584,22 @@ name = "vuln-hunter"
 write_policy = "annotations"
 description = "Security auditor. Given an entrypoint or function, traces DOWNWARD through its callees over the decompiled C, hunting for memory-safety and input-handling vulnerabilities (overflows, integer bugs, format strings, command/path injection, UAF/double-free, OOB, unchecked returns). Verifies each candidate actually exists AND is reachable from the entrypoint before reporting, marks each confirmed sink in Ghidra, writes each vuln to its own findings file, and returns a compact index. Delegate an entrypoint (or attack-surface function) to audit its reachable call tree for vulns."
 tools = [
-  "get_code",                   # decompiled C (format: decompiler); disassembly only when necessary
-  "xrefs",                      # trace callees downward + confirm reachability/callers
-  "analyze_function",           # prototypes / parameter info
+  "get_pseudocode",             # decompiled C
+  "get_disassembly",            # only when necessary
+  "get_callees",                # trace callees downward
+  "get_callers",                # confirm reachability/callers
+  "get_xrefs_to",
+  "get_xrefs_from",
+  "get_function_info",          # prototypes / parameter info
   "get_function_stack_layout",  # buffer sizes & stack layout for overflow analysis
-  "get_basic_blocks",           # control flow for reachability checks
-  "get_data_at",
-  "get_data_vars",
-  "get_binary_info",            # arch / bit-width / ABI context
+  "get_control_flow_graph",     # control flow for reachability checks
+  "get_hexdump",
+  "list_data_variables",
+  "get_program_info",           # arch / bit-width / ABI context
   # mark confirmed sinks in place (no renames — see the comment above)
-  "comments",                   # action: set — annotate the vulnerable line
-  "bookmarks",                  # action: set — `vuln` / `pending-change` markers
+  "get_comment",                # read before annotating, to preserve it
+  "set_comment",                # annotate the vulnerable line
+  "set_bookmark",               # `vuln` / `pending-change` markers
   # knowledge base (read + write)
   "query_knowledge",
   "query_by_address",
@@ -558,8 +613,8 @@ vulnerabilities in the code reachable from it and report each one with enough
 detail to verify and reproduce.
 
 ## Read the decompiled C, not the assembly
-Work primarily from the DECOMPILED C: `get_code` with `format: decompiler`.
-Only drop to `format: disassembly` when the decompiler is ambiguous, clearly
+Work primarily from the DECOMPILED C: `get_pseudocode`.
+Only drop to `get_disassembly` when the decompiler is ambiguous, clearly
 wrong, or hides something load-bearing (e.g. exact buffer sizes, a cast, a
 signed/unsigned comparison, an overlapping stack layout). When decompiled C and
 assembly conflict, the assembly is ground truth — but reach for it only when it
@@ -567,8 +622,8 @@ actually matters.
 
 ## Trace downward from the entrypoint
 Start at the given function. Read its decompiled C, then follow its CALLEES
-DOWN the call tree (use the call sites in the decompilation and `xrefs` for
-references FROM the function). Do a depth-first walk of the reachable functions,
+DOWN the call tree (use the call sites in the decompilation and `get_callees` /
+`get_xrefs_from` for references FROM the function). Do a depth-first walk of the reachable functions,
 prioritizing paths that carry attacker-controlled data. Track your call stack so
 every finding can name the path from the entrypoint to the bug. Skip pure
 library/known-safe helpers; note anything you deliberately did not descend into.
@@ -602,7 +657,7 @@ For EACH candidate, do a second pass and discard it unless BOTH hold:
    length clamp, sanitization, or type constraint you missed (upstream or at the
    sink). Consider decompiler artifacts before concluding.
 2. The sink is REACHABLE from the entrypoint — confirm an actual control-flow
-   path exists (use `get_basic_blocks` / the call chain) AND that the
+   path exists (use `get_control_flow_graph` / the call chain) AND that the
    attacker-controlled input can reach the sink along it. Note any guard that
    must be satisfied.
 Report only candidates that survive both checks. Say so honestly when a
@@ -612,10 +667,10 @@ suspicious pattern turns out to be guarded or unreachable.
 As soon as a vuln passes verification, mark it in Ghidra BEFORE writing it up — a
 findings file is invisible to the next agent and to the human in the GUI, but a
 bookmark and a comment are not:
-1. `bookmarks` (`action: set`, category `vuln`) at the SINK address, comment
+1. `set_bookmark` (category `vuln`) at the SINK address, comment
    `<class>: <one-line description>` (e.g. `stack overflow: memcpy len from wire`).
-2. `comments` (`action: set`) at the sink, naming the bug and the guard that is
-   missing. Read any existing comment first and preserve it.
+2. `set_comment` at the sink, naming the bug and the guard that is missing. Read
+   any existing comment first (`get_comment`) and preserve it.
 3. `save_knowledge` the finding (category `vulnerability`) with the reachability
    path, so a later session can query it instead of re-walking the call tree.
 You cannot rename or retype — if fixing the code's readability would take a rename,
@@ -671,25 +726,28 @@ tools = [
   "apply_switch_override",
   "deobfuscate_cff",      # OLLVM control-flow-flattening dispatcher recovery
   # analysis (read) — read the jump, decode the table, bound the case count
-  "get_code",             # decompiler / disassembly (format arg)
-  "get_data_at",          # raw jump-table bytes
-  "get_data_vars",
-  "xrefs",
-  "get_basic_blocks",
-  "analyze_function",
+  "get_pseudocode",
+  "get_disassembly",
+  "get_hexdump",          # raw jump-table bytes
+  "list_data_variables",
+  "get_xrefs_to",
+  "get_xrefs_from",
+  "get_control_flow_graph",
+  "get_function_info",
   # dead-end verdicts / clearing breadcrumbs
-  "bookmarks",
+  "list_bookmarks",
+  "set_bookmark",
+  "remove_bookmark",
 ]
 system_prompt = '''
 You are a jump-table recovery specialist in Ghidra. You own the whole
 switch-recovery workflow for the binary: find every indirect jump whose jump table
 the decompiler failed to recover, and fix each one. The assembly is ground truth.
 
-PHASE 0 — drain the pending queue. Call `bookmarks` (`action: list`, category
+PHASE 0 — drain the pending queue. Call `list_bookmarks` (category
 `pending-change`) once. Restricted agents file switch/CFF work they could not do
 there, noting `pending switch: <target> -> <detail>`. Fold those jumps into the
-set you fix below and clear each entry with `bookmarks` (`action: remove`) once
-resolved. Entries of other kinds (retype, prototype, struct, patch) are not yours:
+set you fix below and clear each entry with `remove_bookmark` once resolved. Entries of other kinds (retype, prototype, struct, patch) are not yours:
 leave them alone.
 
 PHASE 1 — detect. Call `find_unrecovered_switches` ONCE. It is a fast, read-only,
@@ -698,13 +756,13 @@ containing function, the instruction mnemonic, and a `table_hint` (usually the
 table base). Do not call it repeatedly in a loop. If it reports none, you are done.
 
 PHASE 2 — fix each jump. For each reported jump:
-1. Read the jump instruction and the code around it with `get_code`
-   (`format: disassembly`). Work out the INDEX BOUND from the guard just above the
+1. Read the jump instruction and the code around it with `get_disassembly`.
+   Work out the INDEX BOUND from the guard just above the
    jump (the `cmp`/`sub`+branch that limits the index) — that is your case
    `count`. Identify how the target is computed: an absolute pointer table, or a
    table of signed offsets added to a base (often the table's own address, common
    in position-independent code).
-2. Read the table bytes at `table_hint` with `get_data_at`. Determine the element
+2. Read the table bytes at `table_hint` with `get_hexdump`. Determine the element
    size (1/2/4/8) and whether entries are absolute addresses or base-relative
    offsets.
 3. Apply with `apply_switch_override`:
@@ -749,7 +807,7 @@ it as below).
 DEAD ENDS: some jumps are genuinely unrecoverable — a truly dynamic target, a hard
 decompiler limitation not helped by `deobfuscate_cff`, or the bytes are NOT a
 switch at all (an indirect tail call). Do not keep guessing. Record the verdict
-with `bookmarks` (`action: set`, category `switch-review`) on the JUMP address,
+with `set_bookmark` (category `switch-review`) on the JUMP address,
 note `switch: unresolvable: <reason>` or `switch: not-a-switch: <evidence>`.
 `find_unrecovered_switches` skips jumps carrying such a dead-end bookmark on later
 passes, so this keeps them out of every future run. Never leave a reported jump

@@ -1,15 +1,17 @@
 """Shared plumbing for the local tools that drive Ghidra-side scripts.
 
 ``prototype_tools`` and ``switch_tools`` both work the same way: deploy a Java
-*GhidraScript* through GhidrAssistMCP's ``scripts`` executor, run it, resolve the
+*GhidraScript* through GhidrAssistMCP's ``create_script`` tool, run it with
+``run_script``, resolve the
 async task, and pull a JSON manifest out of the script's stdout between two
 sentinel markers. That plumbing lives here so the tool modules only hold what is
 actually specific to them — the script source, the arguments, and how the
 manifest is rendered for the model.
 
-Server prerequisite: GhidrAssistMCP ships the ``scripts`` tool **disabled by
-default**. When it is absent, ``find_scripts_tools`` warns and returns ``None``,
-and the calling module returns no tools at all.
+Server prerequisite: GhidrAssistMCP ships its script tools **disabled by
+default**; ``create_script`` and ``run_script`` must both be enabled. When either
+is absent, ``find_scripts_tools`` warns and returns ``None``, and the calling
+module returns no tools at all.
 """
 
 import json
@@ -54,37 +56,48 @@ def find_manifest(pattern: re.Pattern[str], raw: str) -> re.Match[str] | None:
     return matches[-1] if matches else None
 
 
+# The MCP tools a script-driving local tool needs; both are off by default.
+_SCRIPT_TOOL_NAMES = ("create_script", "run_script")
+
+
 def find_scripts_tools(
     mcp_tools: list[BaseTool], disabled_note: str
-) -> tuple[BaseTool, BaseTool | None] | None:
-    """Locate the ``scripts`` executor (and ``get_task_status``, if present).
+) -> tuple[BaseTool, BaseTool, BaseTool | None] | None:
+    """Locate ``create_script``, ``run_script`` and (if present) ``get_task_status``.
 
     Returns ``None`` — after warning with ``disabled_note`` — when the server
-    doesn't expose ``scripts``, which is the signal to build no tools.
+    doesn't expose both script tools, which is the signal to build no tools.
     """
     by_name = {t.name: t for t in mcp_tools}
-    scripts_tool = by_name.get("scripts")
-    if scripts_tool is None:
+    missing = [name for name in _SCRIPT_TOOL_NAMES if name not in by_name]
+    if missing:
         print(
-            "Warning: GhidrAssistMCP 'scripts' tool not available "
-            f"(enable it server-side); {disabled_note}",
+            "Warning: GhidrAssistMCP "
+            + ", ".join(repr(name) for name in missing)
+            + f" not available (enable server-side); {disabled_note}",
             file=sys.stderr,
         )
         return None
-    return scripts_tool, by_name.get("get_task_status")
+    return (
+        by_name["create_script"],
+        by_name["run_script"],
+        by_name.get("get_task_status"),
+    )
 
 
 class GhidraScriptRunner:
-    """Deploys and runs Ghidra-side scripts through the MCP ``scripts`` tool."""
+    """Deploys and runs Ghidra-side scripts through the MCP script tools."""
 
     def __init__(
         self,
-        scripts_tool: BaseTool,
+        create_tool: BaseTool,
+        run_tool: BaseTool,
         status_tool: BaseTool | None,
         *,
         timeout_s: float | None = None,
     ) -> None:
-        self._scripts_tool = scripts_tool
+        self._create_tool = create_tool
+        self._run_tool = run_tool
         self._status_tool = status_tool
         self._timeout_s = script_timeout_s() if timeout_s is None else timeout_s
         # Resolved output of the most recent deploy. Ghidra compiles the whole
@@ -104,20 +117,19 @@ class GhidraScriptRunner:
         minutes.
         """
         create_args: dict[str, Any] = {
-            "action": "create",
             "name": name,
             "source": source,
             "overwrite": True,
         }
-        create_out = to_text(await self._scripts_tool.ainvoke(create_args))
+        create_out = to_text(await self._create_tool.ainvoke(create_args))
         self._last_deploy_output = await resolve_async_result(
             create_out, self._status_tool, timeout_s=self._timeout_s
         )
 
-        run_call: dict[str, Any] = {"action": "run", "name": name}
+        run_call: dict[str, Any] = {"name": name}
         if run_args:
             run_call["args"] = run_args
-        run_out = to_text(await self._scripts_tool.ainvoke(run_call))
+        run_out = to_text(await self._run_tool.ainvoke(run_call))
         return await resolve_async_result(
             run_out, self._status_tool, timeout_s=self._timeout_s
         )
@@ -153,8 +165,8 @@ class GhidraScriptRunner:
                 None,
                 raw,
                 f"{tool_label}: no JSON manifest found in the script output. "
-                "The `scripts` executor may not return stdout, the `scripts` "
-                "tool may be disabled/misconfigured, or the script failed to "
+                "`run_script` may not return stdout, the script tools may be "
+                "disabled/misconfigured, or the script failed to "
                 "compile or errored at runtime. Raw output tail:\n"
                 + tail
                 + deploy_note,

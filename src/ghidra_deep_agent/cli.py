@@ -65,7 +65,6 @@ from ghidra_deep_agent.sandbox import (
 from ghidra_deep_agent.sandbox_sync import SandboxSyncMiddleware
 from ghidra_deep_agent.sessions import build_session_store
 from ghidra_deep_agent.subagents import (
-    ALL_WRITE_ACTIONS,
     DEFAULT_WRITE_POLICY,
     READ_ONLY_WRITE_POLICY,
     RESEARCH_SUBAGENT_NAME,
@@ -180,14 +179,14 @@ def _build_tools(
         knowledge_ok = False
 
     # Local `recover_prototypes` tool: drives a Ghidra-side prototype-recovery
-    # script through the MCP `scripts` executor. Omitted (with a warning) when the
-    # server's `scripts` tool is disabled.
+    # script through the MCP `create_script`/`run_script` tools. Omitted (with a
+    # warning) when those tools are disabled server-side.
     prototype_tools = build_prototype_tools(mcp_tools)
 
     # Local jump-table tools: `find_unrecovered_switches` (read-only detection)
     # and `apply_switch_override` (writes the decompiler jump-table override).
-    # Both drive Ghidra-side scripts through the MCP `scripts` executor; omitted
-    # (with a warning) when the server's `scripts` tool is disabled.
+    # Both drive Ghidra-side scripts through the MCP `create_script`/`run_script`
+    # tools; omitted (with a warning) when those are disabled server-side.
     switch_tools = build_switch_tools(mcp_tools)
 
     return (
@@ -354,12 +353,9 @@ def _build_shared_middleware(
         # Tool calls: validate args (reject bad calls without retry), serve
         # immutable reads from cache, resolve async task stubs (inside the cache
         # so resolved results are what gets cached), then retry transient I/O.
-        #
-        # The coordinator never mutates the program itself — it delegates. Its
-        # allowlist grants no write-only tool, but the dual read/write tools it
-        # does need (`bookmarks`, to drain the pending-change queue) carry write
-        # actions along with the reads, so every write action is blocked here.
-        create_argument_validation_middleware(ALL_WRITE_ACTIONS),
+        # The coordinator never mutates the program itself — it delegates — and
+        # its allowlist grants no Ghidra write tool.
+        create_argument_validation_middleware(),
         *([cache_mw] if cache_mw is not None else []),
         *([async_mw] if async_mw is not None else []),
         build_tool_retry_middleware(),
@@ -486,7 +482,7 @@ async def main() -> None:
     # Shared across the coordinator and sub-agents: one cache for the whole
     # session (same binary, same Mongo collection). None when disabled/unreachable.
     cache_mw = build_mcp_cache_middleware(mongodb_uri, mongodb_db, binary_name)
-    # GhidrAssistMCP runs slow tools (e.g. get_code) as async tasks that return a
+    # GhidrAssistMCP runs slow tools (e.g. get_pseudocode) as async tasks that return a
     # task_id stub; this middleware polls get_task_status so the agent sees the
     # resolved result. None when the server exposes no get_task_status tool.
     async_mw = build_async_task_middleware(tools)

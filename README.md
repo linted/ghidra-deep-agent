@@ -22,7 +22,7 @@ The knowledge base is scoped per binary — each program analyzed gets its own i
 
 - Python 3.13+
 - [uv](https://docs.astral.sh/uv/)
-- Ghidra 11.4+ (tested with 12.1) with the [GhidrAssistMCP](https://github.com/symgraph/GhidrAssistMCP) extension installed and its MCP server enabled (HTTP or SSE)
+- Ghidra 12.0+ (tested with 12.1) with the [GhidrAssistMCP](https://github.com/symgraph/GhidrAssistMCP) **3.0.0+** extension installed and its MCP server enabled (HTTP or SSE)
 - MongoDB instance (local or remote)
 - An Anthropic API key (or any other supported LangChain model provider)
 - [Ollama](https://ollama.com/) (for the vector knowledge base embeddings)
@@ -79,7 +79,7 @@ All configuration is done via environment variables (`.env` file or shell export
 | `MONGODB_TOOL_CACHE_COLLECTION` | `tool_cache` | Collection caching immutable read-only MCP tool results |
 | `MONGODB_TOOL_CACHE_TTL` | `86400` | Cache entry lifetime in seconds (TTL index); sized to a session |
 | `MONGODB_TOOL_CACHE_TOOLS` | *(immutable read set)* | Comma-separated allowlist override; empty disables the cache |
-| `MONGODB_TOOL_CACHE_MUTABLE_TOOLS` | `get_code,xrefs,get_data_at` | Mutable-tier allowlist: reads cached until any Ghidra mutation tool succeeds, which flushes the tier for the binary; empty disables the tier |
+| `MONGODB_TOOL_CACHE_MUTABLE_TOOLS` | *(decompilation, disassembly, p-code, xref/call, and hexdump reads)* | Mutable-tier allowlist: reads cached until any Ghidra mutation tool succeeds, which flushes the tier for the binary; empty disables the tier |
 | `MONGODB_TOOL_CACHE_DEBUG` | *(unset)* | Set to `1` to log per-tool cache `HIT`/`MISS`/`INVALIDATE` lines to stderr |
 | `BINARY_NAME` | *(auto-detected)* | Override the binary name used to scope the knowledge base — see [Binary selection](#binary-selection) |
 | `GHIDRA_MCP_TRANSPORT` | `http` | Transport type: `http` or `sse` (GhidrAssistMCP is HTTP-only) |
@@ -199,9 +199,11 @@ With no file present, OpenRouter's default routing is used. See
 ### Transport options
 
 The agent connects to [GhidrAssistMCP](https://github.com/symgraph/GhidrAssistMCP),
-a Ghidra 11.4+/12.1 extension that serves MCP over HTTP. Enable the plugin in
-Ghidra (Window → GhidrAssistMCP → turn the MCP server on) with a program open,
-then point the agent at it:
+a Ghidra 12.0+ extension that serves MCP over HTTP. Version **3.0.0 or later** is
+required: 3.0.0 replaced the consolidated `action`/`format`-selector tools with
+one tool per operation, and the agent's tool allowlists use the new names. Enable
+the plugin in Ghidra (Window → GhidrAssistMCP → turn the MCP server on) with a
+program open, then point the agent at it:
 
 **HTTP** (default):
 ```env
@@ -218,13 +220,19 @@ GHIDRA_MCP_URL=http://localhost:8080/sse
 > GhidrAssistMCP listens on port `8080` by default. If another service uses that
 > port, change it in the GhidrAssistMCP control panel and update `GHIDRA_MCP_URL`.
 
+> The local `recover_prototypes`, `find_unrecovered_switches`,
+> `apply_switch_override`, and `deobfuscate_cff` tools drive Ghidra scripts
+> through GhidrAssistMCP's `create_script` and `run_script` tools, which ship
+> **disabled by default**. Enable both in the GhidrAssistMCP Configuration view;
+> otherwise the agent starts without those tools and prints a warning.
+
 ### Binary selection
 
-At startup the agent calls `list_binaries` on the Ghidra MCP server to determine which binary you are working on. This name is used to scope all knowledge base reads and writes so findings from different binaries never mix.
+At startup the agent calls `list_open_programs` on the Ghidra MCP server to determine which binary you are working on. This name is used to scope all knowledge base reads and writes so findings from different binaries never mix.
 
 - **One program open** — selected automatically, printed to console.
 - **Multiple programs open** — a selection screen appears before the main TUI; use arrow keys and Enter to choose.
-- **Override** — set `BINARY_NAME` in `.env` or pass `--binary-name` on the command line to skip detection entirely (useful for scripting or when the MCP server doesn't expose `list_binaries`).
+- **Override** — set `BINARY_NAME` in `.env` or pass `--binary-name` on the command line to skip detection entirely (useful for scripting or when the MCP server doesn't expose `list_open_programs`).
 
 ```env
 BINARY_NAME=firmware_v2.bin

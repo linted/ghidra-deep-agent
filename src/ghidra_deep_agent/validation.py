@@ -14,14 +14,7 @@ Pydantic-schema tools (knowledge tools, deepagents built-ins) are left untouched
 ``ToolNode`` already validates them and returns a clean error, so re-validating
 here would only risk diverging from each tool's own coercion/defaults.
 
-It also enforces **write-action blocking**: GhidrAssistMCP consolidates
-read and write operations into single ``action``-based tools (e.g. ``variables``
-does both ``action:list`` and ``action:rename``), so a restricted context can't
-simply drop the tool. When built with a ``write_actions`` map, this middleware
-rejects a call whose ``action`` argument names a blocked write on that tool,
-using the same short-circuit path as a schema failure.
-
-Finally it enforces the **provisional-rename prefix**: an ``annotations``-tier
+It also enforces the **provisional-rename prefix**: an ``annotations``-tier
 sub-agent may persist renames, but only provisional ones. Rather than trusting
 the prompt, this middleware rejects any rename whose new name lacks the required
 prefix, so an investigator physically cannot commit a name that reads as settled
@@ -29,7 +22,7 @@ prefix, so an investigator physically cannot commit a name that reads as settled
 """
 
 import json
-from collections.abc import Awaitable, Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator
 from typing import Any
 
 import jsonschema
@@ -41,16 +34,21 @@ from langgraph.types import Command
 # Cap the number of reported errors so a badly-off call can't flood context.
 _MAX_REPORTED_ERRORS = 10
 
-# Tools that assign a new symbol name. ``variables`` is included conditionally —
-# only for ``action: rename`` (see ``_RENAME_ACTIONS``) — since its other actions
-# don't name anything.
-_RENAME_TOOLS = frozenset({"rename_symbol", "batch_rename", "variables"})
-_RENAME_ACTIONS: dict[str, frozenset[str]] = {"variables": frozenset({"rename"})}
+# Tools that assign a new symbol name.
+_RENAME_TOOLS = frozenset(
+    {
+        "rename_function",
+        "rename_label",
+        "rename_local_variable",
+        "rename_global_variable",
+        "rename_symbols_batch",
+    }
+)
 # Argument keys that carry the NEW name in a rename call, matched after
 # lowercasing and stripping non-alphanumerics. Deliberately narrow: keys naming
-# the *existing* target (``function_name``, ``old_name``, ``variable``) must not
+# the *existing* target (``function``, ``variable_name``, ``identifier``) must not
 # match, or every call would be rejected for the wrong reason. Nested structures
-# are searched too, so a `batch_rename` list of per-symbol entries is covered.
+# are searched too, so a `rename_symbols_batch` list of per-symbol entries is covered.
 _NEW_NAME_KEYS = frozenset({"newname", "newlabel", "newsymbolname", "rename", "to"})
 # How deep to search nested rename arguments before giving up (and failing
 # closed). Well past any real batch payload's shape.
@@ -100,18 +98,10 @@ def _error_message(request: ToolCallRequest, payload: dict[str, Any]) -> ToolMes
 
 
 class ArgumentValidationMiddleware(AgentMiddleware):
-    """Validate dict-schema tool arguments (and, optionally, restrict writes)."""
+    """Validate dict-schema tool arguments (and, optionally, rename prefixes)."""
 
-    def __init__(
-        self,
-        write_actions: Mapping[str, frozenset[str]] | None = None,
-        *,
-        rename_prefix: str | None = None,
-    ) -> None:
+    def __init__(self, *, rename_prefix: str | None = None) -> None:
         super().__init__()
-        # Tool name -> set of `action` values this context may not use. Populated
-        # only for restricted tiers; empty means "allow everything the schema does".
-        self._write_actions = dict(write_actions or {})
         # When set, every new symbol name must start with this prefix.
         self._rename_prefix = rename_prefix
         # Tool name -> its compiled validator, or None when the schema itself is
@@ -154,7 +144,7 @@ class ArgumentValidationMiddleware(AgentMiddleware):
 
         validator = self._validator_for(tool.name, schema)
         # A malformed schema is never grounds to block — let the server decide.
-        # The read-only write-action check below still applies.
+        # The rename-prefix check below still applies.
         errors = (
             []
             if validator is None
@@ -181,28 +171,6 @@ class ArgumentValidationMiddleware(AgentMiddleware):
                 },
             )
 
-        blocked = self._write_actions.get(tool.name)
-        if blocked:
-            action = args.get("action")
-            if isinstance(action, str) and action in blocked:
-                return _error_message(
-                    request,
-                    {
-                        "read_only_error": {
-                            "tool": tool.name,
-                            "action": action,
-                            "hint": (
-                                f"'{tool.name}' with action '{action}' mutates the "
-                                "program and is out of scope for you. Use a read "
-                                "action (e.g. list/get) only, and record the change "
-                                "you wanted as a `pending-change` bookmark plus a "
-                                "PENDING: line in your summary instead of applying "
-                                "it. Do not retry this call."
-                            ),
-                        }
-                    },
-                )
-
         return self._check_rename_prefix(request, tool.name, args)
 
     def _check_rename_prefix(
@@ -216,9 +184,6 @@ class ArgumentValidationMiddleware(AgentMiddleware):
         """
         prefix = self._rename_prefix
         if prefix is None or tool_name not in _RENAME_TOOLS:
-            return None
-        gated_actions = _RENAME_ACTIONS.get(tool_name)
-        if gated_actions is not None and args.get("action") not in gated_actions:
             return None
 
         names = list(_new_names(args))
@@ -273,15 +238,11 @@ class ArgumentValidationMiddleware(AgentMiddleware):
 
 
 def create_argument_validation_middleware(
-    write_actions: Mapping[str, frozenset[str]] | None = None,
-    *,
-    rename_prefix: str | None = None,
+    *, rename_prefix: str | None = None
 ) -> ArgumentValidationMiddleware:
     """Build the argument-validation middleware (factory for ``cli.py``).
 
-    Pass ``write_actions`` (tool name -> blocked ``action`` values) to also
-    reject write actions on consolidated read/write tools, and ``rename_prefix``
-    to require that prefix on every new symbol name. Both come from the agent's
-    ``WritePolicy`` (see subagents.py).
+    Pass ``rename_prefix`` to require that prefix on every new symbol name; it
+    comes from the agent's ``WritePolicy`` (see subagents.py).
     """
-    return ArgumentValidationMiddleware(write_actions, rename_prefix=rename_prefix)
+    return ArgumentValidationMiddleware(rename_prefix=rename_prefix)

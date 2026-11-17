@@ -4,14 +4,14 @@ from typing import Any
 
 from ghidra_deep_agent.tui import ProgramSelectApp
 
-# A GhidrAssistMCP ``list_binaries`` entry, e.g. "1. libnloader.so [ACTIVE]".
+# A GhidrAssistMCP ``list_open_programs`` entry, e.g. "1. libnloader.so [ACTIVE]".
 # Indented detail lines (Project Path / Executable Path / Format / Language) that
 # follow each entry do NOT match, so they are ignored.
 _NUMBERED_ENTRY = re.compile(r"^\s*\d+\.\s+(?P<name>.+?)\s*$")
 
 
 def parse_program_list(result: str) -> list[str]:
-    """Parse list_binaries output into a list of program names."""
+    """Parse list_open_programs output into a list of program names."""
     try:
         data = json.loads(result)
         if isinstance(data, list):
@@ -61,10 +61,10 @@ async def resolve_binary_name(tools: list[Any], override: str | None) -> str:
     if override:
         return override
 
-    list_tool = next((t for t in tools if t.name == "list_binaries"), None)
+    list_tool = next((t for t in tools if t.name == "list_open_programs"), None)
     if list_tool is None:
         raise RuntimeError(
-            "Ghidra MCP does not expose 'list_binaries'. "
+            "Ghidra MCP does not expose 'list_open_programs'. "
             "Set BINARY_NAME or pass --binary-name."
         )
 
