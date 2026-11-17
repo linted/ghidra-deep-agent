@@ -724,6 +724,19 @@ def test_jev_judge_reads_the_sdk_response_shape() -> None:
     assert result == Judgement({"x0": 0.25}, 42, "jev-1")
 
 
+def test_jev_judge_tolerates_missing_usage() -> None:
+    """The SDK's ``usage`` is optional; its absence must not fail the batch."""
+    from langchain_typesafe import ClassifierResponse
+
+    from ghidra_deep_agent.context_pruning import JevJudge
+
+    response = ClassifierResponse.model_validate(
+        {"model": "jev-1", "answers": {"x0": {"type": "noul", "noul": 0.75}}}
+    )
+    result = JevJudge._judgement(response, ["x0"])
+    assert result == Judgement({"x0": 0.75}, None, "jev-1")
+
+
 # --- live ---------------------------------------------------------------------
 
 

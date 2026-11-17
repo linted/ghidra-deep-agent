@@ -18,21 +18,21 @@ dependencies = [
     # Uncapped, but compaction.py drives private summarization-engine methods
     # (see compact_out_of_band): on a minor-version upgrade, confirm the
     # private-API smoke test in tests/test_compaction.py still passes.
-    "deepagents>=0.7.34",
+    "deepagents>=0.7.39",
     "jsonschema>=4.26.0",
     "langchain-mcp-adapters>=0.3.2",
     "langchain-mongodb>=0.12.1",
-    "langchain[anthropic]>=1.4.9",
-    "langchain-deepseek>=1.1.1",
+    "langchain[anthropic]>=1.5.0",
+    "langchain-deepseek>=1.2.0",
     "langchain-nvidia-openshell>=0.1.1",
     "langchain-ollama>=1.1.0",
     "langchain-openrouter>=0.2.9",
     # The TypeSafe (Jev) classifier behind context_pruning.py.
-    "langchain-typesafe>=0.0.2",
-    "langgraph>=1.2.20",
+    "langchain-typesafe>=0.1.0",
+    "langgraph>=1.2.22",
     "langgraph-checkpoint-mongodb>=0.5.1",
-    "openshell>=0.1.7",
-    "pymongo>=4.19.0",
+    "openshell>=0.1.9",
+    "pymongo>=4.20.0",
     "python-dotenv>=1.2.4",
     "textual>=8.2.8",
 ]
@@ -42,7 +42,7 @@ ghidra-deep-agent = "ghidra_deep_agent.cli:run"
 
 [project.optional-dependencies]
 dev = [
-    "ruff>=0.17.4",
+    "ruff>=0.17.5",
     "mypy>=2.4.1",
 ]
 

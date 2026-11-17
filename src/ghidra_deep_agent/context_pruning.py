@@ -79,7 +79,7 @@ from ghidra_deep_agent.mongo_util import get_mongo_client, mongo_write_with_retr
 from ghidra_deep_agent.resilience import is_truncation_nudge
 
 if TYPE_CHECKING:
-    from langchain_typesafe import ClassifierRequest
+    from langchain_typesafe import ClassifierRequest, ClassifierResponse
 
 # Jev's P(keep) sits at 0.3–0.5 for results the agent has already acted on
 # (mutation confirmations, notes it has read) and at 0.55+ for ones it is still
@@ -219,11 +219,15 @@ class JevJudge:
         return {"state": state, "questions": _questions(keys)}
 
     @staticmethod
-    def _judgement(response: Any, keys: Sequence[str]) -> Judgement:
+    def _judgement(response: ClassifierResponse, keys: Sequence[str]) -> Judgement:
         nouls = response.nouls
         # A key Jev did not answer is treated as "keep": never evict on silence.
         probs = {key: nouls[key].noul for key in keys if key in nouls}
-        return Judgement(probs, response.usage.input_tokens, response.model)
+        # Since 0.1.0 usage is langchain-core's UsageMetadata (a TypedDict), or
+        # None when Jev does not report it.
+        usage = response.usage
+        tokens = usage["input_tokens"] if usage is not None else None
+        return Judgement(probs, tokens, response.model)
 
     def judge(self, state: dict[str, Any], keys: Sequence[str]) -> Judgement:
         return self._judgement(
