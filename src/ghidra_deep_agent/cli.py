@@ -26,6 +26,7 @@ from langgraph.checkpoint.mongodb import MongoDBSaver
 from pymongo.errors import ServerSelectionTimeoutError
 
 from ghidra_deep_agent.async_tasks import build_async_task_middleware
+from ghidra_deep_agent.auto_mode import build_auto_mode_middleware
 from ghidra_deep_agent.compaction import (
     build_tuned_summarization_middleware,
     create_manual_compaction_engine,
@@ -337,6 +338,7 @@ def _build_shared_middleware(
     built_model: Any,
     summary_override: Any,
     prune_mw: Any = None,
+    auto_mode_mw: Any = None,
 ) -> list[Any]:
     """Middleware shared by all three graphs, in wrapping order.
 
@@ -360,6 +362,8 @@ def _build_shared_middleware(
         # does need (`bookmarks`, to drain the pending-change queue) carry write
         # actions along with the reads, so every write action is blocked here.
         create_argument_validation_middleware(ALL_WRITE_ACTIONS),
+        # Jev Auto Mode (AUTO_MODE=1): blocks risky calls to hard-to-undo tools.
+        *([auto_mode_mw] if auto_mode_mw is not None else []),
         *([cache_mw] if cache_mw is not None else []),
         *([async_mw] if async_mw is not None else []),
         build_tool_retry_middleware(),
@@ -499,6 +503,10 @@ async def main() -> None:
     )
     if prune_mw is not None:
         print("Jev context pruning enabled (savings log: MongoDB jev_prune_log).")
+    # Jev Auto Mode, shared by the coordinator and every sub-agent. Opt-in.
+    auto_mode_mw = build_auto_mode_middleware()
+    if auto_mode_mw is not None:
+        print(f"Jev Auto Mode enabled on: {', '.join(sorted(auto_mode_mw.guarded))}")
     print(f"Main agent: {main_model_spec}  [{len(main_tools)} tool(s)]")
     for sub_cfg in agent_config.subagents:
         # Show the write tier for anything but the default: how much of the
@@ -565,6 +573,7 @@ async def main() -> None:
                 cache_middleware=cache_mw,
                 async_middleware=async_mw,
                 pruning_middleware=prune_mw,
+                auto_mode_middleware=auto_mode_mw,
                 summary_model=summary_override,
             )
             # Plan mode and ask mode delegate to the SAME config entries, rebuilt
@@ -580,6 +589,7 @@ async def main() -> None:
                 cache_middleware=cache_mw,
                 async_middleware=async_mw,
                 pruning_middleware=prune_mw,
+                auto_mode_middleware=auto_mode_mw,
                 summary_model=summary_override,
                 policy_override=READ_ONLY_WRITE_POLICY,
             )
@@ -596,6 +606,7 @@ async def main() -> None:
                 built_model=built_model,
                 summary_override=summary_override,
                 prune_mw=prune_mw,
+                auto_mode_mw=auto_mode_mw,
             )
 
             graphs = _build_graphs(
