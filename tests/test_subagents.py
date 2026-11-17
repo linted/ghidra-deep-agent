@@ -342,3 +342,26 @@ def test_resolver_falls_back_to_env_max_tokens(
     resolve(None)
 
     assert calls == [("anthropic:glm-5.2", 12345)]
+
+
+# --- shared middleware -----------------------------------------------------------
+
+
+def test_auto_mode_sits_right_after_validation(tmp_path: Path) -> None:
+    """After validation (a rejected call costs no Jev request), in every tier."""
+    from langchain.agents.middleware import AgentMiddleware
+
+    auto_mode = AgentMiddleware()
+    config = load_agent_config(_write_config(tmp_path, _entry("analyst")))
+    for override in (None, READ_ONLY_WRITE_POLICY):
+        [spec] = build_subagents(
+            _fake_tools(),
+            config,
+            resolve_model=_resolver,
+            backend=StateBackend(),
+            auto_mode_middleware=auto_mode,
+            policy_override=override,
+        )
+        middleware = list(spec["middleware"])
+        validation = middleware.index(_validation_mw(spec))
+        assert middleware[validation + 1] is auto_mode

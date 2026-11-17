@@ -79,7 +79,11 @@ from ghidra_deep_agent.mongo_util import get_mongo_client, mongo_write_with_retr
 from ghidra_deep_agent.resilience import is_truncation_nudge
 
 if TYPE_CHECKING:
-    from langchain_typesafe import ClassifierRequest
+    from langchain_typesafe import (
+        ClassifierRequest,
+        ClassifierResponse,
+        TypeSafeClassifier,
+    )
 
 # Jev's P(keep) sits at 0.3–0.5 for results the agent has already acted on
 # (mutation confirmations, notes it has read) and at 0.55+ for ones it is still
@@ -194,6 +198,19 @@ def _questions(keys: Iterable[str]) -> dict[str, Any]:
     }
 
 
+def make_jev_classifier(
+    *, model: str = DEFAULT_MODEL, timeout: float = DEFAULT_TIMEOUT
+) -> TypeSafeClassifier:
+    """A ``TypeSafeClassifier`` for Jev; keep it long-lived for its connection pool."""
+    from langchain_core._api.beta_decorator import LangChainBetaWarning
+    from langchain_typesafe import TypeSafeClassifier
+
+    # The classifier class is marked beta and warns on construction.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", LangChainBetaWarning)
+        return TypeSafeClassifier(model=model, timeout=timeout)
+
+
 class JevJudge:
     """Ask Jev through one long-lived ``TypeSafeClassifier``.
 
@@ -205,25 +222,23 @@ class JevJudge:
     def __init__(
         self, *, model: str = DEFAULT_MODEL, timeout: float = DEFAULT_TIMEOUT
     ) -> None:
-        from langchain_core._api.beta_decorator import LangChainBetaWarning
-        from langchain_typesafe import TypeSafeClassifier
-
         self._model = model
-        # The classifier class is marked beta and warns on construction.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", LangChainBetaWarning)
-            self._classifier = TypeSafeClassifier(model=model, timeout=timeout)
+        self._classifier = make_jev_classifier(model=model, timeout=timeout)
 
     @staticmethod
     def _request(state: dict[str, Any], keys: Sequence[str]) -> ClassifierRequest:
         return {"state": state, "questions": _questions(keys)}
 
     @staticmethod
-    def _judgement(response: Any, keys: Sequence[str]) -> Judgement:
+    def _judgement(response: ClassifierResponse, keys: Sequence[str]) -> Judgement:
         nouls = response.nouls
         # A key Jev did not answer is treated as "keep": never evict on silence.
         probs = {key: nouls[key].noul for key in keys if key in nouls}
-        return Judgement(probs, response.usage.input_tokens, response.model)
+        # Since 0.1.0 usage is langchain-core's UsageMetadata (a TypedDict), or
+        # None when Jev does not report it.
+        usage = response.usage
+        tokens = usage["input_tokens"] if usage is not None else None
+        return Judgement(probs, tokens, response.model)
 
     def judge(self, state: dict[str, Any], keys: Sequence[str]) -> Judgement:
         return self._judgement(

@@ -600,6 +600,7 @@ def build_subagents(
     cache_middleware: AgentMiddleware | None = None,
     async_middleware: AgentMiddleware | None = None,
     pruning_middleware: AgentMiddleware | None = None,
+    auto_mode_middleware: AgentMiddleware | None = None,
     summary_model: str | BaseChatModel | None = None,
     policy_override: str | None = None,
 ) -> list[SubAgent]:
@@ -607,7 +608,8 @@ def build_subagents(
 
     Each sub-agent gets its own middleware (sub-agent middleware does not inherit
     from the main agent): model resilience (retry + optional provider fallback),
-    argument validation, the shared immutable-read cache (when enabled),
+    argument validation, the shared Jev Auto Mode check on hard-to-undo tools
+    (when enabled), the shared immutable-read cache (when enabled),
     async-task resolution, transient filesystem-tool retry, the shared Jev
     context pruner (when enabled), and a tuned auto-summarizer (aggressive
     sub-agent thresholds; replaces deepagents' stock instance by ``.name``).
@@ -656,6 +658,8 @@ def build_subagents(
             "middleware": [
                 *build_model_resilience_middleware(resolve_model),
                 validation_mw,
+                # After validation, so a rejected call costs no Jev request.
+                *([auto_mode_middleware] if auto_mode_middleware is not None else []),
                 *([cache_middleware] if cache_middleware is not None else []),
                 # Inside the cache so resolved (not stub) results are cached.
                 *([async_middleware] if async_middleware is not None else []),
