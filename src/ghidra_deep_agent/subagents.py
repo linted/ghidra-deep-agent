@@ -278,7 +278,8 @@ READ_ONLY_WRITE_POLICY = "none"
 #     receive it as a callable tool, or it starts manual polling — the very
 #     context-bloating spin-loop the middleware exists to prevent. Withholding is
 #     safe because the middleware and ``recover_prototypes`` look the tool up in
-#     the *raw* MCP tool list (cli.py), upstream of this filter.
+#     the *raw* MCP tool list (cli.py), upstream of this filter. ``list_tasks`` and
+#     ``cancel_task`` are the rest of that job API and are withheld with it.
 #   ``create_project`` / ``open_project`` / ``close_project`` replace or close the
 #     active Ghidra project. A session is bound to one program in it, so every
 #     later tool call would fail; that is the human's call, not an agent's.
@@ -286,6 +287,8 @@ WITHHELD_TOOLS = frozenset(
     {
         "analyze_program",
         "get_task_status",
+        "list_tasks",
+        "cancel_task",
         "create_project",
         "open_project",
         "close_project",
