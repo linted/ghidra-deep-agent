@@ -13,6 +13,8 @@ Run:  uv run pytest tests/test_models.py -v
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
@@ -34,6 +36,7 @@ def _api_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ZAI_API_URL", raising=False)
     monkeypatch.setenv("OPENCODE_API_KEY", "oc-key")
     monkeypatch.delenv("OPENCODE_API_URL", raising=False)
+    monkeypatch.delenv("OPENCODE_GO_API_URL", raising=False)
 
 
 def test_unprofiled_anthropic_model_gets_the_floor_cap() -> None:
@@ -154,3 +157,63 @@ def test_opencode_without_key_fails_with_a_clear_error(
     monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
     with pytest.raises(ValueError, match="OPENCODE_API_KEY"):
         build_model("opencode:glm-5.3")
+
+
+# --- opencode-go: provider (OpenCode Go subscription) ---------------------------
+
+
+def _sdk_headers(model: Any) -> dict[str, str]:
+    """Headers the underlying SDK client sends on every request."""
+    client = getattr(model, "root_async_client", None) or model._async_client
+    return dict(client.default_headers)
+
+
+@pytest.mark.parametrize(
+    ("name", "path"),
+    [
+        ("claude-haiku-5-5", "/anthropic"),
+        ("gpt-6-luna", "/openai/v1"),
+        ("glm-5.3", "/openai/v1"),
+    ],
+)
+def test_opencode_go_uses_the_go_base_url(name: str, path: str) -> None:
+    model = build_model(f"opencode-go:{name}")
+    base = getattr(model, "anthropic_api_url", None) or getattr(
+        model, "openai_api_base", None
+    )
+    if base is None:
+        base = getattr(model, "api_base")  # noqa: B009
+    assert base == f"https://opencode.ai/inference/go{path}"
+
+
+def test_opencode_go_base_url_is_overridable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENCODE_GO_API_URL", "https://example.test/go/")
+    model = build_model("opencode-go:glm-5.3")
+    assert isinstance(model, _ChatDeepSeekFixed)
+    assert model.api_base == "https://example.test/go/openai/v1"
+
+
+def test_opencode_sends_one_stable_session_id_from_every_model() -> None:
+    """Go requires x-opencode-session; it must be the same across all agents."""
+    sessions = set()
+    for spec in (
+        "opencode-go:claude-haiku-5-5",
+        "opencode-go:gpt-6-luna",
+        "opencode-go:glm-5.3",
+        "opencode:glm-5.3",
+    ):
+        headers = _sdk_headers(build_model(spec))
+        sessions.add(headers["x-opencode-session"])
+        assert headers["User-Agent"].startswith("ghidra-deep-agent/")
+    assert len(sessions) == 1
+    assert next(iter(sessions)).startswith("ses_")
+
+
+def test_opencode_go_without_key_names_the_go_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="opencode-go:glm-5.3 requires"):
+        build_model("opencode-go:glm-5.3")

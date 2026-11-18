@@ -45,7 +45,7 @@ All configuration is done via environment variables (`.env` file or shell export
 | Variable | Default | Description |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | — | API key for Anthropic *(not needed for Ollama)* |
-| `MODEL` | `anthropic:claude-sonnet-4-6` | Any `provider:model` string supported by LangChain (also `openrouter:<model-id>` — see [Using OpenRouter](#using-openrouter) — and `opencode:<model-id>` for the OpenCode Console gateway, keyed by `OPENCODE_API_KEY`) |
+| `MODEL` | `anthropic:claude-sonnet-4-6` | Any `provider:model` string supported by LangChain (also `openrouter:<model-id>` — see [Using OpenRouter](#using-openrouter) — and `opencode:<model-id>` / `opencode-go:<model-id>` for the OpenCode Console gateway, pay-as-you-go or the Go subscription, keyed by `OPENCODE_API_KEY`) |
 | `AGENT_CONFIG` | `./subagents.toml` | Per-agent models and tool allowlists (coordinator + sub-agents); point this at a different TOML to override |
 | `OPENROUTER_API_KEY` | — | API key for OpenRouter *(required for `openrouter:` models)* |
 | `DEEPSEEK_API_KEY` | — | API key for DeepSeek *(required for `deepseek:` models)* |
