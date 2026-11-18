@@ -146,7 +146,7 @@ def _load_openrouter_presets() -> dict[str, dict[str, Any]]:
 # profile for (third-party endpoints like z.ai's glm models). Without this,
 # ChatAnthropic falls back to max_tokens=4096 (_FALLBACK_MAX_OUTPUT_TOKENS),
 # which truncates long tool_use payloads mid-call and silently ends agent runs
-# on a bare preamble. Overridable per model via `max_tokens` in subagents.toml.
+# on a bare preamble. Overridable per model via `max_tokens` in agents.toml.
 _UNPROFILED_ANTHROPIC_MAX_TOKENS = 32768
 
 
@@ -294,7 +294,7 @@ def build_model(
     the Go subscription) with the stock class for the model's family (see
     ``_build_opencode_model``).
 
-    ``max_tokens`` (from ``max_tokens`` in subagents.toml) caps output tokens.
+    ``max_tokens`` (from ``max_tokens`` in agents.toml) caps output tokens.
     Anthropic-protocol models that langchain-anthropic has no profile for get
     ``_UNPROFILED_ANTHROPIC_MAX_TOKENS`` even without an explicit setting —
     the library's 4096 fallback truncates real runs.

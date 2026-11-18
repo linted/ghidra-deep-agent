@@ -13,16 +13,10 @@ This middleware validates dict-schema tool arguments against their JSON schema
 Pydantic-schema tools (knowledge tools, deepagents built-ins) are left untouched:
 ``ToolNode`` already validates them and returns a clean error, so re-validating
 here would only risk diverging from each tool's own coercion/defaults.
-
-It also enforces the **provisional-rename prefix**: an ``annotations``-tier
-sub-agent may persist renames, but only provisional ones. Rather than trusting
-the prompt, this middleware rejects any rename whose new name lacks the required
-prefix, so an investigator physically cannot commit a name that reads as settled
-(nor strip another agent's prefix — promotion belongs to a full-write agent).
 """
 
 import json
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import jsonschema
@@ -34,57 +28,12 @@ from langgraph.types import Command
 # Cap the number of reported errors so a badly-off call can't flood context.
 _MAX_REPORTED_ERRORS = 10
 
-# Tools that assign a new symbol name.
-_RENAME_TOOLS = frozenset(
-    {
-        "rename_function",
-        "rename_label",
-        "rename_local_variable",
-        "rename_global_variable",
-        "rename_symbols_batch",
-    }
-)
-# Argument keys that carry the NEW name in a rename call, matched after
-# lowercasing and stripping non-alphanumerics. Deliberately narrow: keys naming
-# the *existing* target (``function``, ``variable_name``, ``identifier``) must not
-# match, or every call would be rejected for the wrong reason. Nested structures
-# are searched too, so a `rename_symbols_batch` list of per-symbol entries is covered.
-_NEW_NAME_KEYS = frozenset({"newname", "newlabel", "newsymbolname", "rename", "to"})
-# How deep to search nested rename arguments before giving up (and failing
-# closed). Well past any real batch payload's shape.
-_MAX_ARG_DEPTH = 6
-
 
 def _format_path(error: jsonschema.ValidationError) -> str:
     """Render a JSON-pointer-ish path for a validation error, or '(root)'."""
     if not error.absolute_path:
         return "(root)"
     return ".".join(str(part) for part in error.absolute_path)
-
-
-def _normalize_key(key: str) -> str:
-    """Lowercase a key and drop non-alphanumerics, so ``new_name`` == ``newName``."""
-    return "".join(ch for ch in key.lower() if ch.isalnum())
-
-
-def _new_names(value: Any, depth: int = 0) -> Iterator[str]:
-    """Yield every new-name string found in a rename call's arguments.
-
-    Walks nested dicts/lists so a batch payload (a list of per-symbol entries) is
-    covered without hardcoding its shape.
-    """
-    if depth > _MAX_ARG_DEPTH:
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if isinstance(key, str) and _normalize_key(key) in _NEW_NAME_KEYS:
-                if isinstance(item, str):
-                    yield item
-                    continue
-            yield from _new_names(item, depth + 1)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _new_names(item, depth + 1)
 
 
 def _error_message(request: ToolCallRequest, payload: dict[str, Any]) -> ToolMessage:
@@ -98,12 +47,10 @@ def _error_message(request: ToolCallRequest, payload: dict[str, Any]) -> ToolMes
 
 
 class ArgumentValidationMiddleware(AgentMiddleware):
-    """Validate dict-schema tool arguments (and, optionally, rename prefixes)."""
+    """Validate dict-schema tool arguments against their JSON schema."""
 
-    def __init__(self, *, rename_prefix: str | None = None) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        # When set, every new symbol name must start with this prefix.
-        self._rename_prefix = rename_prefix
         # Tool name -> its compiled validator, or None when the schema itself is
         # malformed. Cached because building one meta-schema-validates the
         # schema (`check_schema`), and a tool's args_schema never changes — so
@@ -144,13 +91,10 @@ class ArgumentValidationMiddleware(AgentMiddleware):
 
         validator = self._validator_for(tool.name, schema)
         # A malformed schema is never grounds to block — let the server decide.
-        # The rename-prefix check below still applies.
-        errors = (
-            []
-            if validator is None
-            else sorted(
-                validator.iter_errors(args), key=lambda e: list(e.absolute_path)
-            )
+        if validator is None:
+            return None
+        errors = sorted(
+            validator.iter_errors(args), key=lambda e: list(e.absolute_path)
         )
 
         if errors:
@@ -171,54 +115,7 @@ class ArgumentValidationMiddleware(AgentMiddleware):
                 },
             )
 
-        return self._check_rename_prefix(request, tool.name, args)
-
-    def _check_rename_prefix(
-        self, request: ToolCallRequest, tool_name: str, args: dict[str, Any]
-    ) -> ToolMessage | None:
-        """Reject a rename whose new name lacks the required prefix.
-
-        Fails closed: if the call renames something but no new-name argument can
-        be found, it is rejected rather than let through unchecked, so a schema
-        change on the server can't silently disable the rule.
-        """
-        prefix = self._rename_prefix
-        if prefix is None or tool_name not in _RENAME_TOOLS:
-            return None
-
-        names = list(_new_names(args))
-        offenders = [name for name in names if not name.startswith(prefix)]
-        if not names:
-            offenders = []  # nothing found — reported as the fail-closed case below
-        if names and not offenders:
-            return None
-
-        return _error_message(
-            request,
-            {
-                "rename_prefix_error": {
-                    "tool": tool_name,
-                    "required_prefix": prefix,
-                    "rejected_names": offenders,
-                    "hint": (
-                        f"Renames from this agent must start with '{prefix}' — the "
-                        "name is a provisional conclusion, not a settled one. "
-                        f"Re-call with every new name prefixed (e.g. '{prefix}"
-                        "parse_header'), or, if you are confident enough that the "
-                        "prefix would be wrong, leave the symbol alone and record "
-                        "the rename as a `pending-change` bookmark plus a PENDING: "
-                        "line for a full-write agent to apply."
-                    )
-                    if names
-                    else (
-                        "Could not find the new-name argument in this call, so it "
-                        f"cannot be checked against the required '{prefix}' prefix "
-                        "and is rejected. Re-call using the tool schema's "
-                        "documented new-name field."
-                    ),
-                }
-            },
-        )
+        return None
 
     def wrap_tool_call(
         self,
@@ -237,12 +134,6 @@ class ArgumentValidationMiddleware(AgentMiddleware):
         return error if error is not None else await handler(request)
 
 
-def create_argument_validation_middleware(
-    *, rename_prefix: str | None = None
-) -> ArgumentValidationMiddleware:
-    """Build the argument-validation middleware (factory for ``cli.py``).
-
-    Pass ``rename_prefix`` to require that prefix on every new symbol name; it
-    comes from the agent's ``WritePolicy`` (see subagents.py).
-    """
-    return ArgumentValidationMiddleware(rename_prefix=rename_prefix)
+def create_argument_validation_middleware() -> ArgumentValidationMiddleware:
+    """Build the argument-validation middleware (factory for ``cli.py``)."""
+    return ArgumentValidationMiddleware()

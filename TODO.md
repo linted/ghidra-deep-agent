@@ -28,8 +28,11 @@
   unreachable. Cross-binary resume is a documented soft footgun (tools stay bound
   to the open binary).
 - [x] **OpenRouter support**
-- [ ] **Dynamic subagents: split `research` into planner → parallel workers → synthesizer** —
+- [ ] **Dynamic subagents: split a deep investigation into planner → parallel workers → synthesizer** —
   see the "Dynamic subagents — split `research`" section below for the full write-up.
+  *Superseded framing (2026-11-17):* the dedicated `research` sub-agent was replaced
+  by the `investigate` skill run on the general-purpose worker (skills refactor). The
+  planner→workers→synthesizer idea still applies, now to a worker following that skill.
   Evidence (`agent_topology`): 80 LLM calls / 5.92M tokens across 2 invocations (~40 calls /
   ~2.96M tokens each, 84:1 prompt:completion). Expected: 40–60% token reduction and latency
   541s → ~120–180s per invocation. Effort: Med. *Caveat:* dynamic subagents were evaluated

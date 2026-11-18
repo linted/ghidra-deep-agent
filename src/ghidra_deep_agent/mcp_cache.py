@@ -84,7 +84,7 @@ _DEFAULT_MUTABLE_CACHED_TOOLS = (
     "get_hexdump",
 )
 
-# Ghidra-mutating tools (see the function-analyst allowlist in subagents.toml).
+# Ghidra-mutating tools (see MUTATION_TOOLS in agent_config.py).
 # Any successful call invalidates the mutable tier. Knowledge-base writes are
 # excluded — they don't touch Ghidra state.
 _MUTATING_TOOLS = frozenset(

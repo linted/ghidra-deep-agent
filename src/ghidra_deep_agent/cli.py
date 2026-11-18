@@ -17,7 +17,9 @@ from typing import Any, NamedTuple
 
 from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
+from deepagents.backends.composite import CompositeBackend
 from deepagents.backends.filesystem import FilesystemBackend
+from deepagents.middleware.filesystem import FilesystemPermission
 from deepagents.middleware.summarization import SummarizationToolMiddleware
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -25,6 +27,14 @@ from langchain_mcp_adapters.interceptors import MCPToolCallRequest
 from langgraph.checkpoint.mongodb import MongoDBSaver
 from pymongo.errors import ServerSelectionTimeoutError
 
+from ghidra_deep_agent.agent_config import (
+    build_worker,
+    filter_withheld_tools,
+    load_agent_config,
+    make_model_resolver,
+    read_only_tools,
+    resolve_model_spec,
+)
 from ghidra_deep_agent.async_tasks import build_async_task_middleware
 from ghidra_deep_agent.auto_mode import build_auto_mode_middleware
 from ghidra_deep_agent.compaction import (
@@ -35,6 +45,7 @@ from ghidra_deep_agent.context_pruning import build_context_pruning_middleware
 from ghidra_deep_agent.defaults import (
     DEFAULT_MAX_CONTEXT_TOKENS,
     DEFAULT_RECURSION_LIMIT,
+    config_path,
     env_int,
 )
 from ghidra_deep_agent.ghidra_transport import get_mcp_config
@@ -65,18 +76,6 @@ from ghidra_deep_agent.sandbox import (
 )
 from ghidra_deep_agent.sandbox_sync import SandboxSyncMiddleware
 from ghidra_deep_agent.sessions import build_session_store
-from ghidra_deep_agent.subagents import (
-    DEFAULT_WRITE_POLICY,
-    READ_ONLY_WRITE_POLICY,
-    RESEARCH_SUBAGENT_NAME,
-    build_main_tools,
-    build_plan_mode_main_tools,
-    build_subagents,
-    filter_withheld_tools,
-    load_agent_config,
-    make_model_resolver,
-    resolve_model_spec,
-)
 from ghidra_deep_agent.switch_tools import build_switch_tools
 from ghidra_deep_agent.tui import GhidraAgentApp
 from ghidra_deep_agent.validation import create_argument_validation_middleware
@@ -198,46 +197,6 @@ def _build_tools(
     )
 
 
-def _read_only_delegates(
-    subagents: list[Any],
-) -> tuple[list[Any], list[Any]]:
-    """Pick the sub-agents plan mode and ask mode may delegate to.
-
-    Returns ``(plan_mode_subagents, ask_mode_subagents)``. Pass the sub-agent
-    list built with ``policy_override=READ_ONLY_WRITE_POLICY``: these two modes
-    are read-only *by construction*, so what a config entry asks for doesn't
-    matter here. Only investigation-shaped agents are offered — the fixers exist
-    to mutate and have nothing to do once they cannot.
-
-    `research` is a config `[[subagents]]` entry shared by every graph: the normal
-    coordinator gets the annotating build of it, and plan mode uses the read-only
-    build as its ONLY delegate. Ask mode additionally gets `vuln-hunter` so
-    exploitability questions can be routed to it.
-    """
-    research_sub = next(
-        (s for s in subagents if s.get("name") == RESEARCH_SUBAGENT_NAME), None
-    )
-    if research_sub is None:
-        raise ValueError(
-            f"A '{RESEARCH_SUBAGENT_NAME}' sub-agent is required "
-            "(plan mode and ask mode depend on it); add it to the agent config."
-        )
-
-    ask_mode_subagents = [research_sub]
-    vuln_hunter_sub = next(
-        (s for s in subagents if s.get("name") == "vuln-hunter"), None
-    )
-    if vuln_hunter_sub is not None:
-        ask_mode_subagents.append(vuln_hunter_sub)
-    else:
-        print(
-            "Warning: 'vuln-hunter' sub-agent not found in config; "
-            "ask mode will run without it.",
-            file=sys.stderr,
-        )
-    return [research_sub], ask_mode_subagents
-
-
 def _validate_sandbox_mode() -> None:
     """Reject an unknown SANDBOX value before anything expensive is created."""
     mode = sandbox_mode()
@@ -250,6 +209,46 @@ def _validate_sandbox_mode() -> None:
         sys.exit(1)
 
 
+# Where skills are mounted in the agents' virtual filesystem, and the source
+# directories offered per graph. The repair skills (each needs write tools) are
+# withheld from the read-only plan/ask graphs.
+_SKILLS_ROUTE = "/skills/"
+_ANALYSIS_SKILLS = "/skills/analysis/"
+_REPAIR_SKILLS = "/skills/repair/"
+MAIN_SKILL_SOURCES = [_ANALYSIS_SKILLS, _REPAIR_SKILLS]
+READ_ONLY_SKILL_SOURCES = [_ANALYSIS_SKILLS]
+# Deny the agents writing into the read-only skills mount (reads stay allowed).
+SKILLS_PERMISSIONS = [
+    FilesystemPermission(
+        operations=["write"], paths=[f"{_SKILLS_ROUTE}**"], mode="deny"
+    )
+]
+
+
+def _skills_routes() -> tuple[dict[str, Any], list[str]]:
+    """Resolve the skills directory into a CompositeBackend route + skill names.
+
+    Returns ``({"/skills/": FilesystemBackend(...)}, names)``, or ``({}, [])``
+    with a warning if the directory is missing — the agents still run, just
+    without any skills. ``names`` are the discovered ``<group>/<skill>`` dirs,
+    printed at startup so a broken skills dir is visible early.
+    """
+    skills_dir = config_path("SKILLS_DIR", "skills")
+    if not skills_dir.is_dir():
+        print(
+            f"Warning: skills directory not found at {skills_dir}; agents will run "
+            "without skills. Set SKILLS_DIR to override.",
+            file=sys.stderr,
+        )
+        return {}, []
+    names = sorted(
+        f"{md.parent.parent.name}/{md.parent.name}"
+        for md in skills_dir.glob("*/*/SKILL.md")
+    )
+    route = FilesystemBackend(root_dir=str(skills_dir), virtual_mode=True)
+    return {_SKILLS_ROUTE: route}, names
+
+
 class Storage(NamedTuple):
     """Where agent files live, and what that implies for prompts/middleware."""
 
@@ -259,10 +258,18 @@ class Storage(NamedTuple):
     # Appended to every agent prompt when sandboxed, so the model knows it has a
     # shell and where durable files belong. Empty otherwise.
     prompt_guidance: str
+    # The <group>/<skill> directories found under the skills mount (for display).
+    skill_names: list[str]
 
 
 async def _open_backend(stack: contextlib.AsyncExitStack) -> Storage:
     """Open the agents' filesystem backend.
+
+    The agents' durable/working files live in the chosen backend (state,
+    local dir, or sandbox); the read-only ``skills/`` tree is mounted alongside
+    it via a ``CompositeBackend`` route so the skills middleware can read each
+    ``SKILL.md`` through the same backend. ``SandboxSyncMiddleware`` keeps the raw
+    sandbox backend, since it syncs the host mirror, not the skills mount.
 
     An OpenShell sandbox is entered on ``stack``, so the caller's
     ``stack.aclose()`` tears it down after the TUI exits or crashes and it is
@@ -270,13 +277,18 @@ async def _open_backend(stack: contextlib.AsyncExitStack) -> Storage:
     """
     mode = sandbox_mode()
     output_dir = os.environ.get("AGENT_OUTPUT_DIR", "")
+    routes, skill_names = _skills_routes()
+
+    def wrap(backend: Any) -> Any:
+        """Mount the skills route over ``backend`` (a no-op without skills)."""
+        return CompositeBackend(backend, routes) if routes else backend
 
     if mode != OPENSHELL_MODE:
         if output_dir:
-            return Storage(
-                FilesystemBackend(root_dir=output_dir, virtual_mode=True), None, ""
-            )
-        return Storage(StateBackend(), None, "")
+            raw: Any = FilesystemBackend(root_dir=output_dir, virtual_mode=True)
+        else:
+            raw = StateBackend()
+        return Storage(wrap(raw), None, "", skill_names)
 
     # Appended to every agent prompt when sandboxed, so the model knows it has a
     # shell and where to keep durable files.
@@ -297,12 +309,16 @@ async def _open_backend(stack: contextlib.AsyncExitStack) -> Storage:
             "Sandbox: files live only inside the sandbox this session "
             "(set AGENT_OUTPUT_DIR to persist them locally)."
         )
-        return Storage(backend, None, sandbox_guidance)
+        return Storage(wrap(backend), None, sandbox_guidance, skill_names)
 
     # Files live in the sandbox; the middleware makes AGENT_OUTPUT_DIR the
-    # durable local mirror, synced in before and out after a turn.
+    # durable local mirror, synced in before and out after a turn. Sync uses the
+    # raw sandbox backend (the host mirror is not the skills mount).
     return Storage(
-        backend, SandboxSyncMiddleware(backend, Path(output_dir)), sandbox_guidance
+        wrap(backend),
+        SandboxSyncMiddleware(backend, Path(output_dir)),
+        sandbox_guidance,
+        skill_names,
     )
 
 
@@ -355,8 +371,8 @@ def _build_shared_middleware(
         # Tool calls: validate args (reject bad calls without retry), serve
         # immutable reads from cache, resolve async task stubs (inside the cache
         # so resolved results are what gets cached), then retry transient I/O.
-        # The coordinator never mutates the program itself — it delegates — and
-        # its allowlist grants no Ghidra write tool.
+        # The coordinator holds the full tool set and may apply small changes
+        # itself; it delegates verbose/parallel work to the worker.
         create_argument_validation_middleware(),
         # Jev Auto Mode (AUTO_MODE=1): blocks risky calls to hard-to-undo tools.
         *([auto_mode_mw] if auto_mode_mw is not None else []),
@@ -386,10 +402,10 @@ class Graphs(NamedTuple):
     """The three coordinator graphs the TUI switches between."""
 
     main: Any
-    # Read-only planner: no mutating tools, delegates only to read-only sub-agents.
+    # Read-only planner: no mutating tools, read-only worker, analysis skills only.
     plan: Any
     # Read-only question-answerer: same tool set as plan mode (no Ghidra writes
-    # and no knowledge-base writes), with one more read-only delegate.
+    # and no knowledge-base writes).
     ask: Any
 
 
@@ -403,19 +419,23 @@ def _build_graphs(
     app_name: str,
     main_tools: Sequence[Any],
     plan_tools: Sequence[Any],
-    subagents: Sequence[Any],
-    plan_mode_subagents: Sequence[Any],
-    ask_mode_subagents: Sequence[Any],
+    worker: Any,
+    read_only_worker: Any,
 ) -> Graphs:
-    """Build the three graphs, which differ only in prompt, tools, and delegates.
+    """Build the three graphs, which differ only in prompt, tools, worker, skills.
 
     Everything else is held identical on purpose: they share one checkpointer
     thread and backend, so conversation history and the plan file carry over when
-    the human approves a plan.
+    the human approves a plan. The normal graph offers every skill and the
+    write-capable worker; the read-only graphs offer only the analysis skills and
+    the read-only worker.
     """
 
     def build(
-        system_prompt: str, tools: Sequence[Any], graph_subagents: Sequence[Any]
+        system_prompt: str,
+        tools: Sequence[Any],
+        graph_worker: Any,
+        skills: Sequence[str],
     ) -> Any:
         return create_deep_agent(
             model=built_model,
@@ -425,18 +445,30 @@ def _build_graphs(
             + storage.prompt_guidance,
             checkpointer=checkpointer,
             middleware=middleware,
-            subagents=list(graph_subagents),
+            subagents=[graph_worker],
+            skills=list(skills),
+            permissions=SKILLS_PERMISSIONS,
             backend=storage.backend,
             name=app_name,
         )
 
     return Graphs(
-        main=build(SYSTEM_PROMPT, main_tools, subagents),
-        plan=build(PLAN_MODE_SYSTEM_PROMPT, plan_tools, plan_mode_subagents),
+        main=build(SYSTEM_PROMPT, main_tools, worker, MAIN_SKILL_SOURCES),
+        plan=build(
+            PLAN_MODE_SYSTEM_PROMPT,
+            plan_tools,
+            read_only_worker,
+            READ_ONLY_SKILL_SOURCES,
+        ),
         # Ask mode gets `plan_tools`, not `main_tools`: it is a read-only mode, so
         # the knowledge-base write tools are withheld structurally rather than
         # left for the prompt to talk it out of using.
-        ask=build(ASK_MODE_SYSTEM_PROMPT, plan_tools, ask_mode_subagents),
+        ask=build(
+            ASK_MODE_SYSTEM_PROMPT,
+            plan_tools,
+            read_only_worker,
+            READ_ONLY_SKILL_SOURCES,
+        ),
     )
 
 
@@ -482,7 +514,10 @@ async def main() -> None:
     )
     built_model = resolve_model(agent_config.main_model, agent_config.main_max_tokens)
     main_model_spec = resolve_model_spec(agent_config.main_model, agent_config)
-    main_tools = build_main_tools(all_tools, agent_config)
+    # The coordinator holds the full (non-withheld) tool set; the read-only graphs
+    # drop every mutating tool.
+    main_tools = list(all_tools)
+    plan_tools = read_only_tools(all_tools)
     # Shared across the coordinator and sub-agents: one cache for the whole
     # session (same binary, same Mongo collection). None when disabled/unreachable.
     cache_mw = build_mcp_cache_middleware(mongodb_uri, mongodb_db, binary_name)
@@ -504,18 +539,10 @@ async def main() -> None:
     if auto_mode_mw is not None:
         print(f"Jev Auto Mode enabled on: {', '.join(sorted(auto_mode_mw.guarded))}")
     print(f"Main agent: {main_model_spec}  [{len(main_tools)} tool(s)]")
-    for sub_cfg in agent_config.subagents:
-        # Show the write tier for anything but the default: how much of the
-        # program an agent may change is worth seeing before a session starts.
-        policy = (
-            ""
-            if sub_cfg.write_policy == DEFAULT_WRITE_POLICY
-            else f"  [writes: {sub_cfg.write_policy}]"
-        )
-        print(
-            f"  sub-agent {sub_cfg.name}: "
-            f"{resolve_model_spec(sub_cfg.model, agent_config)}{policy}"
-        )
+    print(
+        f"  worker: {resolve_model_spec(agent_config.worker_model, agent_config)}"
+        f"  [{len(main_tools)} tool(s)]"
+    )
 
     recursion_limit = env_int("RECURSION_LIMIT", DEFAULT_RECURSION_LIMIT)
     # Name each top-level graph so LangSmith traces show the app instead of the
@@ -531,6 +558,11 @@ async def main() -> None:
     stack = contextlib.AsyncExitStack()
     try:
         storage = await _open_backend(stack)
+        if storage.skill_names:
+            print(
+                f"  skills [{len(storage.skill_names)}]: "
+                f"{', '.join(storage.skill_names)}"
+            )
 
         with MongoDBSaver.from_conn_string(
             mongodb_uri, db_name=mongodb_db
@@ -554,43 +586,37 @@ async def main() -> None:
                 summary_model, storage.backend
             )
 
-            # Tuned auto-summarizers ride along as replace-by-name middleware:
-            # sub-agents compact aggressively by default (they never reached
-            # deepagents' 170k no-profile trigger); the main agent keeps stock
-            # thresholds. COMPACT_* / COMPACT_MAIN_* env knobs override either
-            # scope, and SUMMARY_MODEL routes the auto summary too, not just
-            # /compact. Built here because they offload evicted history to the
-            # session backend.
-            subagents = build_subagents(
-                all_tools,
-                agent_config,
-                resolve_model,
-                storage.backend,
+            # The single worker, built twice: write-capable for the normal graph,
+            # and a second read-only build (full MUTATION_TOOLS dropped) for the
+            # plan/ask graphs. Building a separate read-only worker — rather than
+            # trusting the prompt — is what makes those graphs read-only by
+            # construction. The tuned sub-agent summarizer rides along inside each,
+            # compacting aggressively; built here because it offloads evicted
+            # history to the session backend.
+            worker_kwargs: dict[str, Any] = dict(
                 cache_middleware=cache_mw,
                 async_middleware=async_mw,
                 pruning_middleware=prune_mw,
                 auto_mode_middleware=auto_mode_mw,
                 summary_model=summary_override,
             )
-            # Plan mode and ask mode delegate to the SAME config entries, rebuilt
-            # under a forced read-only policy. Building a second set (rather than
-            # relying on `read_only = true` in the config) is what makes those
-            # graphs read-only by construction: `research` can annotate in the
-            # normal graph and still be structurally unable to write here.
-            read_only_subagents = build_subagents(
+            worker = build_worker(
                 all_tools,
                 agent_config,
                 resolve_model,
                 storage.backend,
-                cache_middleware=cache_mw,
-                async_middleware=async_mw,
-                pruning_middleware=prune_mw,
-                auto_mode_middleware=auto_mode_mw,
-                summary_model=summary_override,
-                policy_override=READ_ONLY_WRITE_POLICY,
+                read_only=False,
+                skills=MAIN_SKILL_SOURCES,
+                **worker_kwargs,
             )
-            plan_mode_subagents, ask_mode_subagents = _read_only_delegates(
-                read_only_subagents
+            read_only_worker = build_worker(
+                all_tools,
+                agent_config,
+                resolve_model,
+                storage.backend,
+                read_only=True,
+                skills=READ_ONLY_SKILL_SOURCES,
+                **worker_kwargs,
             )
 
             shared_middleware = _build_shared_middleware(
@@ -613,10 +639,9 @@ async def main() -> None:
                 middleware=shared_middleware,
                 app_name=app_name,
                 main_tools=main_tools,
-                plan_tools=build_plan_mode_main_tools(all_tools, agent_config),
-                subagents=subagents,
-                plan_mode_subagents=plan_mode_subagents,
-                ask_mode_subagents=ask_mode_subagents,
+                plan_tools=plan_tools,
+                worker=worker,
+                read_only_worker=read_only_worker,
             )
 
             # Probe the *resolved* model: `build_model` returns a bare string for

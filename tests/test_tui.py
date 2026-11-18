@@ -332,7 +332,9 @@ def _task_start_event(run_id: str, description: str) -> dict[str, Any]:
         "name": "task",
         "metadata": {"langgraph_checkpoint_ns": "tools:a"},
         "parent_ids": [],
-        "data": {"input": {"description": description, "subagent_type": "research"}},
+        "data": {
+            "input": {"description": description, "subagent_type": "general-purpose"}
+        },
     }
 
 

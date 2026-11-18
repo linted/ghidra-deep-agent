@@ -17,13 +17,13 @@ import asyncio
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, tool
 
+from ghidra_deep_agent.agent_config import WITHHELD_TOOLS, filter_withheld_tools
 from ghidra_deep_agent.async_tasks import (
     AsyncTaskMiddleware,
     _timeout_text,
     build_async_task_middleware,
     resolve_async_result,
 )
-from ghidra_deep_agent.subagents import WITHHELD_TOOLS, filter_withheld_tools
 
 STUB = "Task submitted for async execution. Task ID: abc123def. Status: RUNNING"
 DONE = "Analysis complete. Decompiled body: return a + b;"
