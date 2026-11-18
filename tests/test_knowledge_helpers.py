@@ -9,12 +9,19 @@ Run:  uv run pytest tests/test_knowledge_helpers.py -v
 
 from __future__ import annotations
 
+import asyncio
 import re
+
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
+from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
+from pymongo.errors import OperationFailure
 
 from ghidra_deep_agent.knowledge import (
     QUERY_RESULT_CAP,
     _address_prefix_filter,
     _cap_note,
+    _safe_retriever_tool,
 )
 
 # ── address prefix filter ─────────────────────────────────────────────────────
@@ -59,3 +66,37 @@ def test_note_when_cap_is_hit() -> None:
 
 def test_no_note_for_empty_results() -> None:
     assert _cap_note([]) == ""
+
+
+# ── safe retriever tool ───────────────────────────────────────────────────────
+
+
+class _FakeRetriever(BaseRetriever):
+    fail: bool = False
+
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun
+    ) -> list[Document]:
+        if self.fail:
+            # What a $vectorSearch against a not-yet-built index raises.
+            raise OperationFailure(
+                "cannot query vector index while in state NOT_STARTED", 8
+            )
+        return [Document(page_content="a"), Document(page_content="b")]
+
+
+def test_retriever_tool_formats_documents() -> None:
+    qk = _safe_retriever_tool(_FakeRetriever(), "query_knowledge", "desc")
+    assert qk.invoke({"query": "x"}) == "a\n\nb"
+    assert asyncio.run(qk.ainvoke({"query": "x"})) == "a\n\nb"
+
+
+def test_retriever_tool_reports_mongo_errors() -> None:
+    """A Mongo error must come back as text: raised, it kills the whole run."""
+    qk = _safe_retriever_tool(_FakeRetriever(fail=True), "query_knowledge", "desc")
+    for result in (
+        qk.invoke({"query": "x"}),
+        asyncio.run(qk.ainvoke({"query": "x"})),
+    ):
+        assert result.startswith("Warning: semantic search is unavailable")
+        assert "NOT_STARTED" in result
