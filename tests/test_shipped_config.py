@@ -136,7 +136,11 @@ def _fake_tools() -> Sequence[BaseTool]:
     return cast("Sequence[BaseTool]", tools)
 
 
-def _resolver(model: str | None, max_tokens: int | None = None) -> FakeListChatModel:
+def _resolver(
+    model: str | None,
+    max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
+) -> FakeListChatModel:
     return FakeListChatModel(responses=["ok"])
 
 

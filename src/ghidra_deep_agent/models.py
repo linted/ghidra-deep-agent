@@ -222,7 +222,7 @@ _OPENCODE_USER_AGENT = "ghidra-deep-agent/0.1.0"
 
 
 def _build_opencode_model(
-    plan: str, model_name: str, max_tokens: int | None
+    plan: str, model_name: str, max_tokens: int | None, reasoning_effort: str | None
 ) -> BaseChatModel:
     raw_key = os.environ.get("OPENCODE_API_KEY")
     if not raw_key:
@@ -240,6 +240,9 @@ def _build_opencode_model(
     if model_name.startswith("claude-"):
         from langchain_anthropic import ChatAnthropic
 
+        if reasoning_effort is not None:
+            _warn_reasoning_effort_ignored(f"{plan}:{model_name}")
+
         if max_tokens is None and not _anthropic_has_profile(model_name):
             max_tokens = _UNPROFILED_ANTHROPIC_MAX_TOKENS
         anthropic_kwargs: dict[str, Any] = {}
@@ -256,6 +259,11 @@ def _build_opencode_model(
     kwargs: dict[str, Any] = {}
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
+    # Sent as the top-level `reasoning_effort` field (ChatOpenAI maps it to
+    # `reasoning.effort` on the Responses API). Left unset, GLM-5.3 on Go
+    # reasons like `max`, which has run a single call into a 32k max_tokens cap.
+    if reasoning_effort is not None:
+        kwargs["reasoning_effort"] = reasoning_effort
     if model_name.startswith(_OPENCODE_RESPONSES_PREFIXES):
         from langchain_openai import ChatOpenAI
 
@@ -278,8 +286,18 @@ def _build_opencode_model(
     )
 
 
+def _warn_reasoning_effort_ignored(model_string: str) -> None:
+    print(
+        f"Warning: reasoning_effort is not supported for {model_string!r}; "
+        "ignoring (supported: opencode, opencode-go non-Claude models).",
+        file=sys.stderr,
+    )
+
+
 def build_model(
-    model_string: str, max_tokens: int | None = None
+    model_string: str,
+    max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> BaseChatModel | str:
     """Return a configured chat model for the given provider:model string.
 
@@ -298,12 +316,18 @@ def build_model(
     Anthropic-protocol models that langchain-anthropic has no profile for get
     ``_UNPROFILED_ANTHROPIC_MAX_TOKENS`` even without an explicit setting —
     the library's 4096 fallback truncates real runs.
+
+    ``reasoning_effort`` (from ``reasoning_effort`` in agents.toml) is sent
+    as-is for the OpenAI-protocol ``opencode``/``opencode-go`` models; every
+    other provider ignores it with a warning.
     """
-    if model_string.startswith("zai:"):
-        return _build_zai_model(model_string.split(":", 1)[1], max_tokens)
     plan, _, model_id = model_string.partition(":")
     if plan in _OPENCODE_PLANS:
-        return _build_opencode_model(plan, model_id, max_tokens)
+        return _build_opencode_model(plan, model_id, max_tokens, reasoning_effort)
+    if reasoning_effort is not None:
+        _warn_reasoning_effort_ignored(model_string)
+    if model_string.startswith("zai:"):
+        return _build_zai_model(model_string.split(":", 1)[1], max_tokens)
     if model_string.startswith("deepseek:"):
         model_name = model_string.split(":", 1)[1]
         if max_tokens is not None:

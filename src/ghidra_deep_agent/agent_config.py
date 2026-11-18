@@ -2,7 +2,8 @@
 
 Two agents are declared in ``agents.toml`` (path overridable via ``AGENT_CONFIG``):
 the ``[main]`` coordinator and the single ``[worker]`` (general-purpose)
-sub-agent. Each has an optional ``model`` / ``max_tokens``; the worker also takes
+sub-agent. Each has an optional ``model`` / ``max_tokens`` / ``reasoning_effort``;
+the worker also takes
 an optional ``exclude`` list of tool names. This module loads and validates that
 file and turns it into the objects ``create_deep_agent`` expects.
 
@@ -169,7 +170,10 @@ class ModelResolver(Protocol):
     """
 
     def __call__(
-        self, model: str | None, max_tokens: int | None = None
+        self,
+        model: str | None,
+        max_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> str | BaseChatModel: ...
 
 
@@ -184,6 +188,9 @@ class AgentConfig:
     main_max_tokens: int | None = None
     worker_max_tokens: int | None = None
     default_max_tokens: int | None = None
+    main_reasoning_effort: str | None = None
+    worker_reasoning_effort: str | None = None
+    default_reasoning_effort: str | None = None
 
 
 # --- TOML loading / validation -------------------------------------------------
@@ -262,6 +269,11 @@ def load_agent_config(path: Path | None = None) -> AgentConfig:
         worker_exclude=_opt_str_list(worker_raw, "exclude", f"{path} [worker]"),
         default_model=default_model,
         default_max_tokens=default_max_tokens,
+        main_reasoning_effort=_opt_str(main_raw, "reasoning_effort", f"{path} [main]"),
+        worker_reasoning_effort=_opt_str(
+            worker_raw, "reasoning_effort", f"{path} [worker]"
+        ),
+        default_reasoning_effort=_opt_str(raw, "reasoning_effort", str(path)),
     )
 
 
@@ -279,19 +291,24 @@ def resolve_model_spec(model: str | None, config: AgentConfig) -> str:
 
 
 def make_model_resolver(
-    default_model: str | None, default_max_tokens: int | None = None
+    default_model: str | None,
+    default_max_tokens: int | None = None,
+    default_reasoning_effort: str | None = None,
 ) -> ModelResolver:
     """Return a cached resolver building each distinct model string once.
 
     ``max_tokens`` resolves like the model string: per-call value (a config
     entry's ``max_tokens``) -> TOML top-level ``max_tokens`` -> ``MODEL_MAX_TOKENS``
     env -> unset (provider default; unprofiled Anthropic-protocol models still
-    get a floor in ``build_model``).
+    get a floor in ``build_model``). ``reasoning_effort`` resolves the same way
+    minus the env step: per-call value -> TOML top-level -> unset.
     """
-    cache: dict[tuple[str, int | None], str | BaseChatModel] = {}
+    cache: dict[tuple[str, int | None, str | None], str | BaseChatModel] = {}
 
     def resolve(
-        model: str | None, max_tokens: int | None = None
+        model: str | None,
+        max_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> str | BaseChatModel:
         spec = _model_spec(model, default_model)
         if max_tokens is None:
@@ -299,9 +316,11 @@ def make_model_resolver(
         if max_tokens is None:
             env_raw = os.environ.get("MODEL_MAX_TOKENS")
             max_tokens = int(env_raw) if env_raw and env_raw.isdigit() else None
-        key = (spec, max_tokens)
+        if reasoning_effort is None:
+            reasoning_effort = default_reasoning_effort
+        key = (spec, max_tokens, reasoning_effort)
         if key not in cache:
-            cache[key] = build_model(spec, max_tokens)
+            cache[key] = build_model(spec, max_tokens, reasoning_effort)
         return cache[key]
 
     return resolve
@@ -372,7 +391,9 @@ def build_worker(
     if read_only:
         system_prompt = f"{system_prompt.rstrip()}\n\n{_READ_ONLY_SECTION}\n"
 
-    model = resolve_model(config.worker_model, config.worker_max_tokens)
+    model = resolve_model(
+        config.worker_model, config.worker_max_tokens, config.worker_reasoning_effort
+    )
     spec: SubAgent = {
         "name": WORKER_NAME,
         "description": (

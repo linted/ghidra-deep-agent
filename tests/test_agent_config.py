@@ -56,7 +56,11 @@ def _fake_tools() -> Sequence[BaseTool]:
     return cast("Sequence[BaseTool]", tools)
 
 
-def _resolver(model: str | None, max_tokens: int | None = None) -> FakeListChatModel:
+def _resolver(
+    model: str | None,
+    max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
+) -> FakeListChatModel:
     """Stub model resolver returning a real chat model instance.
 
     ``build_worker`` stores the result in the spec and hands it to the tuned
@@ -176,8 +180,10 @@ def test_full_config_parses(tmp_path: Path) -> None:
     path.write_text(
         'default = "deepseek:deepseek-flash"\n'
         "max_tokens = 32768\n"
-        '[main]\nmodel = "m-main"\nmax_tokens = 20000\n'
+        'reasoning_effort = "high"\n'
+        '[main]\nmodel = "m-main"\nmax_tokens = 20000\nreasoning_effort = "low"\n'
         '[worker]\nmodel = "m-worker"\nmax_tokens = 10000\n'
+        'reasoning_effort = "max"\n'
         'exclude = ["run_script"]\n',
         encoding="utf-8",
     )
@@ -189,6 +195,9 @@ def test_full_config_parses(tmp_path: Path) -> None:
     assert config.worker_model == "m-worker"
     assert config.worker_max_tokens == 10000
     assert config.worker_exclude == ("run_script",)
+    assert config.default_reasoning_effort == "high"
+    assert config.main_reasoning_effort == "low"
+    assert config.worker_reasoning_effort == "max"
 
 
 def test_missing_file_raises(tmp_path: Path) -> None:
@@ -217,10 +226,12 @@ def test_max_tokens_must_be_a_positive_integer(tmp_path: Path) -> None:
 
 
 def _recording_build_model(
-    calls: list[tuple[str, int | None]],
-) -> Callable[[str, int | None], str]:
-    def fake_build_model(spec: str, max_tokens: int | None = None) -> str:
-        calls.append((spec, max_tokens))
+    calls: list[tuple[str, int | None, str | None]],
+) -> Callable[[str, int | None, str | None], str]:
+    def fake_build_model(
+        spec: str, max_tokens: int | None = None, reasoning_effort: str | None = None
+    ) -> str:
+        calls.append((spec, max_tokens, reasoning_effort))
         return spec
 
     return fake_build_model
@@ -229,7 +240,7 @@ def _recording_build_model(
 def test_resolver_threads_max_tokens_to_build_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, int | None]] = []
+    calls: list[tuple[str, int | None, str | None]] = []
     monkeypatch.setattr(
         "ghidra_deep_agent.agent_config.build_model", _recording_build_model(calls)
     )
@@ -241,15 +252,15 @@ def test_resolver_threads_max_tokens_to_build_model(
     resolve(None)  # cached: no new build_model call
 
     assert calls == [
-        ("anthropic:glm-5.2", 32768),
-        ("deepseek:deepseek-v4-pro", 10000),
+        ("anthropic:glm-5.2", 32768, None),
+        ("deepseek:deepseek-v4-pro", 10000, None),
     ]
 
 
 def test_resolver_falls_back_to_env_max_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, int | None]] = []
+    calls: list[tuple[str, int | None, str | None]] = []
     monkeypatch.setattr(
         "ghidra_deep_agent.agent_config.build_model", _recording_build_model(calls)
     )
@@ -258,4 +269,24 @@ def test_resolver_falls_back_to_env_max_tokens(
 
     resolve(None)
 
-    assert calls == [("anthropic:glm-5.2", 12345)]
+    assert calls == [("anthropic:glm-5.2", 12345, None)]
+
+
+def test_resolver_threads_reasoning_effort_to_build_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, int | None, str | None]] = []
+    monkeypatch.setattr(
+        "ghidra_deep_agent.agent_config.build_model", _recording_build_model(calls)
+    )
+    monkeypatch.delenv("MODEL_MAX_TOKENS", raising=False)
+    resolve = make_model_resolver("opencode-go:glm-5.3", None, "high")
+
+    resolve(None)  # falls back to the config default
+    resolve(None, None, "low")  # per-entry override wins, as its own model
+    resolve(None)  # cached: no new build_model call
+
+    assert calls == [
+        ("opencode-go:glm-5.3", None, "high"),
+        ("opencode-go:glm-5.3", None, "low"),
+    ]

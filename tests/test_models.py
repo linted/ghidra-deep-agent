@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
 from ghidra_deep_agent.models import (
@@ -217,3 +218,35 @@ def test_opencode_go_without_key_names_the_go_provider(
     monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
     with pytest.raises(ValueError, match="opencode-go:glm-5.3 requires"):
         build_model("opencode-go:glm-5.3")
+
+
+# --- reasoning_effort ------------------------------------------------------------
+
+
+def test_opencode_sends_reasoning_effort_on_chat_completions() -> None:
+    model = build_model("opencode-go:glm-5.3", reasoning_effort="high")
+    assert isinstance(model, _ChatDeepSeekFixed)
+    payload = model._get_request_payload([HumanMessage("hi")])
+    assert payload["reasoning_effort"] == "high"
+
+
+def test_opencode_omits_reasoning_effort_when_unset() -> None:
+    model = build_model("opencode-go:glm-5.3")
+    assert isinstance(model, _ChatDeepSeekFixed)
+    assert "reasoning_effort" not in model._get_request_payload([HumanMessage("hi")])
+
+
+def test_opencode_responses_models_take_reasoning_effort() -> None:
+    model = build_model("opencode:gpt-5.4", reasoning_effort="low")
+    assert getattr(model, "reasoning_effort") == "low"  # noqa: B009
+
+
+@pytest.mark.parametrize(
+    "spec", ["opencode:claude-sonnet-4-6", "deepseek:deepseek-v4-pro", "zai:glm-5.2"]
+)
+def test_reasoning_effort_is_ignored_with_a_warning_elsewhere(
+    spec: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    model = build_model(spec, reasoning_effort="high")
+    assert getattr(model, "reasoning_effort", None) is None
+    assert "reasoning_effort is not supported" in capsys.readouterr().err
