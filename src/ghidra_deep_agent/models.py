@@ -8,6 +8,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_deepseek import ChatDeepSeek
+from pydantic import SecretStr
 
 from ghidra_deep_agent.defaults import config_path
 
@@ -191,6 +192,67 @@ def _build_zai_model(model_name: str, max_tokens: int | None) -> BaseChatModel:
     )
 
 
+# OpenCode's model gateway (OpenCode Console, formerly Zen). No LangChain
+# integration exists, but it speaks each model family's native protocol, so
+# ``opencode:<model>`` builds the stock class for the family against it:
+#   claude-*                 Anthropic Messages  -> ChatAnthropic
+#   gpt-*, grok-*, muse-*    OpenAI Responses    -> ChatOpenAI(use_responses_api)
+#   everything else          Chat Completions    -> _ChatDeepSeekFixed
+# The last row covers DeepSeek, GLM, Kimi, Qwen, MiniMax, and Gemini (which the
+# gateway translates). _ChatDeepSeekFixed is ChatOpenAI plus reasoning_content
+# capture and round-trip; thinking models on that protocol 400 without it.
+# Endpoints per opencode.ai/docs/zen; override the base via OPENCODE_API_URL.
+_OPENCODE_DEFAULT_API_URL = "https://opencode.ai/inference"
+_OPENCODE_RESPONSES_PREFIXES = ("gpt-", "grok-", "muse-")
+
+
+def _build_opencode_model(model_name: str, max_tokens: int | None) -> BaseChatModel:
+    raw_key = os.environ.get("OPENCODE_API_KEY")
+    if not raw_key:
+        raise ValueError(
+            f"opencode:{model_name} requires the OPENCODE_API_KEY environment "
+            "variable (an OpenCode Console API key)."
+        )
+    api_key = SecretStr(raw_key)
+    base = os.environ.get("OPENCODE_API_URL", _OPENCODE_DEFAULT_API_URL).rstrip("/")
+    if model_name.startswith("claude-"):
+        from langchain_anthropic import ChatAnthropic
+
+        if max_tokens is None and not _anthropic_has_profile(model_name):
+            max_tokens = _UNPROFILED_ANTHROPIC_MAX_TOKENS
+        anthropic_kwargs: dict[str, Any] = {}
+        if max_tokens is not None:
+            anthropic_kwargs["max_tokens"] = max_tokens
+        # The SDK appends /v1/messages itself.
+        return ChatAnthropic(  # type: ignore[call-arg]
+            model=model_name,
+            base_url=f"{base}/anthropic",
+            api_key=api_key,
+            **anthropic_kwargs,
+        )
+    kwargs: dict[str, Any] = {}
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    if model_name.startswith(_OPENCODE_RESPONSES_PREFIXES):
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(
+            model=model_name,
+            base_url=f"{base}/openai/v1",
+            api_key=api_key,
+            use_responses_api=True,
+            **kwargs,
+        )
+    # `api_base` is ChatDeepSeek's documented runtime name; mypy's pydantic
+    # plugin only sees the field alias.
+    return _ChatDeepSeekFixed(  # type: ignore[call-arg]
+        model=model_name,
+        api_base=f"{base}/openai/v1",
+        api_key=api_key,
+        **kwargs,
+    )
+
+
 def build_model(
     model_string: str, max_tokens: int | None = None
 ) -> BaseChatModel | str:
@@ -202,7 +264,9 @@ def build_model(
     ``ChatOpenRouter`` directly with that routing; otherwise the string is
     returned as-is for init_chat_model to resolve. ``zai:<model>`` targets
     z.ai's OpenAI-compatible endpoint via ChatOpenAI (their documented
-    LangChain path; no dedicated integration exists).
+    LangChain path; no dedicated integration exists). ``opencode:<model>``
+    targets OpenCode's gateway with the stock class for the model's family
+    (see ``_build_opencode_model``).
 
     ``max_tokens`` (from ``max_tokens`` in subagents.toml) caps output tokens.
     Anthropic-protocol models that langchain-anthropic has no profile for get
@@ -211,6 +275,8 @@ def build_model(
     """
     if model_string.startswith("zai:"):
         return _build_zai_model(model_string.split(":", 1)[1], max_tokens)
+    if model_string.startswith("opencode:"):
+        return _build_opencode_model(model_string.split(":", 1)[1], max_tokens)
     if model_string.startswith("deepseek:"):
         model_name = model_string.split(":", 1)[1]
         if max_tokens is not None:
@@ -247,7 +313,7 @@ def build_model(
         # num_predict, etc.), so don't guess — say it's ignored.
         print(
             f"Warning: max_tokens is not supported for {model_string!r}; "
-            "ignoring (supported: anthropic, deepseek, openrouter, zai).",
+            "ignoring (supported: anthropic, deepseek, opencode, openrouter, zai).",
             file=sys.stderr,
         )
     return model_string
