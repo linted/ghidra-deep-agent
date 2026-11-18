@@ -2,12 +2,15 @@ import os
 import sys
 import tomllib
 import uuid
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any, cast
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages.ai import UsageMetadata, subtract_usage
+from langchain_core.outputs import ChatGenerationChunk
 from langchain_deepseek import ChatDeepSeek
 from pydantic import SecretStr
 
@@ -41,6 +44,41 @@ class _ChatDeepSeekFixed(ChatDeepSeek):
                     message["reasoning_content"] = rc
 
         return payload
+
+    # Some backends behind the OpenCode gateway attach the *running* usage total
+    # to every streamed chunk instead of once at the end. LangChain sums chunk
+    # usage when merging, so one 34s call was reported as 53M input / 1.4M
+    # output tokens (~405 chunks x a 131k prompt). Rewriting each chunk's usage
+    # as the delta from the previous total sums correctly either way.
+    def _stream(self, *args: Any, **kwargs: Any) -> Iterator[ChatGenerationChunk]:
+        seen: UsageMetadata | None = None
+        for chunk in super()._stream(*args, **kwargs):
+            seen = _usage_to_delta(chunk, seen)
+            yield chunk
+
+    async def _astream(
+        self, *args: Any, **kwargs: Any
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        seen: UsageMetadata | None = None
+        async for chunk in super()._astream(*args, **kwargs):
+            seen = _usage_to_delta(chunk, seen)
+            yield chunk
+
+
+def _usage_to_delta(
+    chunk: ChatGenerationChunk, seen: UsageMetadata | None
+) -> UsageMetadata | None:
+    """Replace ``chunk``'s cumulative usage with the delta since ``seen``.
+
+    Returns the cumulative usage so far, to pass in with the next chunk.
+    """
+    message = chunk.message
+    if not isinstance(message, AIMessageChunk) or not message.usage_metadata:
+        return seen
+    usage = message.usage_metadata
+    if seen is not None:
+        message.usage_metadata = subtract_usage(usage, seen)
+    return usage
 
 
 def build_embeddings(embed_string: str) -> Embeddings:
