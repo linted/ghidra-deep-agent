@@ -26,6 +26,14 @@ default = "deepseek:deepseek-flash"
 # documented cap.
 # max_tokens = 32768
 
+# Optional reasoning level, resolved like `max_tokens` (per-entry -> this
+# top-level value -> provider default). Only sent for the OpenAI-protocol
+# `opencode:`/`opencode-go:` models (not claude-*); other providers ignore it
+# with a warning. GLM-5.3 on Go accepts none/low/medium/high/max, and an unknown
+# value fails every request with a 400. Unset, it reasons like `max`, which has
+# spent a whole 32k max_tokens budget on reasoning in a single call.
+# reasoning_effort = "high"
+
 [main]
 # The coordinator: orchestrates the work, navigates/searches, uses the knowledge
 # base, reads skills, and applies small single-function changes itself. It

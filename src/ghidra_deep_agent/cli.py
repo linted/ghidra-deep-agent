@@ -486,7 +486,9 @@ async def main() -> None:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
     resolve_model = make_model_resolver(
-        agent_config.default_model, agent_config.default_max_tokens
+        agent_config.default_model,
+        agent_config.default_max_tokens,
+        agent_config.default_reasoning_effort,
     )
 
     agents_md = _load_agents_md()
@@ -512,7 +514,11 @@ async def main() -> None:
     all_tools, knowledge_ok = _build_tools(
         tools, mongodb_uri, mongodb_db, storage_cfg.embed_model, binary_name
     )
-    built_model = resolve_model(agent_config.main_model, agent_config.main_max_tokens)
+    built_model = resolve_model(
+        agent_config.main_model,
+        agent_config.main_max_tokens,
+        agent_config.main_reasoning_effort,
+    )
     main_model_spec = resolve_model_spec(agent_config.main_model, agent_config)
     # The coordinator holds the full (non-withheld) tool set; the read-only graphs
     # drop every mutating tool.
