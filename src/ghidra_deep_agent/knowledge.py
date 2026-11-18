@@ -21,9 +21,11 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
+from langchain_core.callbacks import Callbacks
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
-from langchain_core.tools import tool
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.tools import StructuredTool, tool
 from langchain_core.tools.retriever import create_retriever_tool
 from langchain_mongodb import MongoDBAtlasVectorSearch
 from langchain_mongodb.embeddings import AutoEmbeddings
@@ -111,6 +113,43 @@ def _cap_note(docs: list[dict[str, Any]]) -> str:
         f"\n\n(showing the first {QUERY_RESULT_CAP}; narrow the query — "
         "by address, category, or tags — to see the rest)"
     )
+
+
+def _safe_retriever_tool(
+    retriever: BaseRetriever, name: str, description: str
+) -> StructuredTool:
+    """``create_retriever_tool`` that reports Mongo errors instead of raising.
+
+    A raised error escapes the tools node and kills the whole run, cancelling
+    any sibling tool calls with it. A vector index that exists but is not yet
+    queryable fails exactly this way, and the startup check cannot rule it out.
+    """
+    base = create_retriever_tool(retriever, name=name, description=description)
+    func, afunc = base.func, base.coroutine
+    assert func is not None and afunc is not None
+
+    def _unavailable(exc: PyMongoError) -> str:
+        return (
+            f"Warning: semantic search is unavailable — {exc}. Use "
+            "query_by_address, query_by_category, or query_by_tags instead."
+        )
+
+    # The `callbacks` parameter must stay in the signature: StructuredTool
+    # only passes callbacks to functions that declare it.
+    def safe_func(query: str, callbacks: Callbacks = None) -> str:
+        try:
+            return str(func(query, callbacks=callbacks))
+        except PyMongoError as exc:
+            return _unavailable(exc)
+
+    async def safe_afunc(query: str, callbacks: Callbacks = None) -> str:
+        try:
+            return str(await afunc(query, callbacks=callbacks))
+        except PyMongoError as exc:
+            return _unavailable(exc)
+
+    base.func, base.coroutine = safe_func, safe_afunc
+    return base
 
 
 def _render_knowledge_summary(
@@ -561,7 +600,7 @@ def build_knowledge_tools(
             "pre_filter": {"binary_name": {"$eq": binary_name}},
         }
     )
-    query_knowledge = create_retriever_tool(
+    query_knowledge = _safe_retriever_tool(
         retriever,
         name="query_knowledge",
         description=(
@@ -573,7 +612,7 @@ def build_knowledge_tools(
     )
 
     global_retriever = vector_store.as_retriever(search_kwargs={"k": 10})
-    query_knowledge_global = create_retriever_tool(
+    query_knowledge_global = _safe_retriever_tool(
         global_retriever,
         name="query_knowledge_global",
         description=(
