@@ -17,7 +17,12 @@ from typing import Any
 
 import pytest
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import AIMessageChunk, HumanMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    HumanMessage,
+    ToolMessage,
+)
 from langchain_core.outputs import ChatGenerationChunk
 from langchain_openai import ChatOpenAI
 
@@ -241,6 +246,28 @@ def test_opencode_omits_reasoning_effort_when_unset() -> None:
 def test_opencode_responses_models_take_reasoning_effort() -> None:
     model = build_model("opencode:gpt-5.4", reasoning_effort="low")
     assert getattr(model, "reasoning_effort") == "low"  # noqa: B009
+
+
+def test_only_the_current_turn_round_trips_reasoning() -> None:
+    model = build_model("opencode-go:glm-5.3")
+    assert isinstance(model, _ChatDeepSeekFixed)
+    messages = [
+        HumanMessage("first question"),
+        AIMessage("answer", additional_kwargs={"reasoning_content": "old"}),
+        HumanMessage("second question"),
+        AIMessage(
+            "",
+            tool_calls=[{"name": "t", "args": {}, "id": "c1"}],
+            additional_kwargs={"reasoning_content": "current"},
+        ),
+        ToolMessage("result", tool_call_id="c1"),
+    ]
+    assistant = [
+        m
+        for m in model._get_request_payload(messages)["messages"]
+        if m["role"] == "assistant"
+    ]
+    assert [m.get("reasoning_content") for m in assistant] == [None, "current"]
 
 
 @pytest.mark.parametrize(
