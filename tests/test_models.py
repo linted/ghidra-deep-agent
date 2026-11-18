@@ -19,6 +19,7 @@ from langchain_openai import ChatOpenAI
 
 from ghidra_deep_agent.models import (
     _UNPROFILED_ANTHROPIC_MAX_TOKENS,
+    _ChatDeepSeekFixed,
     build_model,
 )
 
@@ -31,6 +32,8 @@ def _api_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setenv("ZAI_API_KEY", "test-key")
     monkeypatch.delenv("ZAI_API_URL", raising=False)
+    monkeypatch.setenv("OPENCODE_API_KEY", "oc-key")
+    monkeypatch.delenv("OPENCODE_API_URL", raising=False)
 
 
 def test_unprofiled_anthropic_model_gets_the_floor_cap() -> None:
@@ -103,3 +106,51 @@ def test_zai_without_key_fails_with_a_clear_error(
     monkeypatch.delenv("ZAI_API_KEY", raising=False)
     with pytest.raises(ValueError, match="ZAI_API_KEY"):
         build_model("zai:glm-5.2")
+
+
+# --- opencode: provider (OpenCode Console gateway) -------------------------------
+
+
+def test_opencode_claude_uses_the_anthropic_endpoint() -> None:
+    model = build_model("opencode:claude-sonnet-4-6")
+    assert isinstance(model, ChatAnthropic)
+    assert model.model == "claude-sonnet-4-6"
+    assert model.anthropic_api_url == "https://opencode.ai/inference/anthropic"
+    # The OpenCode key, not ANTHROPIC_API_KEY.
+    assert model.anthropic_api_key.get_secret_value() == "oc-key"
+
+
+def test_opencode_gpt_uses_the_responses_api() -> None:
+    model = build_model("opencode:gpt-5.4")
+    assert isinstance(model, ChatOpenAI)
+    assert model.use_responses_api is True
+    assert model.openai_api_base == "https://opencode.ai/inference/openai/v1"
+
+
+def test_opencode_other_models_use_chat_completions_with_reasoning_round_trip() -> None:
+    model = build_model("opencode:deepseek-v4-pro")
+    assert isinstance(model, _ChatDeepSeekFixed)
+    assert model.api_base == "https://opencode.ai/inference/openai/v1"
+    assert model.api_key is not None
+    assert model.api_key.get_secret_value() == "oc-key"
+
+
+def test_opencode_threads_max_tokens_through() -> None:
+    for name in ("claude-sonnet-4-6", "gpt-5.4", "glm-5.3"):
+        model = build_model(f"opencode:{name}", max_tokens=12_345)
+        assert getattr(model, "max_tokens") == 12_345  # noqa: B009
+
+
+def test_opencode_base_url_is_overridable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENCODE_API_URL", "https://example.test/inference/")
+    model = build_model("opencode:kimi-k3")
+    assert isinstance(model, _ChatDeepSeekFixed)
+    assert model.api_base == "https://example.test/inference/openai/v1"
+
+
+def test_opencode_without_key_fails_with_a_clear_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="OPENCODE_API_KEY"):
+        build_model("opencode:glm-5.3")
