@@ -10,6 +10,7 @@ from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 from rich.rule import Rule
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -432,8 +433,10 @@ class GhidraAgentApp(App[None]):
             )
         except Exception as exc:
             response.write(
-                f"[bold red]✗ Compaction failed: {exc} — "
-                "the conversation was not changed.[/bold red]"
+                Text(
+                    f"✗ Compaction failed: {exc} — the conversation was not changed.",
+                    style="bold red",
+                )
             )
         finally:
             self._set_busy(False)
@@ -867,7 +870,7 @@ class GhidraAgentApp(App[None]):
             response.write(Rule(style="yellow"))
         except Exception as exc:
             response.write(Rule(style="red"))
-            response.write(f"[bold red]✗ Error: {exc}[/bold red]")
+            response.write(Text(f"✗ Error: {exc}", style="bold red"))
             response.write(Rule(style="red"))
         finally:
             # Runs on cancellation too (CancelledError is a BaseException and

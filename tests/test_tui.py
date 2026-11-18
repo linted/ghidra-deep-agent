@@ -151,6 +151,30 @@ def test_run_streams_response_into_transcript() -> None:
     asyncio.run(run())
 
 
+def test_response_log_wraps_long_lines() -> None:
+    """Long prompts, error lines, and markdown wrap inside a pane narrower
+    than RichLog's 78-column default, and prompt brackets show literally."""
+
+    async def run() -> None:
+        app = _make_app()
+        async with app.run_test(size=(80, 30)) as pilot:
+            await pilot.pause()
+            response = app.query_one(ResponseLog)
+            assert response.wrap
+            response.clear()
+            response.log_user("word " * 60 + "[not markup]")
+            response.write("[bold red]✗ Error: " + "boom " * 60 + "[/bold red]")
+            response.log_assistant("reply " * 60)
+            await pilot.pause()
+            width = response.scrollable_content_region.width
+            texts = [strip.text for strip in response.lines]
+            assert len(texts) > 4
+            assert max(strip.cell_length for strip in response.lines) <= width
+            assert "[not markup]" in "".join(texts)
+
+    asyncio.run(run())
+
+
 def test_nested_tool_calls_are_hidden() -> None:
     """A tool invoked from inside another tool's body (recover_prototypes →
     scripts) is suppressed entirely — no tree row, no deferred-async leak."""

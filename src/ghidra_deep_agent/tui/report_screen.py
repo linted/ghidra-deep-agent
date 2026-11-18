@@ -41,7 +41,13 @@ class SubagentReportScreen(ModalScreen[None]):
                 id="report-title",
             )
             yield ListView(*self._rows(), id="report-list")
-            yield RichLog(id="report-body", highlight=False, markup=False)
+            yield RichLog(
+                id="report-body",
+                highlight=False,
+                markup=False,
+                wrap=True,
+                min_width=1,
+            )
 
     def on_mount(self) -> None:
         self.query_one(ListView).focus()

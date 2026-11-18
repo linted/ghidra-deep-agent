@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from typing import Any
+
 from rich.markdown import Markdown
 from rich.rule import Rule
+from rich.table import Table
+from rich.text import Text
 from textual.widgets import RichLog
 
 from ghidra_deep_agent.tui.messages import AgentDone, ResponseFinal
@@ -9,6 +13,14 @@ from ghidra_deep_agent.tui.messages import AgentDone, ResponseFinal
 
 class ResponseLog(RichLog):
     """Right pane: buffered markdown response."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # RichLog renders plain strings unwrapped and everything at least 78
+        # columns wide by default, so prompts, errors, and (in a narrow pane)
+        # markdown would run off the right edge of the pane.
+        kwargs.setdefault("wrap", True)
+        kwargs.setdefault("min_width", 1)
+        super().__init__(*args, **kwargs)
 
     def on_mount(self) -> None:
         self._response_buf = ""
@@ -31,8 +43,13 @@ class ResponseLog(RichLog):
     def log_user(self, text: str) -> None:
         self.transcript.append(f"❯ {text}")
         self.write(Rule(style="dim cyan"))
-        shown = text.replace("\n", "\n  ")
-        self.write(f"[bold cyan]❯ {shown}[/bold cyan]")
+        # A grid keeps wrapped and multi-line prompts aligned under the text,
+        # and Text (not markup) shows any [brackets] in the prompt literally.
+        prompt = Table.grid()
+        prompt.add_column(no_wrap=True)
+        prompt.add_column()
+        prompt.add_row(Text("❯ ", style="bold cyan"), Text(text, style="bold cyan"))
+        self.write(prompt)
         self.write(Rule(style="dim cyan"))
 
     def on_response_final(self, msg: ResponseFinal) -> None:
