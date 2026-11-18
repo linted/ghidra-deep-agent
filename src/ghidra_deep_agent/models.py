@@ -8,7 +8,7 @@ from typing import Any, cast
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from langchain_core.messages.ai import UsageMetadata, subtract_usage
 from langchain_core.outputs import ChatGenerationChunk
 from langchain_deepseek import ChatDeepSeek
@@ -24,6 +24,11 @@ class _ChatDeepSeekFixed(ChatDeepSeek):
     include the original reasoning_content on subsequent turns.  The base
     langchain_deepseek package stores it in additional_kwargs but never writes
     it back into the request payload, causing a 400 on multi-turn sessions.
+
+    Only the current turn (assistant messages after the latest human message)
+    gets its reasoning back: the model needs it between tool calls, but
+    finished turns' reasoning is dead weight. One resumed GLM-5.3 session was
+    sending ~124k chars of it, about half of every request.
     """
 
     def _get_request_payload(
@@ -32,9 +37,17 @@ class _ChatDeepSeekFixed(ChatDeepSeek):
         original_messages = self._convert_input(input_).to_messages()
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
 
+        turn_start = max(
+            (
+                i
+                for i, msg in enumerate(original_messages)
+                if isinstance(msg, HumanMessage)
+            ),
+            default=-1,
+        )
         reasoning_iter = (
-            msg.additional_kwargs.get("reasoning_content")
-            for msg in original_messages
+            msg.additional_kwargs.get("reasoning_content") if i > turn_start else None
+            for i, msg in enumerate(original_messages)
             if isinstance(msg, AIMessage)
         )
         for message in payload.get("messages", []):
