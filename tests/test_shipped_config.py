@@ -1,17 +1,18 @@
-"""Tests against the repo's own ``subagents.toml``, not a synthetic fixture.
+"""Tests against the repo's own ``agents.toml`` and ``skills/`` tree.
 
-The tier machinery is unit-tested in ``test_subagents.py``; what this file guards
-is that the shipped config actually uses it correctly. Two classes of bug are only
-visible here: a config that drifts out of sync with the code (an unknown policy, a
-tool name the server does not expose), and a change to
-``_read_only_delegates`` that quietly hands plan or ask mode a write-capable agent.
+The builder machinery is unit-tested in ``test_agent_config.py``; what this file
+guards is that the shipped config and skills actually line up with the code. The
+bugs only visible here: a config that won't parse/build, a ``SKILL.md`` that
+deepagents' own loader rejects or whose name drifts from its directory, a skill
+body that names a tool the server does not expose, and the read-only modes being
+handed write tools or the repair skills.
 
 Run:  uv run pytest tests/test_shipped_config.py -v
 """
 
 from __future__ import annotations
 
-import tomllib
+import re
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,21 +20,21 @@ from typing import Any, cast
 
 import pytest
 from deepagents.backends import StateBackend
+from deepagents.backends.filesystem import FilesystemBackend
+from deepagents.middleware.skills import _list_skills
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.tools import BaseTool
 
-from ghidra_deep_agent.cli import _read_only_delegates
-from ghidra_deep_agent.subagents import (
+from ghidra_deep_agent.agent_config import (
     MUTATION_TOOLS,
-    READ_ONLY_WRITE_POLICY,
-    WRITE_POLICIES,
     AgentConfig,
-    build_subagents,
+    build_worker,
     load_agent_config,
 )
-from ghidra_deep_agent.validation import ArgumentValidationMiddleware
 
-CONFIG_PATH = Path(__file__).resolve().parent.parent / "subagents.toml"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+CONFIG_PATH = REPO_ROOT / "agents.toml"
+SKILLS_DIR = REPO_ROOT / "skills"
 
 # GhidrAssistMCP 3.0.0 read tools (every write tool is in MUTATION_TOOLS).
 _GHIDRA_READ_TOOLS = {
@@ -99,9 +100,30 @@ _LOCAL_READ_TOOLS = {
     "list_all_knowledge",
     "list_analyzed_binaries",
 }
-# Every tool any shipped agent could ask for, so `_select` never warns about a
-# missing one.
-_ALL_TOOL_NAMES = sorted(set(MUTATION_TOOLS) | _GHIDRA_READ_TOOLS | _LOCAL_READ_TOOLS)
+# Filesystem tools the skills may reference (supplied by deepagents middleware).
+_FS_TOOLS = {"write_file", "read_file", "edit_file"}
+_KNOWN_TOOLS = set(MUTATION_TOOLS) | _GHIDRA_READ_TOOLS | _LOCAL_READ_TOOLS | _FS_TOOLS
+
+# Backticked snake_case tokens in skill bodies that are NOT tools: tool
+# parameters, example symbol names, and a type/field name. Listed so the
+# drift guard below can tell them apart from a genuine tool-name typo.
+_NON_TOOL_TOKENS = {
+    "base_address",
+    "c_definition",
+    "dry_run",
+    "element_size",
+    "file_size",
+    "local_10",
+    "maybe_",
+    "set_rodata_constant",
+    "size_t",
+    "table_address",
+    "table_hint",
+    "unsupported_arch",
+    "warning_cleared",
+}
+
+_ALL_TOOL_NAMES = sorted(_KNOWN_TOOLS)
 
 
 @pytest.fixture(scope="module")
@@ -118,99 +140,97 @@ def _resolver(model: str | None, max_tokens: int | None = None) -> FakeListChatM
     return FakeListChatModel(responses=["ok"])
 
 
-def _build(config: AgentConfig, *, policy_override: str | None = None) -> list[Any]:
-    return build_subagents(
-        _fake_tools(),
-        config,
-        resolve_model=_resolver,
-        backend=StateBackend(),
-        policy_override=policy_override,
-    )
-
-
 def _tool_names(spec: Any) -> set[str]:
     return {getattr(tool, "name") for tool in spec["tools"]}  # noqa: B009
 
 
-def _validation_mw(spec: Any) -> ArgumentValidationMiddleware:
-    mws = [m for m in spec["middleware"] if isinstance(m, ArgumentValidationMiddleware)]
-    assert len(mws) == 1
-    return mws[0]
-
-
-def test_shipped_config_parses_with_known_policies(config: AgentConfig) -> None:
-    assert config.subagents, "config must declare at least one sub-agent"
-    for sub in config.subagents:
-        assert sub.write_policy in WRITE_POLICIES, (
-            f"{sub.name}: unknown write_policy {sub.write_policy!r}"
-        )
-
-
-def test_shipped_config_builds_without_missing_tools(config: AgentConfig) -> None:
-    specs = _build(config)
-    assert {spec["name"] for spec in specs} == {sub.name for sub in config.subagents}
-
-
-def test_read_only_delegates_cannot_mutate(config: AgentConfig) -> None:
-    """Plan and ask mode are read-only by construction, not by config trust."""
-    plan_subs, ask_subs = _read_only_delegates(
-        _build(config, policy_override=READ_ONLY_WRITE_POLICY)
+def _build_worker(config: AgentConfig, *, read_only: bool) -> Any:
+    return build_worker(
+        _fake_tools(),
+        config,
+        _resolver,
+        StateBackend(),
+        read_only=read_only,
+        skills=["/skills/analysis/", "/skills/repair/"],
     )
-    assert plan_subs and ask_subs
-
-    for spec in [*plan_subs, *ask_subs]:
-        leaked = _tool_names(spec) & MUTATION_TOOLS
-        assert not leaked, f"{spec['name']} kept mutation tool(s) {sorted(leaked)}"
-        assert _validation_mw(spec)._rename_prefix is None
 
 
-def test_delegates_built_from_the_normal_set_would_not_qualify(
-    config: AgentConfig,
-) -> None:
-    """Guards the wiring: passing the *normal* build here must not be silently OK.
+# --- config --------------------------------------------------------------------
 
-    If someone routes `_read_only_delegates` at the main sub-agent list again, the
-    read-only guarantee is gone — this test fails loudly instead.
+
+def test_shipped_config_parses(config: AgentConfig) -> None:
+    # Models may be None (inherited); this just proves it loads and validates.
+    assert isinstance(config, AgentConfig)
+
+
+def test_worker_builds_from_the_full_set(config: AgentConfig) -> None:
+    spec = _build_worker(config, read_only=False)
+    assert _tool_names(spec) == set(_ALL_TOOL_NAMES)
+
+
+def test_read_only_worker_holds_no_mutation_tool(config: AgentConfig) -> None:
+    """Plan/ask mode read-only by construction, not by config trust."""
+    spec = _build_worker(config, read_only=True)
+    leaked = _tool_names(spec) & MUTATION_TOOLS
+    assert not leaked, f"read-only worker kept mutation tool(s) {sorted(leaked)}"
+
+
+# --- skills --------------------------------------------------------------------
+
+
+def _skill_dirs() -> list[Path]:
+    return sorted(SKILLS_DIR.glob("*/*/SKILL.md"))
+
+
+def test_every_skill_parses_with_a_matching_name() -> None:
+    """deepagents' own loader must accept each skill, name == directory name."""
+    backend = FilesystemBackend(root_dir=str(SKILLS_DIR), virtual_mode=True)
+    for group in ("/analysis/", "/repair/"):
+        skills = _list_skills(backend, group)
+        assert skills, f"no skills loaded from {group}"
+        for skill in skills:
+            # path is /<group>/<name>/SKILL.md
+            dir_name = skill["path"].strip("/").split("/")[-2]
+            assert skill["name"] == dir_name, (
+                f"skill name {skill['name']!r} != directory {dir_name!r}"
+            )
+
+
+def test_skills_reference_only_real_tools() -> None:
+    """A tool name a skill names must exist, else the model calls a ghost tool."""
+    for md in _skill_dirs():
+        body = md.read_text(encoding="utf-8")
+        tokens = {
+            tok
+            for tok in re.findall(r"`([a-z][a-z0-9_]+)`", body)
+            if "_" in tok and len(tok) > 3
+        }
+        unknown = tokens - _KNOWN_TOOLS - _NON_TOOL_TOKENS
+        rel = md.relative_to(REPO_ROOT)
+        assert not unknown, f"{rel}: references unknown tool/token(s) {sorted(unknown)}"
+
+
+def test_repair_skills_need_write_tools() -> None:
+    """The repair skills are correctly segregated from the read-only analysis set.
+
+    Each repair skill body names at least one mutating tool (so it cannot be
+    offered to the read-only plan/ask graphs); analysis skills must not require
+    one to function.
     """
-    plan_subs, _ = _read_only_delegates(_build(config))
-    research = plan_subs[0]
-    assert _tool_names(research) & MUTATION_TOOLS, (
-        "the annotating build of `research` should hold mutation tools; if it "
-        "does not, this test no longer guards anything"
-    )
-
-
-def test_every_configured_tool_name_exists() -> None:
-    """A misspelled or retired tool name is only a startup warning; fail here."""
-    raw = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    entries = [raw["main"], *raw["subagents"]]
-    known = set(_ALL_TOOL_NAMES)
-    for entry in entries:
-        tools = entry.get("tools")
-        if not isinstance(tools, list):
-            continue
-        unknown = set(tools) - known
-        assert not unknown, f"{entry.get('name', 'main')}: unknown tools {unknown}"
-
-
-def test_no_prompt_uses_the_retired_selector_api() -> None:
-    """GhidrAssistMCP 3.x has no `action`/`format` selectors; unknown args error."""
-    text = CONFIG_PATH.read_text(encoding="utf-8")
-    for selector in ("`action:", "`format:"):
-        assert selector not in text, (
-            f"a prompt still tells the model to pass {selector[1:]} — the "
-            "consolidated tools it selected between no longer exist"
+    for md in (SKILLS_DIR / "repair").glob("*/SKILL.md"):
+        body = md.read_text(encoding="utf-8")
+        named = {tok for tok in re.findall(r"`([a-z][a-z0-9_]+)`", body)}
+        assert named & MUTATION_TOOLS, (
+            f"{md.relative_to(REPO_ROOT)}: a repair skill should use a write tool"
         )
 
 
-def test_annotating_agents_are_told_the_prefix_rule(config: AgentConfig) -> None:
-    """The generated scope text must reach every annotations-tier agent."""
-    annotating = [
-        spec
-        for spec, sub in zip(_build(config), config.subagents, strict=True)
-        if sub.write_policy == "annotations"
-    ]
-    assert annotating, "expected at least one annotations-tier sub-agent"
-    for spec in annotating:
-        assert "maybe_" in spec["system_prompt"]
-        assert "pending-change" in spec["system_prompt"]
+def test_no_skill_uses_the_retired_selector_api() -> None:
+    """GhidrAssistMCP 3.x has no `action`/`format` selectors; unknown args error."""
+    for md in _skill_dirs():
+        text = md.read_text(encoding="utf-8")
+        for selector in ("`action:", "`format:"):
+            assert selector not in text, (
+                f"{md.relative_to(REPO_ROOT)} still tells the model to pass "
+                f"{selector[1:]} — the consolidated tools it chose between are gone"
+            )

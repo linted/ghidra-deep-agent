@@ -12,7 +12,7 @@ behalf until the task completes — so agents see a synchronous result exactly a
 they did with the previous MCP server.
 
 Because the polling happens here, ``get_task_status`` is actively withheld from
-every agent's tool set (see ``WITHHELD_TOOLS`` in subagents.py): the model never
+every agent's tool set (see ``WITHHELD_TOOLS`` in agent_config.py): the model never
 receives it as a callable tool, so it can't reintroduce the manual-polling
 spin-loop this middleware exists to prevent. If a task exceeds the poll timeout,
 the model gets an explicit "did not complete" message rather than a dangling

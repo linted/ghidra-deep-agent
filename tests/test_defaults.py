@@ -81,13 +81,13 @@ def test_non_positive_allowed_when_opted_out(monkeypatch: pytest.MonkeyPatch) ->
 def test_env_override_wins(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     target = tmp_path / "elsewhere.toml"
     monkeypatch.setenv("GDA_TEST_CONFIG", str(target))
-    assert config_path("GDA_TEST_CONFIG", "subagents.toml") == target
+    assert config_path("GDA_TEST_CONFIG", "agents.toml") == target
 
 
 def test_repo_checkout_resolves_to_the_repo_root() -> None:
     """In a source checkout the file sits next to pyproject.toml."""
-    found = config_path("GDA_TEST_CONFIG", "subagents.toml")
-    assert found.name == "subagents.toml"
+    found = config_path("GDA_TEST_CONFIG", "agents.toml")
+    assert found.name == "agents.toml"
     assert found.exists()
 
 

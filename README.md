@@ -14,6 +14,8 @@ The agent uses Ghidra's MCP server as its primary toolset. On each turn it can:
 
 It treats the assembly as ground truth. Every rename or retype it applies is grounded in specific evidence from the disassembly — it won't guess. As it learns more about the binary it refines its earlier work, building up a progressively more readable Ghidra project.
 
+A **coordinator** agent directs the work and holds the full tool set, so it can apply small, single-function changes itself. The analysis and repair playbooks live as **skills** under `skills/` (reconnaissance, switch recovery, prototype recovery, type recovery, per-function analysis, investigation, vulnerability hunting) — each a `SKILL.md` the agent reads on demand. For verbose, slow, or parallel work the coordinator delegates to a single general-purpose **worker** sub-agent, naming the skill to follow; the worker runs in its own context and returns a compact summary. Plan and ask modes drop every mutating tool (and the repair skills) from both agents, so they are read-only by construction.
+
 Conversation history is persisted to MongoDB via `langgraph-checkpoint-mongodb`, so sessions survive restarts and the agent can continue where it left off. Findings are also stored in a MongoDB vector collection so the agent can retrieve prior knowledge across sessions.
 
 The knowledge base is scoped per binary — each program analyzed gets its own isolated namespace so findings never bleed between targets. When multiple binaries are open in Ghidra at startup, the agent presents a selection screen. A global semantic search tool is also available when cross-binary comparison is useful.
@@ -46,7 +48,8 @@ All configuration is done via environment variables (`.env` file or shell export
 |---|---|---|
 | `ANTHROPIC_API_KEY` | — | API key for Anthropic *(not needed for Ollama)* |
 | `MODEL` | `anthropic:claude-sonnet-4-6` | Any `provider:model` string supported by LangChain (also `openrouter:<model-id>` — see [Using OpenRouter](#using-openrouter) — and `opencode:<model-id>` / `opencode-go:<model-id>` for the OpenCode Console gateway, pay-as-you-go or the Go subscription, keyed by `OPENCODE_API_KEY`) |
-| `AGENT_CONFIG` | `./subagents.toml` | Per-agent models and tool allowlists (coordinator + sub-agents); point this at a different TOML to override |
+| `AGENT_CONFIG` | `./agents.toml` | Models for the coordinator and the worker sub-agent (`[main]` / `[worker]`); point this at a different TOML to override |
+| `SKILLS_DIR` | `./skills` | Directory of analysis/repair skills (`<group>/<name>/SKILL.md`) the agent reads on demand; point this at a different tree to override |
 | `OPENROUTER_API_KEY` | — | API key for OpenRouter *(required for `openrouter:` models)* |
 | `DEEPSEEK_API_KEY` | — | API key for DeepSeek *(required for `deepseek:` models)* |
 | `OPENROUTER_CONFIG` | `./openrouter.toml` | Optional TOML of per-model OpenRouter provider-routing presets — see [Pinning providers](#pinning-providers-provider-routing) |

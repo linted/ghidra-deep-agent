@@ -1,0 +1,41 @@
+# Model configuration for the Ghidra deep agent.
+#
+# There are two agents: the `main` coordinator and the single `worker`
+# (general-purpose) sub-agent the coordinator delegates heavy or parallel work
+# to. Both get the full (non-withheld) Ghidra + knowledge tool set; the workflows
+# themselves live in on-demand skills under `skills/` (see SKILLS_DIR), not in
+# per-agent tool allowlists.
+#
+# Each agent's `model` is optional: omit it to inherit the `default` below, then
+# the MODEL env var, then the built-in "anthropic:claude-sonnet-4-6".
+#
+# Point AGENT_CONFIG at a different file to override this one.
+
+# Optional fallback model for any agent without its own `model`.
+default = "deepseek:deepseek-flash"
+# z.ai GLM direct (OpenAI-compatible endpoint; needs ZAI_API_KEY):
+# default = "zai:glm-5.2"
+
+# Optional output-token cap, resolved like `model`: per-entry `max_tokens` ->
+# this top-level value -> MODEL_MAX_TOKENS env -> provider default. Set it when
+# routing an Anthropic-protocol endpoint at a non-Claude model (e.g.
+# `anthropic:glm-5.2` on z.ai): langchain-anthropic has no profile for those and
+# silently falls back to max_tokens=4096, which truncates long responses
+# mid-tool_use and ends runs on a bare preamble. Unprofiled anthropic:* models
+# get a 32768 floor even without this key; set it to match your endpoint's
+# documented cap.
+# max_tokens = 32768
+
+[main]
+# The coordinator: orchestrates the work, navigates/searches, uses the knowledge
+# base, reads skills, and applies small single-function changes itself. It
+# delegates whole-program passes and large/parallel work to the worker.
+model = "openrouter:z-ai/glm-5.3:floor"
+# model = "openrouter:cohere/north-mini-code:free"
+
+[worker]
+# The single general-purpose sub-agent. Runs a skill end-to-end in its own
+# context (a whole-program pass, a batch of functions, an investigation) and
+# returns a compact summary. In plan/ask mode it is rebuilt read-only.
+model = "deepseek:deepseek-flash"
+# exclude = []  # tool names to drop from its full set, if ever needed

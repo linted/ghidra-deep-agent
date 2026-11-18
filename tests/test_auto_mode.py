@@ -17,13 +17,13 @@ from langchain_core.decisions import (
 )
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+from ghidra_deep_agent.agent_config import MUTATION_TOOLS
 from ghidra_deep_agent.auto_mode import (
     DEFAULT_GUARDED_TOOLS,
     JevAutoModeMiddleware,
     build_auto_mode_middleware,
 )
 from ghidra_deep_agent.context_pruning import JEV_CHARS_PER_TOKEN
-from ghidra_deep_agent.subagents import MUTATION_TOOLS
 
 
 class FakeClassifier(BaseDecisionModel):
