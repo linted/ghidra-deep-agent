@@ -1,6 +1,7 @@
 import os
 import sys
 import tomllib
+import uuid
 from pathlib import Path
 from typing import Any, cast
 
@@ -201,20 +202,41 @@ def _build_zai_model(model_name: str, max_tokens: int | None) -> BaseChatModel:
 # The last row covers DeepSeek, GLM, Kimi, Qwen, MiniMax, and Gemini (which the
 # gateway translates). _ChatDeepSeekFixed is ChatOpenAI plus reasoning_content
 # capture and round-trip; thinking models on that protocol 400 without it.
-# Endpoints per opencode.ai/docs/zen; override the base via OPENCODE_API_URL.
-_OPENCODE_DEFAULT_API_URL = "https://opencode.ai/inference"
+# ``opencode-go:<model>`` is the same gateway under the Go subscription's base
+# URL; one Console API key serves both, the base URL picks the plan.
+# Endpoints per opencode.ai/docs/zen and /docs/go; override the bases via
+# OPENCODE_API_URL / OPENCODE_GO_API_URL.
+_OPENCODE_PLANS: dict[str, tuple[str, str]] = {
+    "opencode": ("OPENCODE_API_URL", "https://opencode.ai/inference"),
+    "opencode-go": ("OPENCODE_GO_API_URL", "https://opencode.ai/inference/go"),
+}
 _OPENCODE_RESPONSES_PREFIXES = ("gpt-", "grok-", "muse-")
+# Go requires a stable `x-opencode-session` on every request, and pay-as-you-go
+# uses it to keep a conversation on one backend and reuse its prompt cache. One
+# id per process: models are built once at startup, before any thread exists,
+# so every agent and conversation in a run shares it. That only affects
+# routing; each conversation's prefix is still cached on its own.
+_OPENCODE_SESSION_ID = f"ses_{uuid.uuid4().hex}"
+# Go's terms ask clients to identify themselves with their own user agent.
+_OPENCODE_USER_AGENT = "ghidra-deep-agent/0.1.0"
 
 
-def _build_opencode_model(model_name: str, max_tokens: int | None) -> BaseChatModel:
+def _build_opencode_model(
+    plan: str, model_name: str, max_tokens: int | None
+) -> BaseChatModel:
     raw_key = os.environ.get("OPENCODE_API_KEY")
     if not raw_key:
         raise ValueError(
-            f"opencode:{model_name} requires the OPENCODE_API_KEY environment "
+            f"{plan}:{model_name} requires the OPENCODE_API_KEY environment "
             "variable (an OpenCode Console API key)."
         )
     api_key = SecretStr(raw_key)
-    base = os.environ.get("OPENCODE_API_URL", _OPENCODE_DEFAULT_API_URL).rstrip("/")
+    url_env, default_url = _OPENCODE_PLANS[plan]
+    base = os.environ.get(url_env, default_url).rstrip("/")
+    headers = {
+        "x-opencode-session": _OPENCODE_SESSION_ID,
+        "User-Agent": _OPENCODE_USER_AGENT,
+    }
     if model_name.startswith("claude-"):
         from langchain_anthropic import ChatAnthropic
 
@@ -228,6 +250,7 @@ def _build_opencode_model(model_name: str, max_tokens: int | None) -> BaseChatMo
             model=model_name,
             base_url=f"{base}/anthropic",
             api_key=api_key,
+            default_headers=headers,
             **anthropic_kwargs,
         )
     kwargs: dict[str, Any] = {}
@@ -241,6 +264,7 @@ def _build_opencode_model(model_name: str, max_tokens: int | None) -> BaseChatMo
             base_url=f"{base}/openai/v1",
             api_key=api_key,
             use_responses_api=True,
+            default_headers=headers,
             **kwargs,
         )
     # `api_base` is ChatDeepSeek's documented runtime name; mypy's pydantic
@@ -249,6 +273,7 @@ def _build_opencode_model(model_name: str, max_tokens: int | None) -> BaseChatMo
         model=model_name,
         api_base=f"{base}/openai/v1",
         api_key=api_key,
+        default_headers=headers,
         **kwargs,
     )
 
@@ -265,8 +290,9 @@ def build_model(
     returned as-is for init_chat_model to resolve. ``zai:<model>`` targets
     z.ai's OpenAI-compatible endpoint via ChatOpenAI (their documented
     LangChain path; no dedicated integration exists). ``opencode:<model>``
-    targets OpenCode's gateway with the stock class for the model's family
-    (see ``_build_opencode_model``).
+    and ``opencode-go:<model>`` target OpenCode's gateway (pay-as-you-go and
+    the Go subscription) with the stock class for the model's family (see
+    ``_build_opencode_model``).
 
     ``max_tokens`` (from ``max_tokens`` in subagents.toml) caps output tokens.
     Anthropic-protocol models that langchain-anthropic has no profile for get
@@ -275,8 +301,9 @@ def build_model(
     """
     if model_string.startswith("zai:"):
         return _build_zai_model(model_string.split(":", 1)[1], max_tokens)
-    if model_string.startswith("opencode:"):
-        return _build_opencode_model(model_string.split(":", 1)[1], max_tokens)
+    plan, _, model_id = model_string.partition(":")
+    if plan in _OPENCODE_PLANS:
+        return _build_opencode_model(plan, model_id, max_tokens)
     if model_string.startswith("deepseek:"):
         model_name = model_string.split(":", 1)[1]
         if max_tokens is not None:
@@ -313,7 +340,8 @@ def build_model(
         # num_predict, etc.), so don't guess — say it's ignored.
         print(
             f"Warning: max_tokens is not supported for {model_string!r}; "
-            "ignoring (supported: anthropic, deepseek, opencode, openrouter, zai).",
+            "ignoring (supported: anthropic, deepseek, opencode, opencode-go, "
+            "openrouter, zai).",
             file=sys.stderr,
         )
     return model_string
