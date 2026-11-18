@@ -17,12 +17,14 @@ from typing import Any
 
 import pytest
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessageChunk, HumanMessage
+from langchain_core.outputs import ChatGenerationChunk
 from langchain_openai import ChatOpenAI
 
 from ghidra_deep_agent.models import (
     _UNPROFILED_ANTHROPIC_MAX_TOKENS,
     _ChatDeepSeekFixed,
+    _usage_to_delta,
     build_model,
 )
 
@@ -250,3 +252,44 @@ def test_reasoning_effort_is_ignored_with_a_warning_elsewhere(
     model = build_model(spec, reasoning_effort="high")
     assert getattr(model, "reasoning_effort", None) is None
     assert "reasoning_effort is not supported" in capsys.readouterr().err
+
+
+# --- streamed usage --------------------------------------------------------------
+
+
+def _merged_usage(usages: list[tuple[int, int] | None]) -> tuple[int, int]:
+    """Stream chunks carrying ``usages`` through the delta rewrite and merge."""
+    chunks = [
+        ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="x",
+                usage_metadata=None
+                if u is None
+                else {
+                    "input_tokens": u[0],
+                    "output_tokens": u[1],
+                    "total_tokens": u[0] + u[1],
+                },
+            )
+        )
+        for u in usages
+    ]
+    seen = None
+    for chunk in chunks:
+        seen = _usage_to_delta(chunk, seen)
+    merged = chunks[0]
+    for chunk in chunks[1:]:
+        merged += chunk
+    assert isinstance(merged.message, AIMessageChunk)
+    usage = merged.message.usage_metadata
+    assert usage is not None
+    return usage["input_tokens"], usage["output_tokens"]
+
+
+def test_cumulative_streamed_usage_is_counted_once() -> None:
+    """A backend sending the running total on every chunk must not be summed."""
+    assert _merged_usage([(100, 1), (100, 2), None, (100, 5)]) == (100, 5)
+
+
+def test_single_final_usage_chunk_is_unchanged() -> None:
+    assert _merged_usage([None, None, (100, 5)]) == (100, 5)
