@@ -12,13 +12,16 @@ from __future__ import annotations
 import asyncio
 import re
 
+import pytest
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
+from langchain_core.tools import tool
 from pymongo.errors import OperationFailure
 
 from ghidra_deep_agent.knowledge import (
     QUERY_RESULT_CAP,
+    Tags,
     _address_prefix_filter,
     _cap_note,
     _safe_retriever_tool,
@@ -100,3 +103,27 @@ def test_retriever_tool_reports_mongo_errors() -> None:
     ):
         assert result.startswith("Warning: semantic search is unavailable")
         assert "NOT_STARTED" in result
+
+
+# ── tags coercion ─────────────────────────────────────────────────────────────
+
+
+@tool
+def _tagged(tags: Tags | None = None) -> str:
+    """Echo the validated tags."""
+    return repr(tags)
+
+
+@pytest.mark.parametrize(
+    ("sent", "expected"),
+    [
+        ("['state-block', 'cff']", ["state-block", "cff"]),
+        ('["vgtrace"]', ["vgtrace"]),
+        ("crypto, loop", ["crypto", "loop"]),
+        (["already", "a-list"], ["already", "a-list"]),
+        (None, None),
+    ],
+)
+def test_tags_sent_as_a_string_become_a_list(sent: object, expected: object) -> None:
+    """GLM sometimes serializes the list; strict validation rejected the call."""
+    assert _tagged.invoke({"tags": sent}) == repr(expected)

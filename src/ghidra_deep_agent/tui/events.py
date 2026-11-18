@@ -104,13 +104,19 @@ def handle_event(
         )
         app.post_message(ToolCountChanged(1))
 
-    elif kind == "on_tool_end":
+    # A tool that raises (e.g. its arguments fail validation) gets
+    # on_tool_error *instead of* on_tool_end; without closing it here its node
+    # spun "in progress" forever and the active-tool count never came back down.
+    elif kind in ("on_tool_end", "on_tool_error"):
         run.active_tool_runs.discard(run_id)
         if run_id in run.hidden_tool_runs:
             run.hidden_tool_runs.discard(run_id)
             return
-        output = event.get("data", {}).get("output")
-        error = bool(event.get("data", {}).get("error"))
+        data = event.get("data", {})
+        if kind == "on_tool_error":
+            output, error = data.get("error"), True
+        else:
+            output, error = data.get("output"), bool(data.get("error"))
         meta = run.subagent_meta.pop(run_id, None)
         if meta is not None:
             # `task` is a local tool that can never return an async submission
