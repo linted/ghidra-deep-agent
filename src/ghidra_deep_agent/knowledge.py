@@ -13,13 +13,14 @@ Configuration (env):
   MONGODB_VECTOR_COLLECTION   collection name (default ``re_knowledge``)
 """
 
+import ast
 import os
 import re
 import sys
 from collections import Counter
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any
 
 from langchain_core.callbacks import Callbacks
 from langchain_core.documents import Document
@@ -29,6 +30,7 @@ from langchain_core.tools import StructuredTool, tool
 from langchain_core.tools.retriever import create_retriever_tool
 from langchain_mongodb import MongoDBAtlasVectorSearch
 from langchain_mongodb.embeddings import AutoEmbeddings
+from pydantic import BeforeValidator
 from pymongo.errors import PyMongoError
 
 from ghidra_deep_agent.mongo_util import get_mongo_client, mongo_write_with_retry
@@ -55,6 +57,30 @@ QUERY_RESULT_CAP = 100
 # session, and it would otherwise load the entire knowledge base into memory as
 # the base fills up. The headline total is counted separately so it stays exact.
 SUMMARY_SCAN_CAP = 1000
+
+
+def _coerce_tags(value: Any) -> Any:
+    """Accept tags sent as one string, e.g. ``"['crypto', 'loop']"`` or ``"a, b"``.
+
+    GLM sometimes serializes the list into a string; strict validation then
+    rejected the whole call and the agent had to resend it.
+    """
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if text.startswith("["):
+        try:
+            parsed = ast.literal_eval(text)
+        except (ValueError, SyntaxError):
+            parsed = None
+        if isinstance(parsed, list):
+            return [str(t) for t in parsed]
+    return [t.strip().strip("'\"") for t in text.strip("[]").split(",") if t.strip()]
+
+
+# A tool's ``tags`` argument: a list of strings, or one string the model
+# serialized it into (see ``_coerce_tags``).
+Tags = Annotated[list[str], BeforeValidator(_coerce_tags)]
 
 
 # Fields every listing tool renders from. Kept as one projection because the
@@ -321,7 +347,7 @@ def build_knowledge_tools(
         address: str = "",
         function_name: str = "",
         confidence: str = "medium",
-        tags: list[str] | None = None,
+        tags: Tags | None = None,
     ) -> str:
         """Save a NEW reverse engineering finding to the long-term knowledge base.
 
@@ -368,7 +394,7 @@ def build_knowledge_tools(
         address: str,
         function_name: str | None = None,
         confidence: str | None = None,
-        tags: list[str] | None = None,
+        tags: Tags | None = None,
     ) -> str:
         """Update metadata on EXISTING knowledge entries for a given address.
 
@@ -414,7 +440,7 @@ def build_knowledge_tools(
         )
 
     @tool
-    def query_by_address(address: str, tags: list[str] | None = None) -> str:
+    def query_by_address(address: str, tags: Tags | None = None) -> str:
         """Retrieve all stored findings for a given address or address prefix.
 
         Use this before working on a specific function or data location to surface
@@ -443,7 +469,7 @@ def build_knowledge_tools(
         return f"{len(docs)} finding(s):\n" + "\n".join(lines) + _cap_note(docs)
 
     @tool
-    def query_by_category(category: str, tags: list[str] | None = None) -> str:
+    def query_by_category(category: str, tags: Tags | None = None) -> str:
         """Retrieve all stored findings of a given category.
 
         Useful for reviewing every known function, every hypothesis, or every rename
@@ -500,7 +526,7 @@ def build_knowledge_tools(
         return _render_knowledge_summary(docs, binary_name, total)
 
     @tool
-    def list_all_knowledge(tags: list[str] | None = None) -> str:
+    def list_all_knowledge(tags: Tags | None = None) -> str:
         """List a summary of every entry in the knowledge base for the current binary.
 
         Call this at the start of a session to orient yourself — see which
@@ -540,7 +566,7 @@ def build_knowledge_tools(
         )
 
     @tool
-    def query_by_tags(tags: list[str]) -> str:
+    def query_by_tags(tags: Tags) -> str:
         """Retrieve all stored findings that match any of the given tags.
 
         Use this to surface everything related to a theme across the whole binary,

@@ -175,6 +175,51 @@ def test_response_log_wraps_long_lines() -> None:
     asyncio.run(run())
 
 
+def test_tool_error_closes_the_node() -> None:
+    """A tool that raises gets on_tool_error instead of on_tool_end; its node
+    must still close (as failed) and the active-tool count come back down."""
+
+    async def run() -> None:
+        app = _make_app()
+        async with app.run_test() as pilot:
+            activity = app.query_one(ActivityTree)
+            response = app.query_one(ResponseLog)
+            thinking = app.query_one(ThinkingPanel)
+
+            def emit(event: dict[str, Any]) -> None:
+                handle_event(app, event, activity, response, thinking)
+
+            emit(
+                {
+                    "event": "on_tool_start",
+                    "run_id": "save",
+                    "name": "save_knowledge",
+                    "metadata": {},
+                    "parent_ids": [],
+                    "data": {"input": {"content": "x"}},
+                }
+            )
+            await pilot.pause()
+            assert app.query_one(StatusBar).active_tools == 1
+
+            emit(
+                {
+                    "event": "on_tool_error",
+                    "run_id": "save",
+                    "metadata": {},
+                    "data": {"error": ValueError("tags: Input should be a valid list")},
+                }
+            )
+            await pilot.pause()
+            assert app.run_state.active_tool_runs == set()
+            assert app.query_one(StatusBar).active_tools == 0
+            node = activity._run_map["save"][0]
+            assert "✗" in str(node.label)
+            assert "valid list" in str(node.children[0].label)
+
+    asyncio.run(run())
+
+
 def test_nested_tool_calls_are_hidden() -> None:
     """A tool invoked from inside another tool's body (recover_prototypes →
     scripts) is suppressed entirely — no tree row, no deferred-async leak."""
