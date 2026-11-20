@@ -14,9 +14,19 @@ Configuration (env):
                       order, after the primary model's retries are exhausted
                       (default: none — fallback disabled)
   TOOL_MAX_RETRIES    retry attempts for retryable filesystem tools (default 3)
+  MODEL_CONCURRENCY_WAIT
+                      seconds to keep retrying a "concurrency limit" 429
+                      before pausing the run (default 300)
+  MODEL_MAX_CONCURRENCY
+                      cap on in-flight model calls across the main agent and
+                      all sub-agents in this process (default: unlimited)
 """
 
+import asyncio
 import os
+import random
+import threading
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
@@ -42,7 +52,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.errors import GraphBubbleUp
 from langgraph.runtime import Runtime
 
-from ghidra_deep_agent.defaults import env_int
+from ghidra_deep_agent.defaults import env_float, env_int
 from ghidra_deep_agent.toasts import notify_toast
 
 ModelResolver = Callable[[str | None], str | BaseChatModel]
@@ -154,6 +164,38 @@ def _is_usage_limit(exc: BaseException) -> bool:
         return True
     text = f"{type(exc).__name__}: {exc}".lower()
     return any(marker in text for marker in _USAGE_LIMIT_MARKERS)
+
+
+# Markers of a *concurrency* limit: too many requests in flight at once on the
+# workspace/key, not too many over a time window. It clears as soon as any
+# in-flight call (ours or another client's) finishes — seconds to a minute or
+# two, never hours — so it gets a long patient wait instead of the short retry
+# budget and the usage-limit halt. Observed verbatim from the OpenCode gateway:
+# "Error code: 429 - Your workspace has reached the concurrency limit".
+_CONCURRENCY_MARKERS = (
+    "concurrency limit",
+    "concurrent request",
+    "too many concurrent",
+)
+
+
+def _is_concurrency_limit(exc: BaseException) -> bool:
+    """Is this a rate limit on requests in flight, rather than a quota?"""
+    if not _is_usage_limit(exc):
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in _CONCURRENCY_MARKERS)
+
+
+def _retry_on(exc: BaseException) -> bool:
+    """``ModelRetryMiddleware``'s filter: transient, minus concurrency limits.
+
+    A concurrency limit reaching the retry layer has already outlasted
+    :class:`ConcurrencyLimitRetryMiddleware`'s whole wait budget; three more
+    short retries would not clear it either, so hand it straight to the error
+    boundary, which pauses the run.
+    """
+    return _is_transient(exc) and not _is_concurrency_limit(exc)
 
 
 _CREDITS_MARKERS = ("requires more credits",)
@@ -280,6 +322,138 @@ class ModelErrorBoundaryMiddleware(AgentMiddleware):
             return self._handle(exc)
 
 
+class ConcurrencyLimitRetryMiddleware(AgentMiddleware):
+    """Wait out a concurrency-limit 429 instead of pausing the run over it.
+
+    The stock retry layer's budget (~7s over three retries) is far shorter than
+    one in-flight model call (tens of seconds), so a workspace-wide concurrency
+    limit routinely outlasted it and escalated to :class:`UsageLimitError` — a
+    full pause waiting on ``/continue`` for a condition that clears on its own.
+    This layer sits inside the retry layer and retries only concurrency limits,
+    with capped exponential backoff and jitter (so parallel sub-agents don't
+    retry in lockstep), until ``max_wait`` seconds have elapsed. Then it
+    re-raises, and :func:`_retry_on` sends the error straight to the boundary,
+    which pauses the run as before.
+    """
+
+    def __init__(
+        self,
+        max_wait: float,
+        *,
+        initial_delay: float = 2.0,
+        max_delay: float = 30.0,
+    ) -> None:
+        super().__init__()
+        self.max_wait = max_wait
+        self.initial_delay = initial_delay
+        self.max_delay = max_delay
+
+    def _next_delay(self, exc: Exception, attempt: int, started: float) -> float:
+        """Seconds to sleep before the next attempt; re-raise ``exc`` when spent."""
+        if not _is_concurrency_limit(exc):
+            raise exc
+        delay = min(self.initial_delay * 2.0**attempt, self.max_delay)
+        delay *= random.uniform(0.75, 1.25)
+        remaining = self.max_wait - (time.monotonic() - started)
+        if remaining <= 0:
+            raise exc
+        if attempt == 0:
+            notify_toast(
+                "Provider concurrency limit reached — waiting for a free slot "
+                f"(up to {self.max_wait:.0f}s) before retrying.",
+                severity="warning",
+                title="Concurrency limit",
+                timeout=8.0,
+            )
+        return min(delay, remaining)
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        started = time.monotonic()
+        attempt = 0
+        while True:
+            try:
+                return handler(request)
+            except GraphBubbleUp:
+                raise
+            except Exception as exc:
+                time.sleep(self._next_delay(exc, attempt, started))
+                attempt += 1
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        started = time.monotonic()
+        attempt = 0
+        while True:
+            try:
+                return await handler(request)
+            except GraphBubbleUp:
+                raise
+            except Exception as exc:
+                await asyncio.sleep(self._next_delay(exc, attempt, started))
+                attempt += 1
+
+
+# How often a coroutine waiting on the model-call limiter re-checks for a slot.
+# Polling (rather than ``to_thread(sem.acquire)``) keeps the wait cancellable
+# without leaking a slot to an orphaned acquiring thread.
+_LIMITER_POLL_SECONDS = 0.05
+
+
+class ModelConcurrencyLimitMiddleware(AgentMiddleware):
+    """Cap in-flight model calls across every agent sharing ``semaphore``.
+
+    The main agent and its sub-agents each build their own middleware stack,
+    so the cap only means something when they share one semaphore — see
+    :func:`_shared_model_semaphore`. A thread semaphore (not an asyncio one)
+    because sync and async callers, and possibly different event loops, draw
+    on the same budget. Placed innermost, so a call waiting out a backoff in
+    the retry layers does not hold a slot.
+    """
+
+    def __init__(self, semaphore: threading.Semaphore) -> None:
+        super().__init__()
+        self.semaphore = semaphore
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        with self.semaphore:
+            return handler(request)
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        while not self.semaphore.acquire(blocking=False):
+            await asyncio.sleep(_LIMITER_POLL_SECONDS)
+        try:
+            return await handler(request)
+        finally:
+            self.semaphore.release()
+
+
+_model_semaphores: dict[int, threading.BoundedSemaphore] = {}
+_model_semaphores_lock = threading.Lock()
+
+
+def _shared_model_semaphore(limit: int) -> threading.BoundedSemaphore:
+    """The process-wide semaphore for ``limit`` concurrent model calls."""
+    with _model_semaphores_lock:
+        if limit not in _model_semaphores:
+            _model_semaphores[limit] = threading.BoundedSemaphore(limit)
+        return _model_semaphores[limit]
+
+
 def is_truncated_message(msg: BaseMessage) -> bool:
     """Was this model response cut off at the output-token limit?
 
@@ -381,7 +555,8 @@ def _fallback_specs() -> list[str]:
 def build_model_resilience_middleware(
     resolve_model: ModelResolver,
 ) -> list[AgentMiddleware]:
-    """Model-call resilience: fallback (outer) > error boundary > retry (inner).
+    """Model-call resilience, outermost first: fallback > error boundary >
+    retry > concurrency-limit wait > concurrency cap.
 
     Fallback is listed first so it is the outermost wrapper: the primary model
     is retried on transient errors first, and only when the terminal-error
@@ -389,9 +564,14 @@ def build_model_resilience_middleware(
     configured model (which is then itself retried). The error boundary between
     them applies that policy to non-retryable errors, which the retry layer
     re-raises rather than routing to ``on_failure`` since langchain 1.3.16.
-    Omits the fallback layer when ``MODEL_FALLBACK`` is unset.
+    Concurrency-limit 429s are waited out below the retry layer, and the
+    optional cap sits innermost so only calls actually in flight hold a slot.
+    Omits the fallback layer when ``MODEL_FALLBACK`` is unset, and the cap when
+    ``MODEL_MAX_CONCURRENCY`` is.
     """
     max_retries = env_int("MODEL_MAX_RETRIES", 3)
+    concurrency_wait = env_float("MODEL_CONCURRENCY_WAIT", 300.0)
+    max_concurrency = env_int("MODEL_MAX_CONCURRENCY", 0)
     middleware: list[AgentMiddleware] = []
 
     fallbacks = _fallback_specs()
@@ -405,10 +585,15 @@ def build_model_resilience_middleware(
     middleware.append(
         ModelRetryMiddleware(
             max_retries=max_retries,
-            retry_on=_is_transient,
+            retry_on=_retry_on,
             on_failure=_on_model_retries_exhausted,
         )
     )
+    middleware.append(ConcurrencyLimitRetryMiddleware(concurrency_wait))
+    if max_concurrency:
+        middleware.append(
+            ModelConcurrencyLimitMiddleware(_shared_model_semaphore(max_concurrency))
+        )
     # Response-level (not exception-level) recovery: a max_tokens-truncated
     # response is a successful HTTP call the retry/fallback layers never see.
     middleware.append(TruncationRecoveryMiddleware())
