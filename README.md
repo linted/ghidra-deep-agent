@@ -75,6 +75,8 @@ All configuration is done via environment variables (`.env` file or shell export
 | `AUTO_MODE_DEBUG` | *(unset)* | Set to print one `[auto-mode]` line per verdict to stderr |
 | `MODEL_FALLBACK` | *(unset)* | Comma-separated `provider:model` fallbacks tried, in order, after the primary model's retries are exhausted |
 | `MODEL_MAX_RETRIES` | `3` | Retry attempts per model call on transient errors (5xx/429/timeouts) |
+| `MODEL_CONCURRENCY_WAIT` | `300` | Seconds to keep retrying a "concurrency limit" 429 (with backoff) before pausing the run |
+| `MODEL_MAX_CONCURRENCY` | *(unset)* | Cap on in-flight model calls across the main agent and all sub-agents; set it to your provider's concurrency limit to queue calls instead of drawing 429s |
 | `TOOL_MAX_RETRIES` | `3` | Retry attempts for transient filesystem-tool I/O errors |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL *(only needed if non-default)* |
 | `EMBED_MODEL` | `ollama:nomic-embed-text` | `provider:model` for embeddings — supports `ollama`, `openai`, `huggingface`, `cohere`, `automated` (MongoDB Atlas Automated Embeddings via Voyage AI; requires an Atlas cluster with Voyage AI configured at the project level, e.g. `automated:voyage-4`) |
@@ -364,6 +366,7 @@ Long runs that fan out to several sub-agents can hit a provider usage limit (for
 
 - Every completed step is durable in the MongoDB checkpointer (thread = session ID). That includes the conversation history, any files the agent wrote, knowledge-base entries, and the results of sub-agents that already finished — LangGraph restores those from *pending writes* and does **not** re-run them.
 - Only the single in-flight model call is discarded. The middleware retries a limit a few times ([`MODEL_MAX_RETRIES`](#configuration)); if it can't clear, the turn stops cleanly and the TUI shows a **paused** banner with your session ID instead of a generic error.
+- A *concurrency* limit ("your workspace has reached the concurrency limit") is different: it clears as soon as any in-flight call finishes, so it is waited out with backoff for up to [`MODEL_CONCURRENCY_WAIT`](#configuration) seconds before the run pauses. To avoid it altogether, set [`MODEL_MAX_CONCURRENCY`](#configuration) to the provider's limit.
 
 To continue once your limit resets:
 

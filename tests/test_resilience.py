@@ -11,6 +11,8 @@ Run:  uv run pytest tests/test_resilience.py -v
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from typing import Any
 
 import pytest
@@ -28,13 +30,18 @@ from langgraph.errors import GraphBubbleUp
 from ghidra_deep_agent.resilience import (
     _MAX_TRUNCATION_RECOVERIES,
     _TRUNCATION_NUDGE,
+    ConcurrencyLimitRetryMiddleware,
+    ModelConcurrencyLimitMiddleware,
     ModelErrorBoundaryMiddleware,
     TruncationRecoveryMiddleware,
     UsageLimitError,
+    _is_concurrency_limit,
     _is_out_of_credits,
     _is_transient,
     _is_usage_limit,
     _on_model_retries_exhausted,
+    _retry_on,
+    _shared_model_semaphore,
     build_model_resilience_middleware,
     is_truncated_message,
 )
@@ -341,6 +348,198 @@ def test_boundary_is_wired_directly_outside_the_retry_layer() -> None:
     # Adjacent, boundary outside: with MODEL_FALLBACK set the fallback layer
     # wraps both, so a usage-limit halt still triggers the fallback models.
     assert boundary == retry - 1
+
+
+# --- concurrency limits ---------------------------------------------------------
+
+# Verbatim from the OpenCode gateway, as the openai SDK formats it.
+_CONCURRENCY_429 = "Error code: 429 - Your workspace has reached the concurrency limit"
+
+
+def test_concurrency_429_is_a_concurrency_limit() -> None:
+    assert _is_concurrency_limit(ModelRateLimitError(_CONCURRENCY_429)) is True
+    assert _is_concurrency_limit(_StatusError("too many concurrent requests", 429))
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ModelRateLimitError("Rate limit exceeded: 50 requests per minute"),
+        _StatusError("insufficient_quota", 429),
+        # Mentions concurrency but isn't a rate limit at all.
+        _StatusError("invalid concurrency limit setting", 400),
+    ],
+)
+def test_other_errors_are_not_concurrency_limits(exc: Exception) -> None:
+    assert _is_concurrency_limit(exc) is False
+
+
+def test_retry_layer_skips_concurrency_limits_but_keeps_other_transients() -> None:
+    assert _retry_on(ModelRateLimitError(_CONCURRENCY_429)) is False
+    assert _retry_on(ModelRateLimitError("Rate limit exceeded")) is True
+    assert _retry_on(_StatusError("bad gateway", 502)) is True
+
+
+def _flaky(failures: int, exc: Exception) -> tuple[list[int], Any]:
+    """A model handler that raises ``exc`` ``failures`` times, then succeeds."""
+    calls: list[int] = []
+
+    def handler(request: Any) -> Any:
+        calls.append(1)
+        if len(calls) <= failures:
+            raise exc
+        return ModelResponse(result=[AIMessage("ok")])
+
+    return calls, handler
+
+
+def _fast_wait(max_wait: float = 5.0) -> ConcurrencyLimitRetryMiddleware:
+    return ConcurrencyLimitRetryMiddleware(
+        max_wait, initial_delay=0.001, max_delay=0.005
+    )
+
+
+def test_concurrency_limit_is_waited_out(
+    captured_toasts: list[ToastRequest],
+) -> None:
+    calls, handler = _flaky(5, ModelRateLimitError(_CONCURRENCY_429))
+    response = _fast_wait().wrap_model_call(None, handler)  # type: ignore[arg-type]
+    assert response.result[0].content == "ok"
+    assert len(calls) == 6
+    # One heads-up per call, not one per retry.
+    assert [t.title for t in captured_toasts] == ["Concurrency limit"]
+
+
+def test_async_concurrency_limit_is_waited_out() -> None:
+    calls, sync_handler = _flaky(3, ModelRateLimitError(_CONCURRENCY_429))
+
+    async def handler(request: Any) -> Any:
+        return sync_handler(request)
+
+    response = asyncio.run(
+        _fast_wait().awrap_model_call(None, handler)  # type: ignore[arg-type]
+    )
+    assert response.result[0].content == "ok"
+    assert len(calls) == 4
+
+
+def test_other_errors_pass_through_the_concurrency_wait_untouched() -> None:
+    original = ModelRateLimitError("Rate limit exceeded")
+    calls, handler = _flaky(1, original)
+    with pytest.raises(ModelRateLimitError) as excinfo:
+        _fast_wait().wrap_model_call(None, handler)  # type: ignore[arg-type]
+    assert excinfo.value is original
+    assert len(calls) == 1
+
+
+def test_an_outlasting_concurrency_limit_pauses_without_more_retries() -> None:
+    """Through the real stack: wait budget spent -> UsageLimitError, and the
+    stock retry layer adds no extra short retries on top."""
+    original = ModelRateLimitError(_CONCURRENCY_429)
+    calls: list[int] = []
+
+    def model(request: Any) -> Any:
+        calls.append(1)
+        raise original
+
+    wait = ConcurrencyLimitRetryMiddleware(0.05, initial_delay=0.01, max_delay=0.01)
+    retry = ModelRetryMiddleware(
+        max_retries=3,
+        retry_on=_retry_on,
+        on_failure=_on_model_retries_exhausted,
+        initial_delay=0.0,
+    )
+
+    def through_wait(request: Any) -> Any:
+        return wait.wrap_model_call(request, model)
+
+    def through_retry(request: Any) -> Any:
+        return retry.wrap_model_call(request, through_wait)
+
+    started = time.monotonic()
+    with pytest.raises(UsageLimitError) as excinfo:
+        ModelErrorBoundaryMiddleware().wrap_model_call(
+            None,  # type: ignore[arg-type]
+            through_retry,
+        )
+    assert excinfo.value.original is original
+    assert time.monotonic() - started >= 0.05
+    # Only the wait layer's attempts: one pass through it, no outer retries.
+    first_pass = len(calls)
+    assert 2 <= first_pass <= 10
+
+
+def test_concurrency_cap_serializes_async_calls() -> None:
+    limiter = ModelConcurrencyLimitMiddleware(threading.BoundedSemaphore(2))
+    in_flight = 0
+    peak = 0
+
+    async def handler(request: Any) -> Any:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.02)
+        in_flight -= 1
+        return ModelResponse(result=[AIMessage("ok")])
+
+    async def run() -> None:
+        await asyncio.gather(
+            *(limiter.awrap_model_call(None, handler) for _ in range(6))  # type: ignore[arg-type]
+        )
+
+    asyncio.run(run())
+    assert peak == 2
+
+
+def test_concurrency_cap_releases_the_slot_on_cancel_and_error() -> None:
+    semaphore = threading.BoundedSemaphore(1)
+    limiter = ModelConcurrencyLimitMiddleware(semaphore)
+
+    async def hang(request: Any) -> Any:
+        await asyncio.sleep(10)
+
+    async def fail(request: Any) -> Any:
+        raise RuntimeError("boom")
+
+    async def run() -> None:
+        task = asyncio.ensure_future(limiter.awrap_model_call(None, hang))  # type: ignore[arg-type]
+        await asyncio.sleep(0.01)
+        # A second caller queued behind the hung one, then cancelled while waiting.
+        waiter = asyncio.ensure_future(limiter.awrap_model_call(None, hang))  # type: ignore[arg-type]
+        await asyncio.sleep(0.01)
+        waiter.cancel()
+        task.cancel()
+        await asyncio.gather(task, waiter, return_exceptions=True)
+        with pytest.raises(RuntimeError):
+            await limiter.awrap_model_call(None, fail)  # type: ignore[arg-type]
+
+    asyncio.run(run())
+    assert semaphore.acquire(blocking=False)
+
+
+def test_concurrency_layers_are_wired_inside_the_retry_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MODEL_MAX_CONCURRENCY", raising=False)
+    kinds = [type(m) for m in build_model_resilience_middleware(lambda s: s or "m")]
+    assert kinds.index(ConcurrencyLimitRetryMiddleware) == (
+        kinds.index(ModelRetryMiddleware) + 1
+    )
+    # The cap is opt-in.
+    assert ModelConcurrencyLimitMiddleware not in kinds
+
+    monkeypatch.setenv("MODEL_MAX_CONCURRENCY", "3")
+    main = build_model_resilience_middleware(lambda s: s or "m")
+    sub = build_model_resilience_middleware(lambda s: s or "m")
+    kinds = [type(m) for m in main]
+    # Innermost of the wrappers: a call sleeping in a backoff holds no slot.
+    assert kinds.index(ModelConcurrencyLimitMiddleware) == (
+        kinds.index(ConcurrencyLimitRetryMiddleware) + 1
+    )
+    (cap_main,) = [m for m in main if isinstance(m, ModelConcurrencyLimitMiddleware)]
+    (cap_sub,) = [m for m in sub if isinstance(m, ModelConcurrencyLimitMiddleware)]
+    # Main agent and sub-agents draw on one budget.
+    assert cap_main.semaphore is cap_sub.semaphore is _shared_model_semaphore(3)
 
 
 # --- truncation recovery --------------------------------------------------------
