@@ -254,7 +254,7 @@ class Storage(NamedTuple):
 
     backend: Any
     # Syncs AGENT_OUTPUT_DIR to/from the sandbox each turn; None when not sandboxed.
-    sync_middleware: Any
+    sync_middleware: SandboxSyncMiddleware | None
     # Appended to every agent prompt when sandboxed, so the model knows it has a
     # shell and where durable files belong. Empty otherwise.
     prompt_guidance: str
@@ -314,12 +314,21 @@ async def _open_backend(stack: contextlib.AsyncExitStack) -> Storage:
     # Files live in the sandbox; the middleware makes AGENT_OUTPUT_DIR the
     # durable local mirror, synced in before and out after a turn. Sync uses the
     # raw sandbox backend (the host mirror is not the skills mount).
-    return Storage(
-        wrap(backend),
-        SandboxSyncMiddleware(backend, Path(output_dir)),
-        sandbox_guidance,
-        skill_names,
-    )
+    sync = SandboxSyncMiddleware(backend, Path(output_dir))
+    # A last sync-back on the way out. Registered after the sandbox was entered,
+    # so the stack's LIFO unwind runs it *before* teardown destroys the sandbox.
+    # It rescues work from a turn that never reached the per-turn sync-back —
+    # e.g. one cancelled, or cut short by quitting mid-run.
+    stack.push_async_callback(_final_sync_back, sync)
+    return Storage(wrap(backend), sync, sandbox_guidance, skill_names)
+
+
+async def _final_sync_back(sync: SandboxSyncMiddleware) -> None:
+    """Pull the sandbox's files home one last time before it is torn down."""
+    try:
+        await sync.sync_back()
+    except Exception as exc:  # shutdown must continue to teardown regardless
+        print(f"Warning: final sandbox sync-back failed: {exc}", file=sys.stderr)
 
 
 class MongoConfig(NamedTuple):
@@ -674,6 +683,7 @@ async def main() -> None:
                 max_context_tokens=ctx_max,
                 session_store=session_store,
                 binary_name=binary_name,
+                sandbox_sync=storage.sync_middleware,
             )
             await app.run_async()
     except ServerSelectionTimeoutError as e:

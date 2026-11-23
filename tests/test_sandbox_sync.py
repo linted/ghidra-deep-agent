@@ -150,7 +150,7 @@ def test_first_seed_uploads_all_then_noop(tmp_path: Path) -> None:
     backend = FakeSandboxBackend()
     mw = _mw(backend, tmp_path)
 
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
     assert len(backend.upload_calls) == 1
     assert {p for p, _ in backend.upload_calls[0]} == {
         "/workspace/a.txt",
@@ -158,7 +158,7 @@ def test_first_seed_uploads_all_then_noop(tmp_path: Path) -> None:
     }
 
     # Nothing changed: a second seed uploads nothing at all.
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
     assert len(backend.upload_calls) == 1
 
 
@@ -172,7 +172,7 @@ def test_unchanged_files_are_not_reread(tmp_path: Path, monkeypatch: Any) -> Non
     _write(tmp_path, "sub/b.txt", b"bravo")
     backend = FakeSandboxBackend()
     mw = _mw(backend, tmp_path)
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
 
     reads: list[str] = []
     real_read_bytes = Path.read_bytes
@@ -183,12 +183,12 @@ def test_unchanged_files_are_not_reread(tmp_path: Path, monkeypatch: Any) -> Non
 
     monkeypatch.setattr(Path, "read_bytes", counting_read_bytes)
 
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
     assert reads == []
 
     # A real edit is still picked up (mtime and size both move).
     _write(tmp_path, "a.txt", b"alpha-v2-longer")
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
     assert reads == ["a.txt"]
 
 
@@ -197,10 +197,10 @@ def test_same_size_edit_is_still_detected(tmp_path: Path) -> None:
     _write(tmp_path, "a.txt", b"alpha")
     backend = FakeSandboxBackend()
     mw = _mw(backend, tmp_path)
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
 
     _write(tmp_path, "a.txt", b"ALPHA")
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
 
     assert backend.upload_calls[-1] == [("/workspace/a.txt", b"ALPHA")]
 
@@ -219,7 +219,7 @@ def test_oversize_file_is_never_read(tmp_path: Path, monkeypatch: Any) -> None:
         return real_read_bytes(self)
 
     monkeypatch.setattr(Path, "read_bytes", counting_read_bytes)
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
 
     assert reads == []
     assert backend.upload_calls == []
@@ -229,10 +229,10 @@ def test_locally_changed_file_reuploads(tmp_path: Path) -> None:
     _write(tmp_path, "a.txt", b"alpha")
     backend = FakeSandboxBackend()
     mw = _mw(backend, tmp_path)
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
 
     _write(tmp_path, "a.txt", b"alpha-v2")
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
 
     assert len(backend.upload_calls) == 2
     assert backend.upload_calls[1] == [("/workspace/a.txt", b"alpha-v2")]
@@ -242,19 +242,19 @@ def test_remote_change_downloads_back(tmp_path: Path) -> None:
     _write(tmp_path, "a.txt", b"alpha")
     backend = FakeSandboxBackend()
     mw = _mw(backend, tmp_path)
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
 
     # Agent edits the file and creates a new one inside the sandbox.
     backend.fs["/workspace/a.txt"] = b"edited-in-sandbox"
     backend.fs["/workspace/report.md"] = b"# findings"
-    asyncio.run(mw._sync_back())
+    asyncio.run(mw.sync_back())
 
     assert (tmp_path / "a.txt").read_bytes() == b"edited-in-sandbox"
     assert (tmp_path / "report.md").read_bytes() == b"# findings"
 
     # Manifest now matches the sandbox: a follow-up sync-back downloads nothing new.
     (tmp_path / "a.txt").write_bytes(b"local-only-change-not-synced-back")
-    asyncio.run(mw._sync_back())
+    asyncio.run(mw.sync_back())
     # unchanged remote content -> local file left as the test just wrote it
     assert (tmp_path / "a.txt").read_bytes() == b"local-only-change-not-synced-back"
 
@@ -271,7 +271,7 @@ def test_seed_follows_directory_symlink(tmp_path: Path) -> None:
     backend = FakeSandboxBackend()
     mw = _mw(backend, local)
 
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
     assert {p for p, _ in backend.upload_calls[0]} == {
         "/workspace/questions/notes.md",
         "/workspace/questions/sub/deep.md",
@@ -279,7 +279,7 @@ def test_seed_follows_directory_symlink(tmp_path: Path) -> None:
 
     # An edit in the *target* directory is still detected through the link.
     (target / "notes.md").write_bytes(b"question one, revised")
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
     assert backend.upload_calls[-1] == [
         ("/workspace/questions/notes.md", b"question one, revised")
     ]
@@ -296,7 +296,7 @@ def test_sync_back_writes_through_directory_symlink(tmp_path: Path) -> None:
     mw = _mw(backend, local)
 
     backend.fs["/workspace/questions/answer.md"] = b"# solved"
-    asyncio.run(mw._sync_back())
+    asyncio.run(mw.sync_back())
 
     assert (target / "answer.md").read_bytes() == b"# solved"
     assert (local / "questions" / "answer.md").read_bytes() == b"# solved"
@@ -309,7 +309,7 @@ def test_oversize_file_skipped_with_toast(tmp_path: Path) -> None:
     backend = FakeSandboxBackend()
     mw = _mw(backend, tmp_path, max_bytes=10)
 
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
 
     assert backend.upload_calls == []  # nothing uploaded
     assert any("big.bin" in t.message for t in toasts)
@@ -336,9 +336,9 @@ def test_upload_error_keeps_file_out_of_manifest(tmp_path: Path) -> None:
     backend.upload_errors.add("/workspace/a.txt")
     mw = _mw(backend, tmp_path)
 
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
     # Errored upload is not recorded, so the next seed retries it.
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
 
     assert len(backend.upload_calls) == 2
     assert backend.upload_calls[1] == [("/workspace/a.txt", b"alpha")]
@@ -352,9 +352,9 @@ def test_upload_error_toasts_once_with_detail(tmp_path: Path) -> None:
     backend.upload_errors.add("/workspace/a.txt")
     mw = _mw(backend, tmp_path)
 
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
     # The retry next turn must not re-toast for the same relpath.
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
 
     failure_toasts = [t for t in toasts if "could not upload" in t.message]
     assert len(failure_toasts) == 1
@@ -393,7 +393,7 @@ def test_listing_failure_toasts(tmp_path: Path) -> None:
 def test_listing_command_uses_double_dash(tmp_path: Path) -> None:
     backend = FakeSandboxBackend()
     mw = _mw(backend, tmp_path)
-    asyncio.run(mw._sync_back())
+    asyncio.run(mw.sync_back())
     assert any("sha256sum -- {}" in c for c in backend.commands)
 
 
@@ -401,7 +401,7 @@ def test_listing_command_excludes_seed_tarball(tmp_path: Path) -> None:
     """A tarball orphaned by an interrupted extract must never sync back."""
     backend = FakeSandboxBackend()
     mw = _mw(backend, tmp_path)
-    asyncio.run(mw._sync_back())
+    asyncio.run(mw.sync_back())
     listing = next(c for c in backend.commands if "sha256sum" in c)
     assert f"! -name {_SEED_TAR_NAME}" in listing
 
@@ -418,7 +418,7 @@ def test_bulk_seed_uses_single_tarball(tmp_path: Path) -> None:
     backend = FakeSandboxBackend()
     mw = _mw(backend, tmp_path)  # default threshold: 4 files
 
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
 
     # One upload (the tarball), one extract exec; every file lands in place.
     assert len(backend.upload_calls) == 1
@@ -430,7 +430,7 @@ def test_bulk_seed_uses_single_tarball(tmp_path: Path) -> None:
     assert seed_tar not in backend.fs  # cleaned up after extract
 
     # Manifest primed by the tar path: a second seed transfers nothing.
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
     assert len(backend.upload_calls) == 1
 
 
@@ -439,7 +439,7 @@ def test_bulk_seed_below_threshold_stays_per_file(tmp_path: Path) -> None:
     backend = FakeSandboxBackend()
     mw = _mw(backend, tmp_path)
 
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
 
     assert len(backend.upload_calls) == 1
     assert len(backend.upload_calls[0]) == 3  # individual files, no tarball
@@ -454,7 +454,7 @@ def test_bulk_seed_extract_failure_falls_back_to_per_file(tmp_path: Path) -> Non
     backend.tar_exit = 127  # e.g. image without tar
     mw = _mw(backend, tmp_path)
 
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
 
     # Tarball upload, then the per-file fallback batch.
     assert len(backend.upload_calls) == 2
@@ -464,7 +464,7 @@ def test_bulk_seed_extract_failure_falls_back_to_per_file(tmp_path: Path) -> Non
     assert any("bulk seed" in t.message.lower() for t in toasts)
 
     # Fallback still primes the manifest: a second seed transfers nothing.
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
     assert len(backend.upload_calls) == 2
 
 
@@ -474,7 +474,7 @@ def test_bulk_seed_tarball_upload_error_falls_back(tmp_path: Path) -> None:
     backend.upload_errors.add(f"{backend.remote_root}/{_SEED_TAR_NAME}")
     mw = _mw(backend, tmp_path)
 
-    asyncio.run(mw._seed())
+    asyncio.run(mw.seed())
 
     assert len(backend.upload_calls) == 2  # failed tarball, then per-file batch
     for rel, data in files.items():

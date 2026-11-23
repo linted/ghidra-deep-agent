@@ -11,6 +11,7 @@ import pytest
 
 from ghidra_deep_agent.compaction import ManualCompactionResult
 from ghidra_deep_agent.resilience import UsageLimitError
+from ghidra_deep_agent.toasts import ToastRequest, register_toast_sink
 from ghidra_deep_agent.tui import GhidraAgentApp
 from ghidra_deep_agent.tui.commands import COMMANDS, help_lines
 from ghidra_deep_agent.tui.events import handle_event, parse_checkpoint_ns
@@ -1092,5 +1093,124 @@ def test_usage_limit_banner_in_plan_mode_omits_relaunch() -> None:
             joined = "\n".join(writes)
             assert "plan-mode" in joined
             assert "--session-id" not in joined
+
+    asyncio.run(run())
+
+
+class _RecordingSync:
+    """Stands in for SandboxSyncMiddleware; records which directions ran."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.calls: list[str] = []
+        self.fail = fail
+
+    async def seed(self) -> None:
+        self.calls.append("seed")
+        if self.fail:
+            raise RuntimeError("sandbox gone")
+
+    async def sync_back(self) -> None:
+        self.calls.append("sync_back")
+        if self.fail:
+            raise RuntimeError("sandbox gone")
+
+
+class _ErrorAgent:
+    """A stub whose stream crashes with an ordinary error."""
+
+    async def astream_events(
+        self, _input: Any, config: Any, version: str
+    ) -> AsyncIterator[dict[str, Any]]:
+        raise RuntimeError("boom")
+        yield  # pragma: no cover - marks this an async generator
+
+
+def _make_synced_app(agent: Any, sync: _RecordingSync) -> GhidraAgentApp:
+    app = _make_app(agent)
+    app._sandbox_sync = sync  # type: ignore[assignment]
+    return app
+
+
+def test_usage_limit_pause_syncs_sandbox_back() -> None:
+    """A paused turn never reaches the `after_agent` sync-back, so the TUI must
+    pull the sandbox's files home itself — else they die with the sandbox."""
+
+    async def run() -> None:
+        sync = _RecordingSync()
+        app = _make_synced_app(_LimitAgent(), sync)
+        async with app.run_test() as pilot:
+            app._start_run("turn", "hi")
+            await pilot.pause(0.3)
+        assert sync.calls == ["sync_back"]
+
+    asyncio.run(run())
+
+
+def test_crashed_turn_syncs_sandbox_back() -> None:
+    async def run() -> None:
+        sync = _RecordingSync()
+        app = _make_synced_app(_ErrorAgent(), sync)
+        async with app.run_test() as pilot:
+            app._start_run("turn", "hi")
+            await pilot.pause(0.3)
+        assert sync.calls == ["sync_back"]
+
+    asyncio.run(run())
+
+
+def test_completed_turn_leaves_sync_to_the_middleware() -> None:
+    """A turn that runs to the end is synced by the graph's own hooks."""
+
+    async def run() -> None:
+        sync = _RecordingSync()
+        app = _make_synced_app(StubAgent(), sync)
+        async with app.run_test() as pilot:
+            app._start_run("turn", "hi")
+            await pilot.pause(0.3)
+        assert sync.calls == []
+
+    asyncio.run(run())
+
+
+def test_continue_seeds_sandbox_before_resuming() -> None:
+    """`/continue` replays past the checkpointed `before_agent` seed, so after a
+    relaunch the fresh sandbox would start empty unless the TUI seeds it."""
+
+    async def run() -> None:
+        sync = _RecordingSync()
+        seen: list[list[str]] = []
+
+        class _Recorder(StubAgent):
+            async def astream_events(
+                self, _input: Any, config: Any, version: str
+            ) -> AsyncIterator[dict[str, Any]]:
+                seen.append(list(sync.calls))
+                async for event in super().astream_events(_input, config, version):
+                    yield event
+
+        app = _make_synced_app(_Recorder(), sync)
+        async with app.run_test() as pilot:
+            app._resume_run()
+            await pilot.pause(0.3)
+        assert seen == [["seed"]]
+
+    asyncio.run(run())
+
+
+def test_sandbox_sync_failure_toasts_instead_of_raising() -> None:
+    async def run() -> None:
+        sync = _RecordingSync(fail=True)
+        app = _make_synced_app(_LimitAgent(), sync)
+        toasts: list[ToastRequest] = []
+        unregister = register_toast_sink(toasts.append)
+        try:
+            async with app.run_test() as pilot:
+                app._start_run("turn", "hi")
+                await pilot.pause(0.3)
+                assert not app._agent_running
+        finally:
+            unregister()
+        assert sync.calls == ["sync_back"]
+        assert any("sync-back failed" in t.message for t in toasts)
 
     asyncio.run(run())
