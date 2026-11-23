@@ -13,6 +13,14 @@ direction. Directory symlinks inside ``AGENT_OUTPUT_DIR`` are followed on seed,
 so an external directory can be symlinked into the sync root. Files deleted
 inside the sandbox are left in place locally. Any sync failure is surfaced as a
 warning toast and swallowed — a sandbox hiccup must never kill the turn.
+
+The ``after_agent`` hook only runs when a turn completes. A turn that ends early
+— paused on a usage limit, crashed, or cancelled — skips it, so the TUI calls
+:meth:`SandboxSyncMiddleware.sync_back` itself on those paths and the CLI calls
+it once more at shutdown, before the sandbox is torn down. Likewise a
+``/continue`` resumes past the already-checkpointed ``before_agent`` node, so
+the TUI calls :meth:`SandboxSyncMiddleware.seed` before resuming; that is what
+repopulates a fresh sandbox when a paused session is resumed after a relaunch.
 """
 
 from __future__ import annotations
@@ -110,7 +118,7 @@ class SandboxSyncMiddleware(AgentMiddleware):
         self, state: AgentState, runtime: Runtime[Any]
     ) -> dict[str, Any] | None:
         try:
-            await self._seed()
+            await self.seed()
         except Exception as exc:  # a sync hiccup must not kill the turn
             notify_toast(
                 f"Sandbox seed failed: {exc}", severity="warning", title="Sandbox"
@@ -121,7 +129,7 @@ class SandboxSyncMiddleware(AgentMiddleware):
         self, state: AgentState, runtime: Runtime[Any]
     ) -> dict[str, Any] | None:
         try:
-            await self._sync_back()
+            await self.sync_back()
         except Exception as exc:  # a sync hiccup must not kill the turn
             notify_toast(
                 f"Sandbox sync-back failed: {exc}", severity="warning", title="Sandbox"
@@ -203,8 +211,13 @@ class SandboxSyncMiddleware(AgentMiddleware):
             pending[remote] = (rel, digest)
         return uploads, pending, oversize
 
-    async def _seed(self) -> None:
-        """Upload new/changed local files into the sandbox."""
+    async def seed(self) -> None:
+        """Upload new/changed local files into the sandbox.
+
+        Raises on a backend failure; the ``before_agent`` hook turns that into a
+        toast. Public so the TUI can seed before a ``/continue``, which resumes
+        past the checkpointed ``before_agent`` node and so never re-runs it.
+        """
         if not self._local_dir.is_dir():
             return
         # Off the event loop: the walk, the reads, and the hashing are all
@@ -322,8 +335,14 @@ class SandboxSyncMiddleware(AgentMiddleware):
             title="Sandbox",
         )
 
-    async def _sync_back(self) -> None:
-        """Download files changed inside the sandbox back to the local dir."""
+    async def sync_back(self) -> None:
+        """Download files changed inside the sandbox back to the local dir.
+
+        Raises on a backend failure; the ``after_agent`` hook turns that into a
+        toast. Public because that hook never runs for a turn that ends early
+        (usage-limit pause, error, cancel), so the TUI and the CLI's shutdown
+        path call this directly to keep that turn's work from being lost.
+        """
         # Ensure the root exists first, so a missing directory can't masquerade
         # as an empty listing; then a `cd` failure is a genuine error to raise.
         await self._ensure_root()

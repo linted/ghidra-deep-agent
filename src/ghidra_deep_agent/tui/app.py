@@ -6,7 +6,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.language_models import BaseChatModel
 from rich.rule import Rule
@@ -31,6 +31,7 @@ from ghidra_deep_agent.prompt import (
     PLAN_CONTEXT_SUMMARY_PROMPT,
 )
 from ghidra_deep_agent.resilience import UsageLimitError
+from ghidra_deep_agent.sandbox_sync import SandboxSyncMiddleware
 from ghidra_deep_agent.sessions import SessionStore
 from ghidra_deep_agent.toasts import ToastRequest, notify_toast, register_toast_sink
 from ghidra_deep_agent.tui.commands import COMMANDS_BY_NAME
@@ -134,6 +135,7 @@ class GhidraAgentApp(App[None]):
         max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
         session_store: SessionStore | None = None,
         binary_name: str = "",
+        sandbox_sync: SandboxSyncMiddleware | None = None,
     ) -> None:
         super().__init__()
         self._agent = agent
@@ -163,6 +165,10 @@ class GhidraAgentApp(App[None]):
         self._session_id = session_id
         self._session_store = session_store
         self._binary_name = binary_name
+        # Mirrors AGENT_OUTPUT_DIR in and out of the sandbox; None when not
+        # sandboxed or not syncing. Its hooks cover turns that run start to end;
+        # `_run_agent` drives it directly for resumed and early-ended turns.
+        self._sandbox_sync = sandbox_sync
         self._agent_running = False
         self._agent_worker: Worker[None] | None = None
         self._unregister_toast_sink: Callable[[], None] | None = None
@@ -783,6 +789,27 @@ class GhidraAgentApp(App[None]):
             time.monotonic() - self._run_start
         )
 
+    async def _sync_sandbox(self, direction: Literal["seed", "sync_back"]) -> None:
+        """Seed or sync back the sandbox outside the graph's own hooks.
+
+        ``direction`` is ``"seed"`` or ``"sync_back"``. A no-op when there is no
+        sandbox sync. Failures toast rather than raise, matching the hooks: a
+        sync hiccup must not turn a pause into a crash.
+        """
+        sync = self._sandbox_sync
+        if sync is None:
+            return
+        try:
+            if direction == "seed":
+                await sync.seed()
+            else:
+                await sync.sync_back()
+        except Exception as exc:
+            label = "seed" if direction == "seed" else "sync-back"
+            notify_toast(
+                f"Sandbox {label} failed: {exc}", severity="warning", title="Sandbox"
+            )
+
     @work(exclusive=True)
     async def _run_agent(self, query: str | None) -> None:
         # Pick the graph AND its thread config together, captured for the lifetime
@@ -803,7 +830,11 @@ class GhidraAgentApp(App[None]):
             # Resume (`/continue`): re-invoke with no input so LangGraph replays
             # from the last checkpoint on this thread — only the failed task
             # re-runs, completed sub-agents are restored from pending writes.
+            # That replay skips the checkpointed `before_agent` seed, so seed
+            # here: after a relaunch the sandbox is brand new and empty (in the
+            # same session this is a cheap no-op).
             input_data = None
+            await self._sync_sandbox("seed")
         else:
             messages: list[dict[str, str]] = []
             # On the first turn of a side-mode, seed its fresh thread with a
@@ -868,10 +899,14 @@ class GhidraAgentApp(App[None]):
                     "and then run [b]/continue[/b]."
                 )
             response.write(Rule(style="yellow"))
+            # The turn ended before the `after_agent` sync-back, so pull this
+            # turn's sandbox files home now — the sandbox dies with the app.
+            await self._sync_sandbox("sync_back")
         except Exception as exc:
             response.write(Rule(style="red"))
             response.write(Text(f"✗ Error: {exc}", style="bold red"))
             response.write(Rule(style="red"))
+            await self._sync_sandbox("sync_back")
         finally:
             # Runs on cancellation too (CancelledError is a BaseException and
             # is not swallowed above), so the UI always returns to idle.
