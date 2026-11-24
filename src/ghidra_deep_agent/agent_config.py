@@ -110,6 +110,7 @@ MUTATION_TOOLS = frozenset(
         "create_script",
         "delete_script",
         "run_script",
+        "run_script_with_file_output",  # run_script + deliver files to sandbox
         # local script-driven tools
         "recover_prototypes",  # commits recovered prototypes
         "apply_switch_override",  # writes jump-table overrides
