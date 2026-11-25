@@ -120,6 +120,9 @@ _MUTATING_TOOLS = frozenset(
         # Fully general mutation path: an agent with `run_script` can run
         # arbitrary Ghidra scripts, including ones that rename/retype/patch.
         "run_script",
+        # Local tool (script_file_tools.py) wrapping `run_script`: the same
+        # arbitrary script, so the same reason to flush.
+        "run_script_with_file_output",
         # Local tool (prototype_tools.py) that commits recovered prototypes via a
         # Ghidra script. It's the name seen in the graph — the coordinator calls
         # it, not `run_script` — so invalidation keys on it here.

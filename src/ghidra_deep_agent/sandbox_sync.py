@@ -31,6 +31,8 @@ import io
 import os
 import shlex
 import tarfile
+import uuid
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -48,9 +50,18 @@ _DEFAULT_TAR_MIN_FILES = 4
 _TAR_MIN_FILES_ENV = "SANDBOX_SYNC_TAR_MIN_FILES"
 
 # Staged inside the sync root — the only path guaranteed writable under the
-# sandbox's Landlock policy (/tmp is not). The sync-back ``find`` excludes it
-# by name, and the extract command removes it even when extraction fails.
-_SEED_TAR_NAME = ".ghidra_seed.tar.gz"
+# sandbox's Landlock policy (/tmp is not). Each upload gets its own name so
+# concurrent uploads into one directory can't overwrite or delete each other's
+# tarball. The sync-back ``find`` excludes the whole pattern (which also covers
+# the older fixed name, ``.ghidra_seed.tar.gz``), and the extract command
+# removes the tarball even when extraction fails.
+_SEED_TAR_PREFIX = ".ghidra_seed"
+SEED_TAR_GLOB = f"{_SEED_TAR_PREFIX}*.tar.gz"
+
+
+def staged_tar_name() -> str:
+    """A fresh, unique name for a staged upload tarball."""
+    return f"{_SEED_TAR_PREFIX}.{uuid.uuid4().hex}.tar.gz"
 
 
 def _default_max_bytes() -> int:
@@ -75,6 +86,54 @@ def _default_tar_min_files() -> int:
     except ValueError:
         return _DEFAULT_TAR_MIN_FILES
     return value if value > 0 else _DEFAULT_TAR_MIN_FILES
+
+
+def build_tar(items: Sequence[tuple[str, bytes]]) -> bytes:
+    """Gzip ``(relpath, data)`` pairs into a tarball. Blocking — use ``to_thread``."""
+    buf = io.BytesIO()
+    # compresslevel=1: the payload is uploaded base64-encoded, so light
+    # compression already pays for itself; level 9 would just burn CPU.
+    with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=1) as tar:
+        for rel, data in items:
+            info = tarfile.TarInfo(name=rel)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+async def upload_via_tar(
+    backend: SandboxBackendProtocol,
+    remote_dir: str,
+    items: Sequence[tuple[str, bytes]],
+) -> str | None:
+    """Upload ``(relpath, data)`` pairs under ``remote_dir`` as one tarball.
+
+    Many small files cost one exec round-trip each when uploaded individually;
+    a single tarball turns that into one upload plus one extract. The tarball
+    is staged under a unique ``staged_tar_name()`` inside ``remote_dir`` — the
+    sync-back listing skips that pattern at any depth — and removed even when
+    extraction fails. Returns ``None`` on success, else a short error for the caller to
+    report before falling back to per-file uploads. ``remote_dir`` must exist.
+    """
+    # gzip is CPU-bound; keep it off the event loop.
+    payload = await asyncio.to_thread(build_tar, items)
+    staged = f"{remote_dir.rstrip('/')}/{staged_tar_name()}"
+    try:
+        responses = await backend.aupload_files([(staged, payload)])
+        if not responses or responses[0].error is not None:
+            error = responses[0].error if responses else "no response"
+            return f"tarball upload failed: {error}"
+        # `;` not `&&`: the tarball must be removed even when extraction fails,
+        # or a per-file fallback would leave it behind.
+        result = await backend.aexecute(
+            f"tar -xzf {shlex.quote(staged)} -C {shlex.quote(remote_dir)}; "
+            f"rc=$?; rm -f {shlex.quote(staged)}; exit $rc"
+        )
+    except Exception as exc:  # the caller falls back to per-file uploads
+        return str(exc)
+    if result.exit_code not in (0, None):
+        return f"extract exited {result.exit_code}: {result.output.strip()[:200]}"
+    return None
 
 
 class SandboxSyncMiddleware(AgentMiddleware):
@@ -274,56 +333,18 @@ class SandboxSyncMiddleware(AgentMiddleware):
     ) -> bool:
         """Upload all pending files as one gzipped tarball and extract it.
 
-        Many small files cost one exec round-trip each when uploaded
-        individually; a single tarball turns that into one upload plus one
-        extract. Returns True when every pending file landed (manifest
-        updated); False to make the caller fall back to per-file uploads —
-        e.g. when the sandbox image lacks ``tar``.
+        Returns True when every pending file landed (manifest updated); False
+        to make the caller fall back to per-file uploads — e.g. when the
+        sandbox image lacks ``tar``.
         """
-        # gzip is CPU-bound; keep it off the event loop.
-        payload = await asyncio.to_thread(self._build_tar, uploads, pending)
-        seed_tar = f"{self._remote_root}/{_SEED_TAR_NAME}"
-        try:
-            responses = await self._backend.aupload_files([(seed_tar, payload)])
-            if not responses or responses[0].error is not None:
-                error = responses[0].error if responses else "no response"
-                self._warn_tar_fallback(f"tarball upload failed: {error}")
-                return False
-            # `;` not `&&`: the tarball must be removed even when extraction
-            # fails, or the per-file fallback would leave it for the sync-back.
-            result = await self._backend.aexecute(
-                f"tar -xzf {shlex.quote(seed_tar)} "
-                f"-C {shlex.quote(self._remote_root)}; "
-                f"rc=$?; rm -f {shlex.quote(seed_tar)}; exit $rc"
-            )
-        except Exception as exc:  # fall back to per-file uploads
-            self._warn_tar_fallback(str(exc))
-            return False
-        if result.exit_code not in (0, None):
-            self._warn_tar_fallback(
-                f"extract exited {result.exit_code}: {result.output.strip()[:200]}"
-            )
+        items = [(pending[remote][0], data) for remote, data in uploads]
+        error = await upload_via_tar(self._backend, self._remote_root, items)
+        if error is not None:
+            self._warn_tar_fallback(error)
             return False
         for rel, digest in pending.values():
             self._manifest[rel] = digest
         return True
-
-    @staticmethod
-    def _build_tar(
-        uploads: list[tuple[str, bytes]],
-        pending: dict[str, tuple[str, str]],
-    ) -> bytes:
-        """Build the gzipped seed tarball. Blocking — call via ``to_thread``."""
-        buf = io.BytesIO()
-        # compresslevel=1: the payload is uploaded base64-encoded, so light
-        # compression already pays for itself; level 9 would just burn CPU.
-        with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=1) as tar:
-            for remote, data in uploads:
-                rel, _digest = pending[remote]
-                info = tarfile.TarInfo(name=rel)
-                info.size = len(data)
-                tar.addfile(info, io.BytesIO(data))
-        return buf.getvalue()
 
     def _warn_tar_fallback(self, detail: str) -> None:
         if self._warned_tar_fallback:
@@ -348,7 +369,7 @@ class SandboxSyncMiddleware(AgentMiddleware):
         await self._ensure_root()
         listing = await self._backend.aexecute(
             f"cd {shlex.quote(self._remote_root)} && "
-            f"find . -type f ! -name {shlex.quote(_SEED_TAR_NAME)} "
+            f"find . -type f ! -name {shlex.quote(SEED_TAR_GLOB)} "
             "-printf '%s ' -exec sha256sum -- {} \\;"
         )
         if listing.exit_code not in (0, None):

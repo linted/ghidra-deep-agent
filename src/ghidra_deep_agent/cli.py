@@ -19,6 +19,7 @@ from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
 from deepagents.backends.composite import CompositeBackend
 from deepagents.backends.filesystem import FilesystemBackend
+from deepagents.backends.protocol import SandboxBackendProtocol
 from deepagents.middleware.filesystem import FilesystemPermission
 from deepagents.middleware.summarization import SummarizationToolMiddleware
 from dotenv import load_dotenv
@@ -75,6 +76,7 @@ from ghidra_deep_agent.sandbox import (
     sandbox_mode,
 )
 from ghidra_deep_agent.sandbox_sync import SandboxSyncMiddleware
+from ghidra_deep_agent.script_file_tools import build_script_file_tools
 from ghidra_deep_agent.sessions import build_session_store
 from ghidra_deep_agent.switch_tools import build_switch_tools
 from ghidra_deep_agent.tui import GhidraAgentApp
@@ -260,6 +262,9 @@ class Storage(NamedTuple):
     prompt_guidance: str
     # The <group>/<skill> directories found under the skills mount (for display).
     skill_names: list[str]
+    # The raw OpenShell backend when sandboxed, else None. Tools that push files
+    # into the sandbox use it directly (the agent backend may be a composite).
+    sandbox: SandboxBackendProtocol | None = None
 
 
 async def _open_backend(stack: contextlib.AsyncExitStack) -> Storage:
@@ -309,7 +314,9 @@ async def _open_backend(stack: contextlib.AsyncExitStack) -> Storage:
             "Sandbox: files live only inside the sandbox this session "
             "(set AGENT_OUTPUT_DIR to persist them locally)."
         )
-        return Storage(wrap(backend), None, sandbox_guidance, skill_names)
+        return Storage(
+            wrap(backend), None, sandbox_guidance, skill_names, sandbox=backend
+        )
 
     # Files live in the sandbox; the middleware makes AGENT_OUTPUT_DIR the
     # durable local mirror, synced in before and out after a turn. Sync uses the
@@ -320,7 +327,7 @@ async def _open_backend(stack: contextlib.AsyncExitStack) -> Storage:
     # It rescues work from a turn that never reached the per-turn sync-back —
     # e.g. one cancelled, or cut short by quitting mid-run.
     stack.push_async_callback(_final_sync_back, sync)
-    return Storage(wrap(backend), sync, sandbox_guidance, skill_names)
+    return Storage(wrap(backend), sync, sandbox_guidance, skill_names, sandbox=backend)
 
 
 async def _final_sync_back(sync: SandboxSyncMiddleware) -> None:
@@ -553,11 +560,6 @@ async def main() -> None:
     auto_mode_mw = build_auto_mode_middleware()
     if auto_mode_mw is not None:
         print(f"Jev Auto Mode enabled on: {', '.join(sorted(auto_mode_mw.guarded))}")
-    print(f"Main agent: {main_model_spec}  [{len(main_tools)} tool(s)]")
-    print(
-        f"  worker: {resolve_model_spec(agent_config.worker_model, agent_config)}"
-        f"  [{len(main_tools)} tool(s)]"
-    )
 
     recursion_limit = env_int("RECURSION_LIMIT", DEFAULT_RECURSION_LIMIT)
     # Name each top-level graph so LangSmith traces show the app instead of the
@@ -573,6 +575,17 @@ async def main() -> None:
     stack = contextlib.AsyncExitStack()
     try:
         storage = await _open_backend(stack)
+        # Built here, not in `_build_tools`: it needs the sandbox, which only
+        # exists once the backend is open. It writes (it runs an arbitrary
+        # script), so it joins the full tool set but never the read-only one.
+        script_file_tools = build_script_file_tools(tools, storage.sandbox)
+        all_tools = [*all_tools, *script_file_tools]
+        main_tools = [*main_tools, *script_file_tools]
+        print(f"Main agent: {main_model_spec}  [{len(main_tools)} tool(s)]")
+        print(
+            f"  worker: {resolve_model_spec(agent_config.worker_model, agent_config)}"
+            f"  [{len(main_tools)} tool(s)]"
+        )
         if storage.skill_names:
             print(
                 f"  skills [{len(storage.skill_names)}]: "

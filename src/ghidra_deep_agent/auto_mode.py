@@ -69,6 +69,7 @@ DEFAULT_GUARDED_TOOLS: frozenset[str] = frozenset(
         "create_script",
         "delete_script",
         "run_script",
+        "run_script_with_file_output",
         "delete_project_file",
         "delete_project_folder",
         "open_program",
