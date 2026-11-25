@@ -11,6 +11,7 @@ Run:  uv run pytest tests/test_script_file_tools.py -v
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import os
 from collections.abc import Callable
 from pathlib import Path
@@ -20,7 +21,7 @@ from test_sandbox_sync import FakeSandboxBackend
 
 from ghidra_deep_agent.agent_config import read_only_tools
 from ghidra_deep_agent.sandbox import SANDBOX_WORKDIR
-from ghidra_deep_agent.sandbox_sync import _SEED_TAR_NAME
+from ghidra_deep_agent.sandbox_sync import SEED_TAR_GLOB
 from ghidra_deep_agent.script_file_tools import TOOL_NAME, build_script_file_tools
 
 Writer = Callable[[Path, list[str]], object]
@@ -103,11 +104,12 @@ def test_many_files_ship_as_one_tarball() -> None:
     _call(_tool(Ghidra(write), sandbox), name="Pages.java", dest="pages")
 
     dest = f"{SANDBOX_WORKDIR}/pages"
-    assert [len(batch) for batch in sandbox.upload_calls] == [1]
-    assert sandbox.upload_calls[0][0][0] == f"{dest}/{_SEED_TAR_NAME}"
+    # One tarball upload (plus the small delivery list written afterwards).
+    [(staged, _blob)] = sandbox.upload_calls[0]
+    assert fnmatch.fnmatch(staged, f"{dest}/{SEED_TAR_GLOB}")
     for i in range(6):
         assert sandbox.fs[f"{dest}/page_{i}.bin"] == bytes([i]) * 64
-    assert f"{dest}/{_SEED_TAR_NAME}" not in sandbox.fs
+    assert staged not in sandbox.fs
 
 
 def test_no_files_written_explains_the_convention() -> None:
@@ -180,6 +182,117 @@ def test_upload_failures_are_reported() -> None:
     result = _call(_tool(Ghidra(write), sandbox), name="X.java", dest="d")
     assert "1 file(s), 1 bytes" in result
     assert "could NOT be uploaded" in result and "bad.bin" in result
+    # Only what actually landed is recorded for the next call to clear.
+    assert sandbox.fs[f"{SANDBOX_WORKDIR}/d/.script_output_files"] == b"good.bin\n"
+
+
+def test_failures_become_error_results_not_exceptions() -> None:
+    """A crash in Ghidra or the sandbox must not end the agent's turn."""
+
+    def boom(_args: dict[str, Any]) -> str:
+        raise ConnectionError("ghidra went away")
+
+    ghidra = Ghidra(lambda _o, _a: None)
+    ghidra.run._reply = boom
+    result = _call(_tool(ghidra, _sandbox()), name="X.java")
+    assert result.startswith("Error:") and "ghidra went away" in result
+    assert not ghidra.seen_dirs  # never reached the fake's writer
+
+    sandbox = _sandbox()
+    sandbox.raise_on_execute = True
+    good = Ghidra(lambda o, _a: (o / "f").write_bytes(b"x"))
+    result = _call(_tool(good, sandbox), name="X.java")
+    assert result.startswith("Error:") and "sandbox gone" in result
+    assert not good.seen_dirs[0].exists()  # temp dir still cleaned up
+
+
+def test_rerun_replaces_previous_delivery_but_keeps_agent_files() -> None:
+    outputs = [["a.bin", "b.bin"], ["a.bin"]]
+
+    def write(out: Path, _args: list[str]) -> None:
+        for name in outputs.pop(0):
+            (out / name).write_bytes(b"v")
+
+    sandbox = _sandbox()
+    tool = _tool(Ghidra(write), sandbox)
+    dest = f"{SANDBOX_WORKDIR}/d"
+    _call(tool, name="X.java", dest="d")
+    sandbox.fs[f"{dest}/notes.md"] = b"agent's own"
+
+    result = _call(tool, name="X.java", dest="d")
+    assert f"{dest}/a.bin" in sandbox.fs
+    assert f"{dest}/b.bin" not in sandbox.fs  # stale output from run 1
+    assert sandbox.fs[f"{dest}/notes.md"] == b"agent's own"
+    assert "2 old file(s) removed" in result
+
+
+def test_tampered_delivery_list_cannot_escape_dest() -> None:
+    sandbox = _sandbox()
+    outside = f"{SANDBOX_WORKDIR}/keep.txt"
+    sandbox.fs[outside] = b"keep"
+    sandbox.fs[f"{SANDBOX_WORKDIR}/d/.script_output_files"] = (
+        b"../keep.txt\n/sandbox/output/keep.txt\na/../../keep.txt\n"
+    )
+    _call(
+        _tool(Ghidra(lambda o, _a: (o / "f").write_bytes(b"x")), sandbox),
+        name="X.java",
+        dest="d",
+    )
+    assert sandbox.fs[outside] == b"keep"
+
+
+def test_files_over_the_sync_limit_are_flagged(monkeypatch: Any) -> None:
+    monkeypatch.setenv("SANDBOX_SYNC_MAX_BYTES", "10")
+
+    def write(out: Path, _args: list[str]) -> None:
+        (out / "small").write_bytes(b"x")
+        (out / "huge").write_bytes(b"x" * 11)
+
+    result = _call(_tool(Ghidra(write), _sandbox()), name="X.java")
+    huge = next(line for line in result.splitlines() if "/huge" in line)
+    small = next(line for line in result.splitlines() if "/small" in line)
+    assert "sandbox only" in huge and "sandbox only" not in small
+    assert "will NOT be copied home" in result
+
+
+def test_error_like_output_is_called_out() -> None:
+    trace = (
+        "java.lang.NullPointerException: boom\n"
+        "    at DumpRegion.run(DumpRegion.java:12)"
+    )
+    ghidra = Ghidra(lambda o, _a: (o / "f").write_bytes(b"x"), output=trace)
+    result = _call(_tool(ghidra, _sandbox()), name="X.java")
+    assert result.startswith("Warning:") and "partial" in result
+    assert "Script finished" not in result
+
+    clean = Ghidra(lambda o, _a: (o / "f").write_bytes(b"x"), output="wrote 1 file")
+    assert not _call(_tool(clean, _sandbox()), name="X.java").startswith("Warning")
+
+
+def test_not_built_when_ghidra_is_remote() -> None:
+    ghidra = Ghidra(lambda _o, _a: None)
+    for url in ("http://10.0.0.5:8081/mcp", "http://ghidra.example.com/mcp"):
+        assert (
+            build_script_file_tools(cast(Any, ghidra.tools), _sandbox(), ghidra_url=url)
+            == []
+        )
+    for url in (
+        "http://localhost:8081/mcp",
+        "http://127.0.0.1:8081/mcp",
+        "http://[::1]:8081/mcp",
+    ):
+        assert build_script_file_tools(
+            cast(Any, ghidra.tools), _sandbox(), ghidra_url=url
+        )
+
+
+def test_explicit_zero_limit_is_honored() -> None:
+    sandbox = _sandbox()
+    tool = _tool(
+        Ghidra(lambda o, _a: (o / "f").write_bytes(b"x")), sandbox, max_bytes=0
+    )
+    assert "over the limit" in _call(tool, name="X.java")
+    assert sandbox.upload_calls == []
 
 
 def test_not_built_without_a_sandbox_or_script_tools() -> None:
