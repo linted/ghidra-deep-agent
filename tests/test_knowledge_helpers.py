@@ -76,6 +76,7 @@ def test_no_note_for_empty_results() -> None:
 
 class _FakeRetriever(BaseRetriever):
     fail: bool = False
+    empty: bool = False
 
     def _get_relevant_documents(
         self, query: str, *, run_manager: CallbackManagerForRetrieverRun
@@ -85,13 +86,37 @@ class _FakeRetriever(BaseRetriever):
             raise OperationFailure(
                 "cannot query vector index while in state NOT_STARTED", 8
             )
-        return [Document(page_content="a"), Document(page_content="b")]
+        if self.empty:
+            return []
+        return [
+            Document(
+                page_content="parses the config",
+                metadata={
+                    "binary_name": "other.elf",
+                    "category": "function",
+                    "confidence": "high",
+                    "address": "0x1000",
+                    "function_name": "parse_cfg",
+                },
+            ),
+            Document(page_content="b"),  # legacy entry with no metadata
+        ]
 
 
-def test_retriever_tool_formats_documents() -> None:
-    qk = _safe_retriever_tool(_FakeRetriever(), "query_knowledge", "desc")
-    assert qk.invoke({"query": "x"}) == "a\n\nb"
-    assert asyncio.run(qk.ainvoke({"query": "x"})) == "a\n\nb"
+def test_retriever_tool_labels_each_hit_with_its_binary() -> None:
+    """A cross-binary hit must say which binary it came from."""
+    qk = _safe_retriever_tool(_FakeRetriever(), "query_knowledge_global", "desc")
+    expected = (
+        "[other.elf | function | high] 0x1000 parse_cfg — parses the config"
+        "\n\n[? | ? | ?] — b"
+    )
+    assert qk.invoke({"query": "x"}) == expected
+    assert asyncio.run(qk.ainvoke({"query": "x"})) == expected
+
+
+def test_retriever_tool_reports_no_hits() -> None:
+    qk = _safe_retriever_tool(_FakeRetriever(empty=True), "query_knowledge", "d")
+    assert qk.invoke({"query": "x"}) == "No matching findings."
 
 
 def test_retriever_tool_reports_mongo_errors() -> None:
