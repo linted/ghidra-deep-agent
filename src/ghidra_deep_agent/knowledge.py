@@ -141,6 +141,31 @@ def _cap_note(docs: list[dict[str, Any]]) -> str:
     )
 
 
+def _format_hits(docs: list[Document]) -> str:
+    """Render semantic-search hits, each headed by where it came from.
+
+    The stock retriever tool returns bare ``page_content``, which drops the
+    binary a finding belongs to — so a cross-binary hit from the global search
+    reads exactly like a finding about the current program. Every hit is
+    labeled ``[binary | category | confidence] address function`` instead,
+    the same shape the direct query tools use plus the binary.
+    """
+    if not docs:
+        return "No matching findings."
+    out = []
+    for doc in docs:
+        meta = doc.metadata
+        label = " | ".join(
+            str(meta.get(key) or "?")
+            for key in ("binary_name", "category", "confidence")
+        )
+        where = " ".join(
+            str(meta[key]) for key in ("address", "function_name") if meta.get(key)
+        )
+        out.append(f"[{label}]{' ' + where if where else ''} — {doc.page_content}")
+    return "\n\n".join(out)
+
+
 def _safe_retriever_tool(
     retriever: BaseRetriever, name: str, description: str
 ) -> StructuredTool:
@@ -150,9 +175,10 @@ def _safe_retriever_tool(
     any sibling tool calls with it. A vector index that exists but is not yet
     queryable fails exactly this way, and the startup check cannot rule it out.
     """
+    # create_retriever_tool supplies the name, description and args schema;
+    # the bodies are replaced so each hit carries its metadata (see
+    # ``_format_hits``) and Mongo errors come back as text.
     base = create_retriever_tool(retriever, name=name, description=description)
-    func, afunc = base.func, base.coroutine
-    assert func is not None and afunc is not None
 
     def _unavailable(exc: PyMongoError) -> str:
         return (
@@ -164,15 +190,17 @@ def _safe_retriever_tool(
     # only passes callbacks to functions that declare it.
     def safe_func(query: str, callbacks: Callbacks = None) -> str:
         try:
-            return str(func(query, callbacks=callbacks))
+            docs = retriever.invoke(query, config={"callbacks": callbacks})
         except PyMongoError as exc:
             return _unavailable(exc)
+        return _format_hits(docs)
 
     async def safe_afunc(query: str, callbacks: Callbacks = None) -> str:
         try:
-            return str(await afunc(query, callbacks=callbacks))
+            docs = await retriever.ainvoke(query, config={"callbacks": callbacks})
         except PyMongoError as exc:
             return _unavailable(exc)
+        return _format_hits(docs)
 
     base.func, base.coroutine = safe_func, safe_afunc
     return base
