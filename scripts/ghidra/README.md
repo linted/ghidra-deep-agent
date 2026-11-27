@@ -11,6 +11,7 @@ address or a target binary; addresses come in as script arguments.
 | `OneDecompile.java` | `<address>` | no | Decompiles one function and prints its C, or the decompiler's error. |
 | `ListMemoryBlocks.java` | none | no | Prints each memory block's range, size, initialized flag and permissions. |
 | `UnitAudit.java` | `[blockName]` (default `.text`) | no | Reports code-unit coverage of a block by class, and the bytes with no unit at all. |
+| `IndirectBranches.java` | `<address>` | no | Lists the register-indirect branches (`br`, `braa`, `brab`, `blr`) in the function containing an address. The jumps switch recovery has to fix. |
 
 ## Running
 
